@@ -1,0 +1,132 @@
+/**
+ * The data a statement is described by, and the port the driver implements.
+ * These types used to share `pipeline.ts` with a middleware `compose()`, now
+ * a class in `client.ts` — this module keeps only the shared vocabulary.
+ */
+
+import type { AbortSignalLike } from "@langwatch/limiter";
+
+import type { IdBoundOptions } from "./idBound.ts";
+
+/** Whether a statement reads or writes, which several policies branch on. */
+export type QueryKind = "read" | "write";
+
+export type { AbortSignalLike };
+
+export interface QueryRequest {
+  /**
+   * The tenant this statement belongs to. Required, and not optional by
+   * oversight: no other identifier in this schema is unique across tenants, so
+   * a request that cannot name its tenant cannot be routed or audited safely.
+   */
+  tenantId: string;
+  /** Route an organisation-wide operation directly; tenant scope checks still apply. */
+  organizationId?: string;
+  /**
+   * A declared tenant set, one organisation's projects: the statement's `TenantId IN (...)`
+   * must bind exactly these, `tenantId` among them, and the router refuses a set that spans
+   * organisations.
+   */
+  tenantIds?: readonly string[] | undefined;
+  sql: string;
+  params?: Record<string, unknown> | undefined;
+  /** The primary table, used for metrics and span attributes. */
+  table?: string | undefined;
+  kind?: QueryKind | undefined;
+  /** Per-query ClickHouse settings, e.g. a `max_memory_usage` cap. */
+  settings?: Record<string, string | number> | undefined;
+  /** Cooperative cancellation. Policies should stop retrying when aborted. */
+  signal?: AbortSignalLike | undefined;
+  /**
+   * False when hitting the statement's own time cap (TIMEOUT_EXCEEDED) is its answer, so
+   * retrying would only hit the cap again. Absent keeps the timeout transient.
+   */
+  retryOnTimeout?: false | undefined;
+  /**
+   * Skips the tenant predicate check (DDL, `system.*`, a cross-tenant sweep). `tenantId` still
+   * routes the statement; every skip is counted and logged. A comment directly above the flag
+   * gives the reason (`langwatch/skip-tenant-check-reason`).
+   */
+  SKIP_TENANT_CHECK?: true | undefined;
+  /**
+   * Declares a read that must walk every partition (an upgrade step, a replay, an install-wide
+   * sweep), so the cold-scan warning stays for accidental ones. A comment above gives the reason.
+   */
+  SKIP_COLD_SCAN_CHECK?: true | undefined;
+  /** For a statement carrying `{{idBound}}`: a time the caller has, and today's fallback. */
+  idBound?: IdBoundOptions | undefined;
+}
+
+/**
+ * One batch of rows, written to the server their tenant is on. A batch that
+ * mixes tenants is refused rather than routed by whichever row came first,
+ * so "every statement scopes to one tenant" holds without a reader remembering.
+ */
+export interface InsertRequest {
+  /**
+   * The tenant these rows belong to. Required for the same reason a read's is:
+   * no other identifier in this schema is unique across tenants, so a batch
+   * that cannot name its tenant cannot be routed.
+   */
+  tenantId: string;
+  /** Route to the known billing organisation without changing the rows' tenant. */
+  organizationId?: string;
+  /**
+   * A declared tenant set, one organisation's tenants: the rows' TenantIds must be exactly these,
+   * `tenantId` among them, and the router refuses a set that spans organisations, as for a read.
+   */
+  tenantIds?: readonly string[] | undefined;
+  /** The table the rows are written to. */
+  table: string;
+  /**
+   * Read-only on purpose: nothing here mutates the batch it is handed, and
+   * saying so lets a caller holding a `readonly` row array write without
+   * copying every row.
+   */
+  rows: readonly Readonly<Record<string, unknown>>[];
+  /** Skips the one-tenant batch check; counted and logged like a statement's skip. */
+  SKIP_TENANT_CHECK?: true | undefined;
+  /** Per-insert ClickHouse settings, e.g. `async_insert`. */
+  settings?: Record<string, string | number> | undefined;
+  /** Cooperative cancellation. Policies should stop retrying when aborted. */
+  signal?: AbortSignalLike | undefined;
+}
+
+export interface QueryResult<Row> {
+  rows: Row[];
+  /** Whatever the driver knows about the execution. All fields optional. */
+  stats?:
+    | {
+        rowsRead?: number | undefined;
+        bytesRead?: number | undefined;
+        durationMs?: number | undefined;
+      }
+    | undefined;
+}
+
+/**
+ * The port a real ClickHouse connection implements — one method, so a test
+ * double is an object literal and the class under test needs no network.
+ * The only thing in the package that actually talks to a server.
+ */
+export interface QueryDriver {
+  execute<Row>(request: QueryRequest): Promise<QueryResult<Row>>;
+  /**
+   * Writes one batch. Separate from {@link execute} because an insert carries
+   * rows rather than text, and because the tenant guard checks a batch by
+   * reading its rows rather than by reading a predicate out of SQL.
+   */
+  insert(request: InsertRequest): Promise<void>;
+  /**
+   * Runs a statement with no rows back (`ALTER ... UPDATE`, `KILL MUTATION`,
+   * `TRUNCATE`). Separate from {@link execute}: appending a result format to
+   * one is a syntax error, not an empty answer.
+   */
+  command(request: QueryRequest): Promise<void>;
+  /**
+   * Reads one statement's rows batch by batch as the server sends them, so a large read holds one
+   * batch in memory rather than the whole result. Optional: a driver without it answers the whole
+   * result as one batch through {@link execute}.
+   */
+  stream?<Row>(request: QueryRequest): AsyncIterable<Row[]>;
+}

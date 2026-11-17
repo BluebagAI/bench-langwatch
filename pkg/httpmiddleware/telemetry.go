@@ -1,0 +1,138 @@
+package httpmiddleware
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"net"
+	"net/http"
+	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/langwatch/langwatch/pkg/clog"
+	"github.com/langwatch/langwatch/pkg/herr"
+)
+
+// Telemetry is a request lifecycle middleware. It:
+//   - Enriches the context logger with request fields (method, path, remote, request_id)
+//   - Logs request start at debug level
+//   - Logs request completion at info level with status, bytes, and duration
+func Telemetry() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			requestID := GetRequestID(r.Context())
+
+			ctx := clog.With(r.Context(),
+				zap.String("method", r.Method),
+				zap.String("path", r.URL.Path),
+				zap.String("remote", r.RemoteAddr),
+				zap.String("request_id", requestID),
+			)
+
+			clog.Get(ctx).Debug("request_started")
+
+			rec := &responseRecorder{ResponseWriter: w, status: 200}
+			next.ServeHTTP(rec, r.WithContext(ctx))
+
+			fields := []zap.Field{
+				zap.Int("status", rec.status),
+				zap.Int("bytes", rec.bytes),
+				zap.Duration("duration", time.Since(start)),
+			}
+			if rec.hijacked {
+				fields = append(fields, zap.Bool("hijacked", true))
+			}
+
+			// Level follows fault attribution, the same rule the TS boundaries
+			// (tRPC, Hono, SSE) apply: a handled error with a customer fault is
+			// expected and warns (spike-watched via error_code); platform /
+			// provider faults are incidents and log at error; a handled error
+			// with no fault annotation stays at info; a plain (unhandled)
+			// error — the "unknown" WriteHTTP hides behind a generic 500 —
+			// always logs at error for alerting. A client abort (the request's
+			// context canceled) is the exception: it logs at info.
+			level := zapcore.InfoLevel
+			if rec.err != nil {
+				var e herr.E
+				if errors.As(rec.err, &e) {
+					fields = append(fields, zap.String("error_code", string(e.Code)))
+					if len(e.Meta) > 0 {
+						fields = append(fields, zap.Any("error_meta", e.Meta))
+					}
+					if len(e.Reasons) > 0 {
+						reasons := make([]string, len(e.Reasons))
+						for i, r := range e.Reasons {
+							reasons[i] = r.Error()
+						}
+						fields = append(fields, zap.Strings("error_reasons", reasons))
+					}
+					switch e.Meta["fault"] {
+					case "customer":
+						level = zapcore.WarnLevel
+					case "platform", "provider", "presumed_platform":
+						level = zapcore.ErrorLevel
+					}
+				} else {
+					level = zapcore.ErrorLevel
+					fields = append(fields, zap.NamedError("error", rec.err))
+				}
+				// A request whose context was canceled is the caller going
+				// away, not a failure of ours: nobody's fault, nothing to page.
+				// Both must hold: a handler can surface a Canceled of its own.
+				if errors.Is(r.Context().Err(), context.Canceled) && errors.Is(rec.err, context.Canceled) {
+					level = zapcore.InfoLevel
+					fields = append(fields, zap.Bool("client_aborted", true))
+				}
+			}
+
+			clog.Get(ctx).Log(level, "request_completed", fields...)
+		})
+	}
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int
+	err    error
+	// hijacked is set once a handler took the connection over.
+	hijacked bool
+}
+
+// Hijack hands the connection to the handler, which is how a WebSocket
+// upgrade leaves HTTP. Bytes written on it afterwards are not counted.
+func (r *responseRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil {
+		r.hijacked = true
+	}
+	return conn, rw, err
+}
+
+func (r *responseRecorder) RecordError(err error) {
+	r.err = err
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += n
+	return n, err
+}
+
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *responseRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}

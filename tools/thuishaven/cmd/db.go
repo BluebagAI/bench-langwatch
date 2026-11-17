@@ -1,0 +1,188 @@
+package cmd
+
+import (
+	"bufio"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"strings"
+
+	"github.com/langwatch/langwatch/tools/thuishaven/app"
+	"github.com/langwatch/langwatch/tools/thuishaven/domain"
+)
+
+// runDB is `haven db <reset|url>` — the one noun for this stack's data.
+// reset is the only way haven drops data on purpose: it states what it will
+// drop and asks, `--yes` replaces the prompt for scripts, and agent mode
+// never destroys without it.
+func runDB(ctx context.Context, d deps, inv invocation) error {
+	usage := "usage: haven db reset [preset] [--yes] | haven db seed [preset | seed flags] | haven db url [postgres|clickhouse|redis] | haven db prune [--dry-run|--yes] | haven db status | haven db logins\n  presets: " + strings.Join(app.SeedPresetNames(), ", ")
+	if len(inv.args) == 0 {
+		return usageErr("%s", usage)
+	}
+	switch inv.args[0] {
+	case "reset":
+		if err := guardSeedEnv(d); err != nil {
+			return err
+		}
+		slug, err := d.orch.ResolveSlug(d.params)
+		if err != nil {
+			return err
+		}
+		proceed, err := confirmDBReset(dbResetConfirm{
+			db:      domain.DatabaseForSlug(slug),
+			isAgent: d.isAgent,
+			yes:     inv.has("--yes"),
+			in:      os.Stdin,
+			out:     os.Stdout,
+		})
+		if err != nil || !proceed {
+			return err
+		}
+		if err := d.orch.DBReset(ctx, d.params, dbPresetArg(inv)); err != nil {
+			return err
+		}
+		return d.orch.SeedPreset(ctx, d.params, dbPresetArg(inv))
+	case "seed":
+		if inv.has("--yes") {
+			return fmt.Errorf("db seed is non-destructive (an idempotent upsert, nothing dropped) — no confirmation to give")
+		}
+		if usesSeedgen(inv) {
+			if len(inv.args) > 1 {
+				return usageErr("haven db seed takes a preset or seed flags, not both")
+			}
+			inv.args = nil
+			return runSeed(ctx, d, inv)
+		}
+		if err := guardSeedEnv(d); err != nil {
+			return err
+		}
+		if err := d.orch.DBSeed(ctx, d.params, dbPresetArg(inv)); err != nil {
+			return err
+		}
+		return d.orch.SeedPreset(ctx, d.params, dbPresetArg(inv))
+	case "prune":
+		if inv.has("--dry-run") && inv.has("--yes") {
+			return fmt.Errorf("--dry-run and --yes contradict each other")
+		}
+		shouldAct := inv.has("--yes")
+		dbs, err := d.orch.PruneStrayDatabases(ctx, shouldAct)
+		verb := "would drop"
+		if shouldAct {
+			verb = "dropped"
+		}
+		for _, db := range dbs {
+			fmt.Printf("  %s %s\n", verb, db)
+		}
+		if !shouldAct && len(dbs) > 0 {
+			fmt.Println("dry run: re-run with --yes to drop these")
+		}
+		if len(dbs) == 0 {
+			fmt.Println("no stray databases older than HAVEN_DB_TTL")
+		}
+		return err
+	case "url":
+		if inv.has("--yes") {
+			return fmt.Errorf("--yes does not apply to `haven db url`")
+		}
+		engine := ""
+		if len(inv.args) > 1 {
+			engine = inv.args[1]
+		}
+		return d.orch.DBURL(ctx, d.params, engine)
+	default:
+		return usageErr("unknown `haven db` subcommand %q — %s", inv.args[0], usage)
+	}
+}
+
+// dbResetConfirm is what the reset ceremony needs to decide: which database is
+// about to go, whether a human is there to answer, and where to ask.
+type dbResetConfirm struct {
+	db      string
+	isAgent bool
+	yes     bool
+	in      io.Reader
+	out     io.Writer
+}
+
+// confirmDBReset runs the confirmation ceremony for `haven db reset`, reporting
+// whether the reset should go ahead.
+//
+// The shared main database gets a louder one than a worktree's own. Every
+// worktree that never asked for its own data falls back to it, so dropping it —
+// which is what `haven db reset` in the primary checkout on main does — takes
+// data the developer is unlikely to think of as "this stack's". A y/N prompt is
+// the same keystroke either way; typing the database name is not, and that is
+// the whole point of the distinction. `--yes` still stands for scripts, but it
+// says out loud what it is about to take.
+func confirmDBReset(c dbResetConfirm) (bool, error) {
+	shared := domain.IsProtectedDatabase(c.db)
+	switch {
+	case c.yes:
+		if shared {
+			fmt.Fprintf(c.out, "dropping %q — the shared database every worktree without its own falls back to\n", c.db)
+		}
+		return true, nil
+	case c.isAgent && shared:
+		return false, usageErr(
+			"db reset would drop %q, the shared database every worktree without its own falls back to, not just this stack's — pass --yes to confirm",
+			c.db)
+	case c.isAgent:
+		return false, usageErr(
+			"db reset drops and recreates database %q on the managed ClickHouse and Postgres and flushes this stack's Redis db — pass --yes to confirm", c.db)
+	}
+
+	answer := askDBReset(c, shared)
+	if shared {
+		// Nothing but the exact name: "y" must not be able to drop the database
+		// every other worktree shares.
+		if answer != c.db {
+			fmt.Fprintln(c.out, "aborted — nothing was dropped")
+			return false, nil
+		}
+		return true, nil
+	}
+	switch strings.ToLower(answer) {
+	case "y", "yes":
+		return true, nil
+	}
+	fmt.Fprintln(c.out, "aborted — nothing was dropped")
+	return false, nil
+}
+
+// askDBReset prints the prompt the target deserves and reads one answer. A
+// read that yields nothing answers nothing, which the caller treats as no.
+func askDBReset(c dbResetConfirm, shared bool) string {
+	if shared {
+		fmt.Fprintf(c.out,
+			"This drops and recreates %q — the shared database every worktree without its own\nfalls back to, not just this stack's. Type the database name to continue: ", c.db)
+	} else {
+		fmt.Fprintf(c.out,
+			"This drops and recreates database %q on the managed ClickHouse and Postgres,\nthen migrates and seeds it fresh. Continue? [y/N] ", c.db)
+	}
+	// io.EOF with content is a final line without a trailing newline — a real
+	// answer. Only a read that produced nothing answered nothing.
+	answer, _ := bufio.NewReader(c.in).ReadString('\n')
+	return strings.TrimSpace(answer)
+}
+
+// usesSeedgen reports whether `db seed` was given the seed generator's flags
+// (what `haven db seed` took) rather than a preset.
+func usesSeedgen(inv invocation) bool {
+	for _, f := range append(slices.Clone(seedValueFlags), "--org", "--live", "--dry-run", "--json", "--reveal") {
+		if inv.has(f) {
+			return true
+		}
+	}
+	return false
+}
+
+// dbPresetArg is the optional positional preset after reset/seed.
+func dbPresetArg(inv invocation) string {
+	if len(inv.args) > 1 {
+		return inv.args[1]
+	}
+	return ""
+}

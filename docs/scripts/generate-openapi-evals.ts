@@ -1,0 +1,588 @@
+import { writeFileSync } from "node:fs";
+
+import { readObjectLiteral, type Literal } from "./ts-object-literal.ts";
+
+/**
+ * Generates openapi-evals.json from AVAILABLE_EVALUATORS: fetches
+ * evaluators.generated.ts from langwatch/langevals and builds the OpenAPI
+ * spec with code samples. Run with: npx tsx scripts/generate-openapi-evals.ts
+ */
+
+const EVALUATORS_URL =
+  "https://raw.githubusercontent.com/langwatch/langevals/main/ts-integration/evaluators.generated.ts";
+
+/** The part of one catalogue entry this script reads. */
+type EvaluatorDefinition = {
+  name: string;
+  description: string;
+  requiredFields: string[];
+  optionalFields: string[];
+  settings: Record<string, { description?: string; default: unknown }>;
+};
+
+type AvailableEvaluators = Record<string, EvaluatorDefinition>;
+
+type LiteralObject = { [key: string]: Literal };
+
+const isLiteralObject = (value: Literal): value is LiteralObject =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const objectAt = (value: Literal, where: string): LiteralObject => {
+  if (!isLiteralObject(value)) throw new Error(`${where} is not an object`);
+  return value;
+};
+
+const stringAt = (value: Literal, where: string): string => {
+  if (typeof value !== "string") throw new Error(`${where} is not a string`);
+  return value;
+};
+
+const stringsAt = (value: Literal, where: string): string[] => {
+  if (!Array.isArray(value)) throw new Error(`${where} is not a list`);
+  return value.map((item, index) => stringAt(item, `${where}[${index}]`));
+};
+
+const settingAt = (value: Literal, where: string): { description?: string; default: unknown } => {
+  const setting = objectAt(value, where);
+  const description = setting.description;
+  return description === undefined
+    ? { default: setting.default }
+    : { description: stringAt(description, `${where}.description`), default: setting.default };
+};
+
+/** One catalogue entry, checked field by field against what this script reads. */
+const evaluatorAt = (value: Literal, slug: string): EvaluatorDefinition => {
+  const entry = objectAt(value, slug);
+  const settings = objectAt(entry.settings, `${slug}.settings`);
+  return {
+    name: stringAt(entry.name, `${slug}.name`),
+    description: stringAt(entry.description, `${slug}.description`),
+    requiredFields: stringsAt(entry.requiredFields, `${slug}.requiredFields`),
+    optionalFields: stringsAt(entry.optionalFields, `${slug}.optionalFields`),
+    settings: Object.fromEntries(
+      Object.entries(settings).map(([key, setting]) => [
+        key,
+        settingAt(setting, `${slug}.settings.${key}`),
+      ]),
+    ),
+  };
+};
+
+/** The catalogue object literal, read as data and checked; nothing in it is ever run. */
+const parseAvailableEvaluators = (objectStr: string): AvailableEvaluators => {
+  const catalogue = objectAt(readObjectLiteral(objectStr), "AVAILABLE_EVALUATORS");
+  return Object.fromEntries(
+    Object.entries(catalogue).map(([slug, entry]) => [slug, evaluatorAt(entry, slug)]),
+  );
+};
+
+const toTitleCase = (str: string): string => {
+  return str
+    .split(/[/_]/)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+};
+
+const generatePythonExperimentSample = (
+  slug: string,
+  requiredFields: string[],
+  optionalFields: string[],
+): string => {
+  const allFields = [...requiredFields, ...optionalFields];
+  const dataFields = allFields
+    .map((field) => {
+      if (field === "output") return `            "${field}": output,`;
+      if (field === "input") return `            "${field}": row["input"],`;
+      if (field === "contexts") return `            "${field}": row["contexts"],`;
+      if (field === "expected_output") return `            "${field}": row["expected_output"],`;
+      if (field === "expected_contexts") return `            "${field}": row["expected_contexts"],`;
+      if (field === "conversation") return `            "${field}": row["conversation"],`;
+      return `            "${field}": "",`;
+    })
+    .join("\n");
+
+  return `import langwatch
+
+df = langwatch.datasets.get_dataset("dataset-id").to_pandas()
+
+experiment = langwatch.experiment.init("my-experiment")
+
+for index, row in experiment.loop(df.iterrows()):
+    # your execution code here
+    experiment.evaluate(
+        "${slug}",
+        index=index,
+        data={
+${dataFields}
+        },
+        settings={}
+    )
+`;
+};
+
+const generatePythonOnlineSample = (
+  slug: string,
+  name: string,
+  requiredFields: string[],
+  optionalFields: string[],
+): string => {
+  const allFields = [...requiredFields, ...optionalFields];
+  const dataFields = allFields.map((field) => `            "${field}": "",`).join("\n");
+
+  const checkName = toTitleCase(name);
+
+  return `import langwatch
+
+@langwatch.span()
+def my_llm_step():
+    ... # your existing code
+    result = langwatch.evaluation.evaluate(
+        "${slug}",
+        name="My ${checkName} Check",
+        data={
+${dataFields}
+        },
+        settings={},
+    )
+    print(result)`;
+};
+
+const generateTypeScriptExperimentSample = (
+  slug: string,
+  requiredFields: string[],
+  optionalFields: string[],
+): string => {
+  const allFields = [...requiredFields, ...optionalFields];
+  const dataFields = allFields
+    .map((field) => {
+      if (field === "input") return `        input: item.input,`;
+      if (field === "output") return `        output: output,`;
+      return `        ${field}: item.${field},`;
+    })
+    .join("\n");
+
+  return `import { LangWatch } from "langwatch";
+
+const langwatch = new LangWatch();
+
+// Fetch dataset from LangWatch
+const dataset = await langwatch.datasets.get("your-dataset-slug");
+
+const experiment = await langwatch.experiments.init("my-experiment");
+
+await experiment.run(
+  dataset.entries.map((e) => e.entry),
+  async ({ item, index }) => {
+    // Run your LLM/agent
+    const output = await myLLM(item.input);
+
+    // Evaluate the output
+    await experiment.evaluate("${slug}", {
+      index,
+      data: {
+${dataFields}
+      },
+    });
+  },
+  { concurrency: 4 }
+);`;
+};
+
+const generateTypeScriptOnlineSample = (
+  slug: string,
+  requiredFields: string[],
+  optionalFields: string[],
+): string => {
+  const allFields = [...requiredFields, ...optionalFields];
+  const dataFields = allFields
+    .map((field) => `      ${field}: "", // your ${field} value`)
+    .join("\n");
+
+  return `import { LangWatch } from "langwatch";
+
+const langwatch = new LangWatch();
+
+async function myLLMStep(input: string): Promise<string> {
+  // ... your existing code
+
+  // Call the evaluator
+  const result = await langwatch.evaluations.evaluate("${slug}", {
+    name: "my-evaluation",
+    data: {
+${dataFields}
+    },
+    settings: {},
+  });
+
+  console.log(result);
+  return result;
+}`;
+};
+
+const generateSettingsSchema = (
+  slug: string,
+  settings: Record<string, { description?: string; default: unknown }>,
+): Record<string, unknown> => {
+  const properties: Record<string, unknown> = {};
+  const required: string[] = [];
+
+  for (const [key, value] of Object.entries(settings)) {
+    const prop: Record<string, unknown> = {};
+
+    if (value.description) {
+      prop.description = value.description;
+    }
+
+    const defaultValue = value.default;
+
+    if (typeof defaultValue === "string") {
+      prop.type = "string";
+      prop.default = defaultValue;
+    } else if (typeof defaultValue === "number") {
+      prop.type = "number";
+      prop.default = defaultValue;
+    } else if (typeof defaultValue === "boolean") {
+      prop.type = "boolean";
+      prop.default = defaultValue;
+    } else if (Array.isArray(defaultValue)) {
+      prop.type = "array";
+      prop.default = defaultValue;
+    } else if (typeof defaultValue === "object" && defaultValue !== null) {
+      prop.type = "object";
+      prop.default = defaultValue;
+    } else {
+      prop.type = "string";
+    }
+
+    properties[key] = prop;
+  }
+
+  return {
+    type: "object",
+    properties,
+    ...(required.length > 0 ? { required } : {}),
+  };
+};
+
+const generateRequestSchema = (
+  slug: string,
+  requiredFields: string[],
+  optionalFields: string[],
+): Record<string, unknown> => {
+  const properties: Record<string, unknown> = {};
+
+  const fieldDescriptions: Record<string, string> = {
+    input: "The input text to evaluate",
+    output: "The output/response text to evaluate",
+    contexts: "Array of context strings used for RAG evaluation",
+    expected_output: "The expected output for comparison",
+    expected_contexts: "The expected contexts for comparison",
+    conversation: "Array of conversation turns for multi-turn evaluation",
+  };
+
+  for (const field of [...requiredFields, ...optionalFields]) {
+    if (field === "contexts" || field === "expected_contexts") {
+      properties[field] = {
+        type: "array",
+        items: { type: "string" },
+        description: fieldDescriptions[field],
+      };
+    } else if (field === "conversation") {
+      properties[field] = {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            role: { type: "string" },
+            content: { type: "string" },
+          },
+        },
+        description: fieldDescriptions[field],
+      };
+    } else {
+      properties[field] = {
+        type: "string",
+        description: fieldDescriptions[field],
+      };
+    }
+  }
+
+  return {
+    type: "object",
+    properties: {
+      trace_id: {
+        type: "string",
+        description: "Optional trace ID to associate this evaluation with a trace",
+      },
+      data: {
+        type: "object",
+        properties,
+        required: requiredFields,
+      },
+    },
+    required: ["data"],
+  };
+};
+
+const slugToSchemaName = (slug: string): string => {
+  return slug.replace(/\//g, "_");
+};
+
+type BraceScan = { inString: boolean; stringChar: string; escaped: boolean };
+
+/** Steps over one character of string or escape syntax; true when the character was one. */
+const skipsStringChar = (scan: BraceScan, char: string): boolean => {
+  if (scan.escaped) {
+    scan.escaped = false;
+    return true;
+  }
+  if (char === "\\") {
+    scan.escaped = true;
+    return true;
+  }
+  if (!scan.inString && (char === '"' || char === "'" || char === "`")) {
+    scan.inString = true;
+    scan.stringChar = char;
+    return true;
+  }
+  if (!scan.inString) return false;
+  if (char === scan.stringChar) scan.inString = false;
+  return true;
+};
+
+/** The index just past the brace that closes the one at `startIndex`, skipping string contents. */
+const closingBraceEnd = ({
+  content,
+  startIndex,
+}: {
+  content: string;
+  startIndex: number;
+}): number => {
+  const scan: BraceScan = { inString: false, stringChar: "", escaped: false };
+  let braceCount = 0;
+  for (let i = startIndex; i < content.length; i++) {
+    const char = content[i];
+    if (skipsStringChar(scan, char)) continue;
+    if (char === "{") braceCount++;
+    if (char === "}") braceCount--;
+    if (braceCount === 0) return i + 1;
+  }
+  return startIndex;
+};
+
+const generateOpenAPISpec = async (): Promise<void> => {
+  console.log(`Fetching evaluators from ${EVALUATORS_URL}...`);
+
+  const response = await fetch(EVALUATORS_URL);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch evaluators: ${response.statusText}`);
+  }
+
+  const content = await response.text();
+
+  // Extract the AVAILABLE_EVALUATORS object using regex
+  // Find the start of the object
+  const startMatch = content.match(/export const AVAILABLE_EVALUATORS[^=]*=\s*\{/);
+  if (!startMatch || startMatch.index === undefined) {
+    throw new Error("Could not find AVAILABLE_EVALUATORS in the file");
+  }
+
+  // Position of the opening brace
+  const startIndex = startMatch.index + startMatch[0].length - 1;
+  const endIndex = closingBraceEnd({ content, startIndex });
+  const objectStr = content.slice(startIndex, endIndex);
+
+  const evaluators = parseAvailableEvaluators(objectStr);
+
+  console.log(`Found ${Object.keys(evaluators).length} evaluators`);
+
+  // Generate OpenAPI spec
+  const paths: Record<string, unknown> = {};
+  const schemas: Record<string, unknown> = {
+    EvaluationResult: {
+      type: "object",
+      properties: {
+        status: {
+          type: "string",
+          enum: ["processed", "skipped", "error"],
+        },
+        score: {
+          type: "number",
+          description: "Numeric score from the evaluation",
+        },
+        passed: {
+          type: "boolean",
+          description: "Whether the evaluation passed",
+        },
+        label: {
+          type: "string",
+          description: "Label assigned by the evaluation",
+        },
+        details: {
+          type: "string",
+          description: "Additional details about the evaluation",
+        },
+        cost: {
+          type: "object",
+          properties: {
+            currency: { type: "string" },
+            amount: { type: "number" },
+          },
+        },
+      },
+    },
+  };
+
+  for (const [slug, evaluator] of Object.entries(evaluators)) {
+    const schemaName = slugToSchemaName(slug);
+
+    // Generate request schema
+    schemas[`${schemaName}Request`] = generateRequestSchema(
+      slug,
+      evaluator.requiredFields,
+      evaluator.optionalFields,
+    );
+
+    // Generate settings schema
+    schemas[`${schemaName}Settings`] = generateSettingsSchema(slug, evaluator.settings);
+
+    // Generate path
+    paths[`/${slug}/evaluate`] = {
+      post: {
+        summary: evaluator.name,
+        description: evaluator.description.trim(),
+        operationId: `${schemaName}_evaluate`,
+        requestBody: {
+          content: {
+            "application/json": {
+              schema: {
+                allOf: [
+                  { $ref: `#/components/schemas/${schemaName}Request` },
+                  {
+                    type: "object",
+                    properties: {
+                      settings: {
+                        $ref: `#/components/schemas/${schemaName}Settings`,
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+          required: true,
+        },
+        responses: {
+          "200": {
+            // A single result, not an array. LangEvals' own FastAPI returns a
+            // list because it evaluates a batch; the LangWatch endpoint these
+            // pages document evaluates one input and answers one result.
+            description: "Successful evaluation",
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/EvaluationResult" },
+              },
+            },
+          },
+          "400": {
+            description: "Bad request",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { detail: { type: "string" } },
+                },
+              },
+            },
+          },
+          "500": {
+            description: "Internal server error",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: { detail: { type: "string" } },
+                },
+              },
+            },
+          },
+        },
+        "x-codeSamples": [
+          {
+            lang: "python",
+            label: "Experiment",
+            source: generatePythonExperimentSample(
+              slug,
+              evaluator.requiredFields,
+              evaluator.optionalFields,
+            ),
+          },
+          {
+            lang: "python",
+            label: "Online Evaluation",
+            source: generatePythonOnlineSample(
+              slug,
+              evaluator.name,
+              evaluator.requiredFields,
+              evaluator.optionalFields,
+            ),
+          },
+          {
+            lang: "typescript",
+            label: "Experiment",
+            source: generateTypeScriptExperimentSample(
+              slug,
+              evaluator.requiredFields,
+              evaluator.optionalFields,
+            ),
+          },
+          {
+            lang: "typescript",
+            label: "Online Evaluation",
+            source: generateTypeScriptOnlineSample(
+              slug,
+              evaluator.requiredFields,
+              evaluator.optionalFields,
+            ),
+          },
+        ],
+      },
+    };
+  }
+
+  const openApiSpec = {
+    openapi: "3.1.0",
+    info: {
+      title: "LangEvals API",
+      version: "1.0.0",
+      description: "API for LangEvals evaluators",
+    },
+    servers: [
+      {
+        url: "https://app.langwatch.ai/api/evaluations",
+        description: "Production server",
+      },
+    ],
+    security: [{ api_key: [] }],
+    paths,
+    components: {
+      schemas,
+      securitySchemes: {
+        api_key: {
+          type: "apiKey",
+          in: "header",
+          name: "X-Auth-Token",
+          description: "API key for authentication",
+        },
+      },
+    },
+  };
+
+  // Write to file
+  const outputPath = new URL("../api-reference/openapi-evals.json", import.meta.url);
+  writeFileSync(outputPath, JSON.stringify(openApiSpec, null, 2));
+
+  console.log(`Generated openapi-evals.json with ${Object.keys(paths).length} endpoints`);
+};
+
+generateOpenAPISpec().catch(console.error);

@@ -1,0 +1,385 @@
+---
+title: Troubleshooting & FAQ
+description: "Common issues and solutions for LangWatch self-hosting"
+---
+
+## Health Checks
+
+Verify your deployment is healthy:
+
+```bash
+# App health
+kubectl -n langwatch exec deploy/langwatch-app -- curl -s http://localhost:5560/api/health
+
+# Worker health
+kubectl -n langwatch exec deploy/langwatch-workers -- curl -s http://localhost:2999/healthz
+
+# Pod status
+kubectl -n langwatch get pods
+
+# Recent events
+kubectl -n langwatch get events --sort-by='.lastTimestamp' | tail -20
+```
+
+## Docker Compose Issues
+
+### Port 5560 already in use
+
+Another process is using port 5560. Find and stop it:
+
+```bash
+lsof -i :5560
+# Then either stop that process or change the port in infra/compose.yml
+```
+
+### Containers keep restarting
+
+Check logs for the failing container:
+
+```bash
+docker compose logs app --tail=50
+docker compose logs postgres --tail=50
+```
+
+Common causes:
+
+- PostgreSQL not ready before app starts (health checks should handle this)
+- Missing or invalid `.env` file
+- Insufficient Docker memory (increase to 8+ GB in Docker Desktop settings)
+
+### Slow startup
+
+First startup is slower because:
+
+- Docker pulls all images
+- The workers run the upgrade (PostgreSQL and ClickHouse migrations), and the app is not ready until it is done
+- OpenSearch initializes its cluster
+
+Subsequent starts are faster. If it remains slow, check Docker resource allocation.
+
+## Kubernetes, Helm Issues
+
+### Pods stuck in `CrashLoopBackOff`
+
+```bash
+# Check pod logs
+kubectl -n langwatch logs <pod-name> --previous
+
+# Common causes:
+# 1. Database connection failed, check DATABASE_URL secret
+# 2. Missing secrets, check autogen.enabled or secrets.existingSecret
+# 3. ClickHouse not ready, check clickhouse pod status
+```
+
+### Pods stuck in `Pending`
+
+```bash
+# Check events for the pod
+kubectl -n langwatch describe pod <pod-name>
+
+# Common causes:
+# 1. Insufficient cluster resources (CPU/memory)
+# 2. No StorageClass available for PVC provisioning
+# 3. Node selector/affinity mismatch
+```
+
+### PVC stuck in `Pending`
+
+```bash
+kubectl -n langwatch get pvc
+kubectl -n langwatch describe pvc <pvc-name>
+```
+
+Ensure your cluster has a default StorageClass:
+
+```bash
+kubectl get storageclass
+```
+
+If not, set one in your values:
+
+```yaml
+clickhouse:
+  storage:
+    storageClass: "gp3" # or your available StorageClass
+```
+
+### Ingress not routing traffic
+
+```bash
+# Check ingress resource
+kubectl -n langwatch get ingress
+kubectl -n langwatch describe ingress <ingress-name>
+
+# Verify the ingress controller is running
+kubectl get pods -n ingress-nginx  # or your ingress namespace
+```
+
+Ensure `app.http.baseHost` and `app.http.publicUrl` match the Ingress host.
+
+### Istio, Service Mesh
+
+Job pods may hang after completion because the Istio sidecar keeps the pod alive. The chart ships no CronJobs of its own; if you add jobs under `cronjobs.jobs`, disable sidecar injection for them:
+
+```yaml
+cronjobs:
+  pod:
+    annotations:
+      sidecar.istio.io/inject: "false"
+```
+
+The chart-managed ClickHouse backup CronJobs (when `clickhouse.backup.enabled` is on) and the chart's own setup Jobs (the LangWatchQL render and the stored-objects upgrade hooks) take no pod annotations, so the setting above does not reach them. For those, enable native sidecars (Kubernetes 1.29 or later, Istio `ENABLE_NATIVE_SIDECARS=true`), which stop when the Job's container exits, or exclude the pods in your mesh's injection configuration.
+
+## ClickHouse Issues
+
+### ClickHouse OOM kills
+
+Increase ClickHouse memory:
+
+```yaml
+clickhouse:
+  memory: "16Gi" # Up from default 4Gi
+```
+
+The subchart auto-tunes internal memory limits based on this value.
+
+### Evaluations service OOM kills
+
+The evaluations service runs a pool of workers, and each worker that serves a
+local-model evaluator (PII detection, language detection) loads its own copy of
+that model, around 2.1Gi per worker. Its memory is therefore set by how many
+workers it runs, and the chart sizes the pool from `langevals.resources`: ask
+for less CPU and you get a smaller pool and a smaller footprint.
+
+Give one worker room for every local model it may load:
+
+```yaml
+langevals:
+  resources:
+    requests: { cpu: 100m, memory: 768Mi }
+    limits: { cpu: 500m, memory: 4Gi }
+```
+
+The limit is a ceiling, not a reservation, so a generous one uses no extra
+memory until an evaluator actually loads a model.
+
+To pin the pool independently of the CPU allowance, set `CPU_COUNT`:
+
+```yaml
+langevals:
+  extraEnvs:
+    - { name: CPU_COUNT, value: "1" }
+```
+
+`CPU_COUNT` is the variable that governs this, and yours wins over the chart's.
+`WEB_CONCURRENCY` has no effect: the service passes an explicit worker count to
+gunicorn, which overrides the environment default.
+
+If you are on an older chart that does not set `CPU_COUNT`, set it yourself. The
+service otherwise sizes the pool from the **node's** CPU count rather than the
+container's, so a container limited to half a core still starts one worker per
+core on the node.
+
+### ClickHouse connection errors
+
+```bash
+# Check ClickHouse pod status
+kubectl -n langwatch get pods -l app.kubernetes.io/component=clickhouse
+
+# Test connectivity from app pod
+kubectl -n langwatch exec deploy/langwatch-app -- \
+  curl -s "http://langwatch-clickhouse:8123/?query=SELECT%201"
+```
+
+### Cold storage not working
+
+Verify S3 credentials and bucket access:
+
+```bash
+# Check ClickHouse logs for S3 errors
+kubectl -n langwatch logs sts/langwatch-clickhouse --tail=50 | grep -i s3
+```
+
+Ensure the service account has S3 access (IRSA) or static credentials are configured correctly.
+
+### ClickHouse restarts with `NAMED_COLLECTION_ALREADY_EXISTS`
+
+With chart-managed ClickHouse, the chart delivers the LangWatchQL named collections `lwql_postgres` and `lwql_postgres_<database>` as server config. A collection of the same name created by hand with `CREATE NAMED COLLECTION` clashes with it, and the server stops at startup. Remove the hand-made one before you upgrade. If the server already stops, roll back to the previous release (`helm rollback`) so ClickHouse starts, follow these steps, then upgrade again:
+
+Named collections created by hand live on one replica only, so run every step on each ClickHouse pod. Set your release and namespace, and a helper that runs a query on one pod with the chart's password:
+
+```bash
+RELEASE=langwatch NS=langwatch
+PODS=$(kubectl -n "$NS" get pods -l "app.kubernetes.io/name=$RELEASE-clickhouse" -o name)
+ch() { kubectl -n "$NS" exec -i "$1" -c clickhouse -- sh -c \
+  'clickhouse-client --password "$(cat /mnt/secrets/password)" "$@"' ch "${@:2}"; }
+```
+
+1. On each pod, list the collections, and the tables that read PostgreSQL through each one:
+
+   ```bash
+   for pod in $PODS; do echo "== $pod"; ch "$pod" <<'SQL'
+   SELECT c.name AS collection, c.source, t.database, t.name AS engine_table
+   FROM system.named_collections AS c
+   LEFT JOIN (
+     SELECT database, name,
+       extract(engine_full, '^PostgreSQL\\(\\s*`?([A-Za-z0-9_]+)') AS collection
+     FROM system.tables
+     WHERE engine = 'PostgreSQL'
+   ) AS t ON t.collection = c.name
+   WHERE c.name LIKE 'lwql_postgres%'
+   ORDER BY collection, engine_table
+   SQL
+   done
+   ```
+
+2. On each pod, for each collection whose `source` is `SQL`, drop the tables listed beside it. They hold no data: each one reads PostgreSQL when it is queried. The next deploy recreates the LangWatchQL tables only. Save the definition of any table you created yourself first (`SHOW CREATE TABLE`) and recreate it after the upgrade. Until the deploy, LangWatchQL's PostgreSQL-backed views are unavailable.
+
+   ```bash
+   pod=pod/$RELEASE-clickhouse-0 # the pod that listed the table
+   ch "$pod" -q "SHOW CREATE TABLE <database>.<engine_table>"
+   ch "$pod" -q "DROP TABLE <database>.<engine_table>"
+   ```
+
+3. On each pod, drop each collection whose `source` is `SQL`. ClickHouse refuses while any table still uses it (`NAMED_COLLECTION_IS_USED`):
+
+   ```bash
+   pod=pod/$RELEASE-clickhouse-0 # the pod that listed the collection
+   ch "$pod" -q "DROP NAMED COLLECTION <collection>"
+   ```
+
+Upgrades need no collection created by hand: the upgrade binds the LangWatchQL tables to a collection the server already holds.
+
+## PostgreSQL Issues
+
+### The app refuses to start: the installation is behind
+
+The api never migrates; the workers run the upgrade when they start. The api logs `refuses to serve: the installation is behind this image` with the outstanding steps and is not ready while the upgrade has not run for its version. Check the workers' log for why the upgrade did not finish, or run it from the new image (see [Run the upgrade](/self-hosting/upgrade#run-the-upgrade)).
+
+The refusal names the cause: outstanding steps, or no ClickHouse configured (set `CLICKHOUSE_URL`, run the upgrade, start again). **Ops > Upgrades** and `pnpm task upgrade status` show the state.
+
+On Helm, read the workers' log. When upgrades are serialised (`serializeUpgrades` on and no `app.dataplane`), the pre-upgrade Job runs it instead:
+
+```bash
+kubectl -n langwatch logs deploy/<release>-workers --tail=100
+kubectl -n langwatch get jobs | grep migrate-pre-roll
+kubectl -n langwatch logs job/<release>-migrate-pre-roll --tail=100
+```
+
+On Docker Compose, read the `workers` service:
+
+```bash
+docker compose -f infra/compose.yml --project-directory . logs workers
+```
+
+### The upgrade failed
+
+A failed upgrade in the pre-upgrade Job fails the `helm upgrade` before any pod rolls, so the previous version keeps serving. When the new workers run it instead, the new api pods never become ready and the previous version keeps serving. On Docker Compose, the failure is in the `workers` log and the app does not become ready.
+
+The exit code and outcome code, and what to do for each, are in [Exit codes and what to do](/self-hosting/upgrade#exit-codes-and-what-to-do). The Job's or the workers' log and **Ops > Upgrades** name the failed step. A failed PostgreSQL migration is named with the command that clears it: check what it left behind, then run `prisma migrate resolve --rolled-back <migration>` if none of it remains, and run the upgrade again. It resumes where it stopped.
+
+### Connection refused
+
+Verify the connection string:
+
+```bash
+# For chart-managed PostgreSQL
+kubectl -n langwatch exec statefulset/langwatch-postgresql -- \
+  pg_isready -U postgres
+
+# For external PostgreSQL, test from the app pod
+kubectl -n langwatch exec deploy/langwatch-app -- \
+  curl -v telnet://your-rds-host:5432
+```
+
+## Authentication Issues
+
+### SSO callback URL mismatch
+
+The redirect URI registered in your identity provider must exactly match the one shown on the connection's setup page:
+
+```text
+https://<your LangWatch host>/api/auth/sso/callback/<connection id>
+```
+
+Check that `app.http.publicUrl` matches your actual domain (including `https://`).
+
+### Issuer mismatch on the test sign-in
+
+If you see "Your identity provider names a different issuer" on the test sign-in, compare the two issuers it lists: the connection's, and the one in the `iss` claim of the ID token. See [Issuer](/self-hosting/configuration/sso#issuer).
+
+### Existing account refused during SSO sign-in
+
+When SSO sign-in says "An account with this address already exists", the identity provider reported the address as unverified, or the connection has not verified the address's domain. See [Existing email and password accounts](/self-hosting/configuration/sso#existing-email-and-password-accounts).
+
+### Sessions expire too quickly
+
+`NEXTAUTH_SECRET` may have changed between deployments. Ensure it's stored persistently in a Kubernetes Secret, not auto-generated.
+
+## Debugging Tools
+
+### Grafana Dashboards
+
+LangWatch ships with off-the-shelf Grafana dashboards for monitoring the platform, including trace throughput, worker queue depth, ClickHouse performance, and error rates. See [Observability & Monitoring](/self-hosting/configuration/observability) for setup.
+
+### Skynet (Internal Event Debugger)
+
+LangWatch includes Skynet, an internal event debugging tool that lets you inspect the event sourcing pipeline in real-time, view individual events, trace processing steps, and diagnose pipeline issues.
+
+## FAQ
+
+### How much disk space does ClickHouse need?
+
+Roughly 1 KB per span (compressed). See [Sizing & Scaling](/self-hosting/configuration/sizing-and-scaling#storage-sizing) for detailed estimates.
+
+### Can I use an existing PostgreSQL, Redis?
+
+Yes. Redis must be 7.0 or later (or Valkey 7.2 or later); LangWatch refuses to start when the server reports an older version (a server that does not report its version starts with a warning). Use the external database overlays:
+
+```bash
+helm install langwatch langwatch/langwatch \
+  -f examples/overlays/postgres-external.yaml \
+  -f examples/overlays/redis-external.yaml
+```
+
+See [Kubernetes (Helm)](/self-hosting/deployment/kubernetes-helm#production-deployment) for full instructions.
+
+### Can I run without LangEvals or NLP?
+
+Yes. These services are optional. If you don't need built-in evaluators or NLP features, you can leave them out. `enabled: false` removes the Deployment, Service and PodDisruptionBudget:
+
+```yaml
+langwatch_nlp:
+  enabled: false
+langevals:
+  enabled: false
+```
+
+### How do I disable telemetry?
+
+```yaml
+app:
+  telemetry:
+    usage:
+      enabled: false
+```
+
+Or set `DISABLE_USAGE_STATS=true`.
+
+### What ports need to be open?
+
+Only port 443 (HTTPS) for the Ingress/Load Balancer. All other communication is internal to the cluster. See [Security](/self-hosting/security#firewall-rules) for the full port matrix.
+
+### Can I run LangWatch in an air-gapped environment?
+
+Yes. Mirror the Docker images to your private registry and configure the Helm chart to pull from there. See [Docker Images](/self-hosting/deployment/docker-images#private-registries).
+
+### How do I check the LangWatch version?
+
+```bash
+# Helm chart version and app version
+helm list -n langwatch
+
+# Image version running in pods
+kubectl -n langwatch get pods -o jsonpath='{.items[*].spec.containers[*].image}'
+```

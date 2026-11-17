@@ -1,0 +1,19 @@
+{{- if and .Values.langwatch_nlp.enabled (include "langwatch.pdbRenders" (dict "name" "langwatch_nlp" "spec" .Values.langwatch_nlp.podDisruptionBudget "replicas" .Values.langwatch_nlp.replicaCount)) }}
+{{- with .Values.langwatch_nlp.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $.Release.Name }}-langwatch-nlp-pdb
+  labels:
+    app.kubernetes.io/name: {{ $.Release.Name }}-langwatch-nlp
+    app.kubernetes.io/instance: {{ $.Release.Name }}
+    app.kubernetes.io/component: langwatch-nlp
+    {{- include "langwatch.labels" $ | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ $.Release.Name }}-langwatch-nlp
+      app.kubernetes.io/instance: {{ $.Release.Name }}
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

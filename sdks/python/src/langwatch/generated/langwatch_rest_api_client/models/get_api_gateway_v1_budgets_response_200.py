@@ -1,0 +1,78 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, TypeVar, cast
+
+from attrs import define as _attrs_define
+
+if TYPE_CHECKING:
+    from ..models.get_api_gateway_v1_budgets_response_200_data_item import GetApiGatewayV1BudgetsResponse200DataItem
+
+
+T = TypeVar("T", bound="GetApiGatewayV1BudgetsResponse200")
+
+
+@_attrs_define
+class GetApiGatewayV1BudgetsResponse200:
+    """
+    Attributes:
+        data (list[GetApiGatewayV1BudgetsResponse200DataItem]):
+        spend_available (bool):
+        next_cursor (None | str): Pass back as cursor for the next page. Null means the walk is exhausted.
+    """
+
+    data: list[GetApiGatewayV1BudgetsResponse200DataItem]
+    spend_available: bool
+    next_cursor: None | str
+
+    def to_dict(self) -> dict[str, Any]:
+        data = []
+        for data_item_data in self.data:
+            data_item = data_item_data.to_dict()
+            data.append(data_item)
+
+        spend_available = self.spend_available
+
+        next_cursor: None | str
+        next_cursor = self.next_cursor
+
+        field_dict: dict[str, Any] = {}
+
+        field_dict.update(
+            {
+                "data": data,
+                "spend_available": spend_available,
+                "next_cursor": next_cursor,
+            }
+        )
+
+        return field_dict
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.get_api_gateway_v1_budgets_response_200_data_item import GetApiGatewayV1BudgetsResponse200DataItem
+
+        d = dict(src_dict)
+        data = []
+        _data = d.pop("data")
+        for data_item_data in _data:
+            data_item = GetApiGatewayV1BudgetsResponse200DataItem.from_dict(data_item_data)
+
+            data.append(data_item)
+
+        spend_available = d.pop("spend_available")
+
+        def _parse_next_cursor(data: object) -> None | str:
+            if data is None:
+                return data
+            return cast(None | str, data)
+
+        next_cursor = _parse_next_cursor(d.pop("next_cursor"))
+
+        get_api_gateway_v1_budgets_response_200 = cls(
+            data=data,
+            spend_available=spend_available,
+            next_cursor=next_cursor,
+        )
+
+        return get_api_gateway_v1_budgets_response_200

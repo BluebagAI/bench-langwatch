@@ -1,0 +1,575 @@
+Feature: Machine-wide slots for whole-repo checks
+  As a developer whose laptop runs several worktrees and agents at once
+  I want opted-in agent checks and explicit Haven runs to queue instead of piling up
+  So that N parallel checks never take the machine down, and a slow one
+  explains itself instead of looking hung
+
+  # Optional Haven hooks own agent admission (haven-agent-hooks.feature).
+  # Repository scripts and pnpm-generated tool launchers run directly.
+  # `haven machine slot run -- <command>` provides explicit terminal admission;
+  # The JavaScript check-queue.mjs and its bin shims are retired.
+  # Flock waiters retry every 100 ms without changing capacity or memory limits.
+
+  # --- The happy path stays invisible ---
+
+  @unit
+  Scenario: A run that finds a free slot is silent
+    Given no other check holds a slot
+    When I run a check through the queue
+    Then the command runs immediately
+    And the wrapper prints nothing of its own
+
+  @unit
+  Scenario: The wrapper is transparent to the command it runs
+    Given a command that fails
+    When I run it through the queue
+    Then its exit code reaches the caller unchanged
+    And its stdout and stderr are passed through untouched
+
+  # --- Waiting, and saying so ---
+
+  @unit
+  Scenario: A run past the limit waits and names what it is waiting for
+    Given the limit is 1 and a check is already running
+    When a second check starts
+    Then it does not run the command yet
+    And it reports that 1 check is already active and that it is queued
+    And the report names the limit and the environment variable that changes it
+
+  @unit
+  Scenario: Lint and typecheck queue against the same counter
+    Given the limit is 1 and a typecheck is already running
+    When a lint starts
+    Then the lint waits for the typecheck to finish
+    And the two never run at the same time, because they compete for the same cores
+
+  @unit
+  Scenario: A run that waited says how long it waited
+    Given a run that spent time in the queue
+    When its slot frees up
+    Then it reports the time it spent queued before running the command
+
+  @unit
+  Scenario: A long wait repeats itself so it never looks hung
+    Given a run has been queued for longer than the heartbeat interval
+    When it re-checks
+    Then it repeats its position and how long it has waited
+    And it names the runs holding the slots and how long they have held them
+
+  # Arrivals inside one 100 ms poll tick still race; anything later waits its turn.
+  @unit
+  Scenario: Waiters are served in arrival order
+    Given the limit is 1, one run holding the slot and two queued behind it
+    When the holder finishes
+    Then the run that queued first is the one that starts
+
+  # --- Nothing may hold a slot forever ---
+
+  @unit
+  Scenario: A slot held by a dead process is reclaimed
+    Given a run holding the only slot is killed without releasing it
+    When another run checks the queue
+    Then the dead run's entry is dropped
+    And the waiting run starts
+
+  @unit
+  Scenario: A malformed entry from another branch cannot crash the queue
+    Given the shared directory holds an entry written in a shape this branch does not understand
+    When a check reads the queue
+    Then the entry is dropped rather than reaching code that assumes its fields
+    And the check runs
+
+  @unit
+  Scenario: A queue that cannot be created degrades to an unqueued run
+    Given the shared directory cannot be created or written
+    When a check starts
+    Then it warns that the queue is unavailable
+    And it runs the command without a slot, because the queue is a courtesy and never a gate
+
+  @unit
+  Scenario: A run that waits too long runs anyway
+    Given the maximum wait has elapsed and no slot has freed up
+    When the waiting run re-checks
+    Then it warns that it is starting without a slot
+    And it runs the command rather than hanging
+
+  @unit
+  Scenario: A stuck check fails instead of waiting forever
+    Given a run was started with a timeout
+    When the command is still running when the timeout passes
+    Then the wrapper stops the command and exits 124
+    And it says the command ran past its timeout and was stopped
+
+  # --- Choosing the limit ---
+
+  @unit
+  Scenario: The limit can be turned off
+    Given CHECK_SLOTS is 0 in a person's shell
+    When several checks run at once
+    Then none of them queue
+
+  @unit
+  Scenario: An explicit limit is honored
+    Given CHECK_SLOTS is 1
+    When three checks are started at once
+    Then only one of them runs at a time
+
+  @unit
+  Scenario: The default limit is derived from the machine
+    Given CHECK_SLOTS is not set
+    When the limit is resolved on a developer machine
+    Then it is one slot per 6 GiB of RAM, capped at one per 4 CPUs, and never below 1
+
+  @unit
+  Scenario: CI does not queue by default
+    Given CI is set and CHECK_SLOTS is not
+    When a check runs
+    Then the gate is off, because a CI runner runs one check at a time anyway
+
+  # --- The gate-off is the operator's lever, not the agents' ---
+
+  # Observed in the wild: an agent prefixed CHECK_SLOTS=0 onto a whole-tree
+  # typecheck to jump the queue, and the machine ran three checks at once, 14
+  # GB into swap. The queue exists to serialize agents, so a lever any agent
+  # may pull is not a limit. Agent shells are recognizable: Claude Code sets
+  # CLAUDECODE in every shell it spawns. A person's own shell does not carry
+  # it, so the operator keeps the lever.
+
+  @unit
+  Scenario: An agent shell cannot turn the queue off
+    Given CLAUDECODE is set, as it is in every agent shell
+    And CHECK_SLOTS asks for the gate to be off
+    When the limit is resolved
+    Then the derived limit applies as if CHECK_SLOTS were unset
+    And the run says the gate-off was ignored and that only a person may turn the queue off
+
+  # The queue itself turns the gate off for everything below a run it already
+  # counted, or a slot-holding run would queue behind itself at the first bin
+  # shim. That gate-off carries the wrapper's pid in CHECK_QUEUE_HELD, and the
+  # pid must pass two tests: it is a live ancestor of the run asking, and that
+  # process is one of the queue's own wrappers. Ancestry alone would prove
+  # nothing, because a shell is an ancestor of every command it runs, so
+  # CHECK_QUEUE_HELD=$$ would hand the gate-off to any agent that types it.
+  #
+  # This is a lock on an honest door, not a vault. Anyone who may start
+  # processes on the machine may start one named haven. It closes the one-token
+  # bypasses, which is what the queue needs: the runs it serializes are all
+  # started by the wrappers themselves.
+
+  @unit
+  Scenario: A run the queue spawned itself stays unqueued in an agent shell
+    Given a wrapper holding a slot spawned the run with its pid in CHECK_QUEUE_HELD
+    And CLAUDECODE is set
+    When the limit is resolved
+    Then the gate is off for this run, because the wrapper above already counted it
+    And nothing is printed, because nothing was refused
+
+  @unit
+  Scenario: A borrowed held-marker does not turn the queue off
+    Given CHECK_QUEUE_HELD names a live process that is not an ancestor of the run
+    And CLAUDECODE is set and CHECK_SLOTS asks for the gate to be off
+    When the limit is resolved
+    Then the derived limit applies
+
+  @unit
+  Scenario: An agent's own shell is not a queue wrapper
+    Given CHECK_QUEUE_HELD names a live ancestor of the run that is not a queue wrapper
+    And CLAUDECODE is set and CHECK_SLOTS asks for the gate to be off
+    When the limit is resolved
+    Then the derived limit applies, because the marker names no wrapper that counted the run
+
+  @unit
+  Scenario: haven ignores an agent's gate-off the same way
+    Given CLAUDECODE is set and CHECK_SLOTS asks for the gate to be off
+    When haven resolves the slot limit
+    Then the derived limit applies, exactly as the JavaScript queue resolves it
+
+  # --- Memory pressure: the machine says the formula's assumption is false ---
+
+  # The derived limit and the 6 GiB memory ceiling both assume an otherwise
+  # idle machine. A machine that is already compressing and swapping is the
+  # machine saying that assumption is false: its RAM is spoken for, and every
+  # gigabyte a check takes is paid by evicting someone else's pages. Under
+  # pressure the check runs in its smallest shape, so the check pays for the
+  # shortage in its own time instead of everything else paying in swap.
+  # The level and its thresholds are ADR-090's (domain/pressure.go): either
+  # swap fill or compressor occupancy alone can raise it. A machine the queue
+  # cannot read is green, because a governor that cannot see must not throttle.
+
+  @unit
+  Scenario: Memory pressure narrows the queue to one run
+    Given the machine reports amber or red memory pressure
+    And CHECK_SLOTS is not set
+    When the limit is resolved
+    Then it is one, whatever the formula would have said
+    And an explicit CHECK_SLOTS still wins, because it is the operator's call
+
+  @unit
+  Scenario: Memory pressure lowers the memory ceiling to the floor
+    Given the machine reports amber or red memory pressure
+    When a check runs through the queue
+    Then its GOMEMLIMIT is the 3 GiB floor, whatever the machine's size
+    And an operator's explicit GOMEMLIMIT still reaches it unchanged
+
+  @unit
+  Scenario: A run's parallelism is the units it holds, on every machine
+    When a check runs through the queue, at any pressure level
+    Then its GOMAXPROCS is the number of units it holds
+    And a green machine caps it too, because a run counted as two cores must not take ten
+
+  # Measured 2026-10-11 at load 33 (2,298-file typecheck, five alternating
+  # rounds): utility medians 0.78 s against 0.70 s plain; background (-b) was
+  # eight to thirty times slower in the plan's own rounds, so it is never used.
+  @unit
+  Scenario: An agent's run on macOS runs in the utility band
+    Given a run started from an agent shell on macOS, with CLAUDECODE or HAVEN_AGENT_ID set
+    When it runs through the queue
+    Then it runs under taskpolicy -c utility, never in the background band
+    And HAVEN_AGENT_QOS=off keeps the default band
+    And a person's shell, or any other operating system, is never clamped
+
+  # --- Slot classes: one budget in core units (dev/docs/plans/haven-exec-policy.md) ---
+
+  @unit
+  Scenario: The budget is counted in core units and narrows with pressure
+    Given CHECK_SLOTS is not set on a machine with 10 cores and 64 GiB
+    When the unit budget is resolved
+    Then it is 8 units when green, 4 when amber and 2 when red
+    And an explicit CHECK_SLOTS of N is N checks of two units each
+
+  @unit
+  Scenario: Each class takes its weight in units
+    When "haven machine slot run --class <class>" starts a run
+    Then typecheck, lint and build take two units
+    And test takes its Vitest worker count, two by default and at most four
+    And a run with no --class takes two units, as one check always has
+
+  @unit
+  Scenario: A test run is told its worker count
+    When "haven machine slot run --class test" starts a run holding two units
+    Then its VITEST_MAX_WORKERS is 2 and its GOMAXPROCS is 2
+
+  @unit
+  Scenario: An operator's explicit parallelism wins, up to the units held
+    Given GOMAXPROCS or VITEST_MAX_WORKERS is set in the caller's environment
+    When a run starts through the queue
+    Then the child sees the operator's GOMAXPROCS unchanged
+    And its VITEST_MAX_WORKERS is the operator's value, capped at the units the run holds
+
+  @unit
+  Scenario: The gate and haven machine typecheck take two units of the same budget
+    Given slot runs hold part of the unit budget
+    When the hook gate or "haven machine typecheck" admits a run
+    Then it takes two units of the same budget, all or none, and names itself as a holder
+
+  @unit
+  Scenario: A run takes all of its units or none
+    Given 3 of 4 units are held
+    When a run needing 2 units tries for them
+    Then it takes none and waits, holding nothing
+
+  @unit
+  Scenario: A big run at the head of the queue is not starved by small ones
+    Given a 4-unit test run queued first and 2-unit typechecks arriving after it
+    When units free up
+    Then the typechecks let the test run go first
+
+  @unit
+  Scenario: A run inside a slot takes no second slot
+    Given a run started inside "haven machine slot run"
+    When it runs "haven machine slot run --class typecheck" itself
+    Then it runs at once without touching the budget
+
+  # Ruling 2026-10-11: a run rush's gate owns (a shim in rush's gate/bin folder
+  # and a runnable rush) queues in rush, never in haven's slots as well.
+  @unit
+  Scenario: A launcher hands a run rush's gate owns to rush
+    Given rush's gate holds a shim for the program and rush is runnable
+    When tsc, vitest, oxlint or with-build-slot.sh starts a run
+    Then it runs under "rush gate run --name <program> --dir <cwd>"
+    And its environment carries GOMAXPROCS 2, GOMEMLIMIT 3GiB or VITEST_MAX_WORKERS 2 unless set
+    And it takes no haven slot
+
+  @unit
+  Scenario: A run rush already admitted takes no haven slot
+    Given RUSH_GATE_HELD is set in the environment
+    When tsc, vitest, oxlint or with-build-slot.sh starts a run
+    Then it runs directly under haven's caps, asking neither rush nor haven
+
+  @unit
+  Scenario: Without rush, haven queues as before
+    Given rush's gate holds no shim for the program, or the shim's rush is not runnable
+    When tsc, vitest, oxlint or with-build-slot.sh starts a run
+    Then it takes its haven slot through "haven machine slot run" as before
+
+  # Ruling 2026-10-11: the stack's UI rebuild is the developer waiting on
+  # their own page, so it skips both queues and keeps the build caps.
+  @unit
+  Scenario: haven's own UI rebuild never waits behind agent runs
+    Given rush's gate owns vite, or haven's slots are full of agent runs
+    When haven rebuilds a stack's UI through build:local
+    Then with-build-slot.sh runs vite at once, capped at GOMAXPROCS 2 and GOMEMLIMIT 3GiB
+    And it asks neither rush nor haven for a slot
+
+  @unit
+  Scenario: haven status names rush's gate as the queue for what it owns
+    Given rush's gate holds shims for some programs
+    When "haven status" prints the slots block
+    Then one line reads "queue: rush gate (<programs>)" listing them
+
+  @unit
+  Scenario: slot explain names who holds the units
+    Given runs hold units of the budget
+    When "haven machine slot explain" runs
+    Then each holder is listed with its class, units, worktree and pid
+
+  @unit
+  Scenario: A forced pressure level overrides the measurement
+    Given CHECK_PRESSURE is set to green, amber or red
+    When the level is resolved
+    Then the forced level is used instead of measuring the machine
+    And a misspelled level falls back to the measurement, like a CHECK_SLOTS typo
+
+  @unit
+  Scenario: A slot reads the published memory pressure instead of measuring it
+    Given the haven daemon published a pressure level within the last 90 seconds
+    When a slot run or slot explain resolves the level
+    Then it uses the published level
+    And it does not probe the machine's memory itself
+
+  @unit
+  Scenario: A slot measures the pressure when no fresh level is published
+    Given the published pressure record is missing, unreadable, of an unknown version or older than 90 seconds
+    When a slot run or slot explain resolves the level
+    Then it measures the machine's memory pressure itself
+    And a missing daemon never reads as a green machine
+
+  # CI already runs one check per job on a machine of its own, which is why it
+  # gets no queue. The same reasoning retires the pressure policy there: nobody
+  # is typing on a runner, so buying back an interactive machine buys nothing
+  # and only makes the job slower, and a swap figure read inside a container
+  # describes the host rather than the job.
+
+  @unit
+  Scenario: CI keeps the runtime limits it had before the pressure policy
+    Given the run is under CI
+    When the level is resolved
+    Then it is green whatever the machine measures
+    And the check runs with the same memory ceiling and parallelism it had before
+    And an explicitly forced level still wins, for a test that needs one
+
+  # --- A killed run must not read as the queue's doing ---
+
+  # Observed in the wild: a whole-tree typecheck ended in a bare exit 137, and
+  # the agent driving it concluded the queue had killed it and re-ran with
+  # CHECK_SLOTS=0, removing the machine-wide serialization for everyone. The
+  # queue never kills runs; a signal death it did not forward is an operator
+  # kill or the OS reclaiming memory, and the wrapper now says so at the
+  # moment it happens, where the next reader of the transcript will see it.
+
+  @unit
+  Scenario: A run killed from outside is reported as not the queue's doing
+    Given a check is running through the queue
+    When the command dies by a signal the wrapper did not forward
+    Then the wrapper says the queue never kills runs and names the likely causes
+    And it says to re-run the same command rather than set CHECK_SLOTS=0
+    And a signal the wrapper itself forwarded, like Ctrl-C, is not reported
+    And a command that fails on its own is not reported
+
+  @unit
+  Scenario: An interrupted run killed from outside is still reported
+    Given a check was interrupted and the command ignored the forwarded signal
+    When the command is then killed by a signal the wrapper did not forward
+    Then the wrapper still reports the kill, because the earlier interrupt did not cause it
+    And a run the wrapper itself canceled is not reported
+
+  # A Ctrl-C at a terminal reaches the wrapper and the command together, so the
+  # command can be gone before the wrapper has handled its own copy of the
+  # signal. Reading the record at that moment would accuse the operator of a
+  # kill from outside for their own interrupt, which is the exact mistake the
+  # report exists to prevent.
+
+  @unit
+  Scenario: A signal delivered to the whole process group still counts as forwarded
+    Given a check is running through the queue
+    When the whole process group is signalled at once
+    Then the wrapper counts the signal as one it forwarded
+    And it reports no kill from outside
+
+  # A signal keeps its default disposition until the wrapper is listening for
+  # it, so the order of starting the command and listening decides what a
+  # Ctrl-C at that instant does. In the wrong order the machine kills the
+  # wrapper outright: the interrupt reaches nobody and the command keeps
+  # running with no parent. A slot is counted for as long as its wrapper
+  # lives, so the queue then makes that slot free and can start another check
+  # on top of a run that is still using the machine.
+
+  @unit
+  Scenario: An interrupt that arrives as the command starts is forwarded
+    Given a contributor interrupts a check in the instant its command starts
+    Then the interrupt reaches the command
+    And the check still reports how the command ended
+
+  # --- The queue lives inside haven ---
+
+  # The queue's decisions are Go code in haven: `haven machine slot run -- <cmd>`
+  # takes a slot from the same flock semaphore `haven machine typecheck` holds — one
+  # counter for everything that saturates the cores — then runs the command
+  # with the gate off and the Go memory cap set, exactly as the JS wrapper
+  # would. check-queue.mjs delegates to it whenever the haven binary is
+  # installed (HAVEN_BIN overrides where to look), and keeps its JavaScript
+  # queue only as the fallback for machines without haven. Flock slots die
+  # with their holder, so a killed run frees its slot with no bookkeeping.
+
+  @unit
+  Scenario: With haven installed the queue runs inside haven
+    Given the haven binary is installed
+    When a whole-repo check runs through the queue
+    Then the run is handed to haven's slot command
+    And the command's exit code reaches the caller unchanged
+
+  @unit
+  Scenario: haven derives the same limit the JavaScript queue would
+    Given CHECK_SLOTS is unset on a developer machine
+    When haven resolves the slot limit
+    Then it is one slot per 6 GiB of RAM, capped at one per 4 CPUs, and never below 1
+    And an explicit CHECK_SLOTS, a disabling value, and CI resolve exactly as the JavaScript queue resolves them
+
+  @unit
+  Scenario: haven's slot run is transparent to the command
+    Given a command that fails
+    When it runs under haven's slot command with a free slot
+    Then its exit code reaches the caller unchanged and nothing extra is printed
+    And the child runs with the gate off and the Go memory cap set, so it cannot queue behind itself
+
+  @unit
+  Scenario: A run queued inside haven says so
+    Given every check slot is held
+    When a run starts under haven's slot command
+    Then it reports it is queued and names the knob that changes the limit
+    And once a slot frees it reports how long it queued
+
+  @unit
+  Scenario: haven machine typecheck and delegated checks share one counter
+    Given "haven machine typecheck" holds a check slot
+    Then a delegated check counts against the same semaphore, not a second ledger
+
+  @unit
+  Scenario: haven machine typecheck is not gated twice
+    Given "haven machine typecheck" already holds one of its own RAM slots
+    When it runs "pnpm typecheck"
+    Then it passes CHECK_SLOTS=0 to that run
+    And the run is counted once, by haven's slot
+
+  # --- How long the wait actually is ---
+
+  # haven keeps a short history of completed heavy runs (kind, started at,
+  # duration, exit status) beside the semaphore, so a queued run can be told
+  # roughly how long the wait is instead of only how many runs are ahead.
+
+  @unit
+  Scenario: A queued run says roughly how long the wait is
+    Given recent history for a kind of run, and a run of that kind already holding the only slot
+    When another run of that kind is queued behind it
+    Then it reports being queued behind 1 run
+    And it reports roughly how long that wait is expected to be
+
+  @unit
+  Scenario: With no history the gate does not guess
+    Given no run of any kind has ever been recorded
+    When a run is queued behind another
+    Then it reports being queued behind 1 run
+    And it says nothing about how long the wait might be, exactly as before the estimate existed
+
+  # --- Priority with ageing ---
+
+  # The shared slot used to serve waiters strictly in arrival order. A person
+  # is worth more than an agent's own turn: their wait is not backed by a
+  # prompt cache with its own clock running out, and nobody wants to watch a
+  # laptop finish somebody else's queued sub-agent before their own `pnpm
+  # test:unit` starts. domain.CallerKind already ranks who is asking -
+  # Interactive above MainSession above SubAgent; this adds two things on
+  # top: a queued run's effective priority rises with how long it has
+  # waited, so a lower-ranked run is never starved forever, only ever slower
+  # than a caller who has waited exactly as long; and an agent's own
+  # HAVEN_PRIORITY=high claim that a run matters, metered so it is a claim
+  # and not a lever. Same-rank waiters keep arrival order in practice: ageing
+  # is monotonic with wait time, so the one that queued first keeps a strictly
+  # higher effective priority at every check, all the way to a tie only the
+  # flock itself resolves.
+
+  @unit
+  Scenario: Priority classes rank a person above a main session above a sub-agent
+    Given a sub-agent and a person queued for the same slot at the same moment
+    When the slot frees
+    Then the person's effective priority outranks the sub-agent's
+    And the sub-agent yields its attempt on that poll tick to the person
+
+  @unit
+  Scenario: A queued run's effective priority rises with how long it has waited
+    Given a run that has been queued for a while
+    When its effective priority is computed again
+    Then it is higher than it was when the run had waited less
+    And ageing never adds more than one caller-rank's worth on its own
+
+  @unit
+  Scenario: Aging alone lets a sub-agent catch up to a main session, never past a person waiting the same time
+    Given a sub-agent that has waited long enough for ageing to reach its cap
+    When its effective priority is compared to a main session that just queued
+    Then the two are equal
+    But a person who queued at the same moment as the sub-agent still outranks it
+
+  @unit
+  Scenario: An explicit HAVEN_PRIORITY=high raises effective priority by one class step
+    Given two otherwise identical queued runs, one with an honored HAVEN_PRIORITY=high claim
+    When their effective priorities are compared
+    Then the claiming run's priority is higher by exactly one caller-rank's worth
+    And the claim alone never lets a sub-agent outrank a person who queued at the same moment
+
+  @unit
+  Scenario: An honored HAVEN_PRIORITY=high claim is limited to once per agent id per 10 minutes
+    Given an agent id whose claim was already honored
+    When the same agent id claims HAVEN_PRIORITY=high again inside 10 minutes
+    Then the second claim is refused
+    And a claim from the same agent id 10 minutes or more after the first is honored again
+
+  @unit
+  Scenario: An explicit HAVEN_PRIORITY=high in the caller's environment lets an agent state that this run matters
+    Given a caller sets HAVEN_PRIORITY=high in its own shell environment before a shimmed command runs
+    When the claim is honored
+    Then the run's effective priority carries the override for the rest of its own wait
+    And an honored claim is written to run-history.jsonl so it is visible
+    And with HAVEN_PRIORITY unset, or a claim inside the metering window, nothing is claimed and nothing is written
+
+  @unit
+  Scenario: haven machine slot explain shows each holder and waiter with class, age and effective priority
+    Given at least one run holding the shared slot and at least one run queued behind it
+    When "haven machine slot explain" runs
+    Then each holder is listed with its own kind and how long it has held the slot
+    And each waiter is listed with its caller class, how long it has waited, and its effective priority right now
+
+  @unit
+  Scenario: Priority scheduling is additive: with no registry wired, nothing yields
+    Given a slot run built with no waiter registry at all
+    When it decides whether to yield this poll tick
+    Then it never yields
+    And it behaves exactly as the queue did before priority scheduling existed
+
+  @unit
+  Scenario: A quiet machine grows the check budget and run widths
+    Given the 1-minute load is at most 0.35 of the cores and a quarter of RAM is available
+    When a typecheck is admitted
+    Then the budget is every core and the run takes twice its usual units, up to the idle cores
+
+  @unit
+  Scenario: The capacity tier does not flap
+    Given the machine is quiet
+    When the load rises to half the cores
+    Then it stays quiet until the load reaches 0.6 of the cores or available RAM falls under 15%
+
+  @unit
+  Scenario: A check gives way to a boot someone is waiting on
+    Given a haven wait --for ready is blocked on a stack boot
+    When an agent's check is admitted
+    Then it takes at most half the budget, runs under taskpolicy -b, and its queued line says a boot is ahead of it
+    And once the stack answers, new checks get the full budget and utility again

@@ -1,0 +1,187 @@
+---
+title: SSO Configuration
+description: "Set up Single Sign-On for LangWatch with your identity provider"
+---
+
+## Setting up a connection
+
+A connection is an organization's link to its identity provider, over OpenID
+Connect or SAML. To set one up, open **Settings > Authentication > Identity
+provider** as an organization administrator and give:
+
+- the provider's issuer, client id and client secret, or its SAML metadata
+- the email domain the connection signs in
+- a test sign-in through the provider
+- an administrator who can still sign in if the provider is unavailable
+
+See the [SSO setup guide](/platform/sso) for the full journey and screenshots,
+and [First run](/self-hosting/first-run) for the steps on a fresh install.
+
+On a licensed installation, a domain added in the setup page is verified right
+away, with no DNS record or file to publish. A domain belongs to one
+organization per installation. When the installation has more than one
+organization, only a platform operator listed in `ADMIN_EMAILS` adds a domain
+without proof. Other organization administrators complete the DNS or file
+check.
+
+## Before you start
+
+- Activate an [Enterprise license](/self-hosting/licensing). Single sign-on
+  turns on without a restart once the license is active.
+- Set `BASE_HOST` and `NEXTAUTH_URL` to the public HTTPS address people use to
+  open LangWatch. The redirect URI the identity provider calls uses that
+  address.
+- Keep `CREDENTIALS_SECRET` stable across app and worker processes. It
+  encrypts the stored client secrets, and a new value cannot decrypt the
+  existing ones.
+
+## Redirect URI
+
+Every connection has its own redirect URI, shown on the setup page:
+
+```text
+https://<your LangWatch host>/api/auth/sso/callback/<connection id>
+```
+
+A SAML connection posts to its assertion consumer service instead, also shown
+on the setup page:
+
+```text
+https://<your LangWatch host>/api/auth/sso/saml2/sp/acs/<connection id>
+```
+
+The connection id stays the same for the life of the connection, so the
+address registered in the identity provider does not change.
+
+To fix a wrong issuer, client id or client secret, or to replace SAML metadata,
+edit the connection with the pencil button next to its issuer on the setup
+page. Editing keeps the connection id, so the redirect URI, the domains and who
+the connection admits stay the same. A blank client secret keeps the current
+one.
+
+The new settings are checked the same way as at registration. If they are
+refused, the connection keeps its current settings. The protocol of a
+connection cannot be changed.
+
+## Issuer
+
+Enter the issuer exactly as it appears in the `iss` claim of the provider's
+ID tokens. When you register the connection, LangWatch fetches
+`<issuer>/.well-known/openid-configuration` and saves the `issuer` value from
+that response, so a trailing slash you typed or left out is corrected. If the
+response gives a different issuer, you get an error and the connection is not saved.
+
+| Provider | Issuer |
+|----------|--------|
+| Microsoft Entra ID | `https://login.microsoftonline.com/<tenant id>/v2.0` |
+| Okta | `https://<your org>.okta.com`, or `https://<your org>.okta.com/oauth2/<server id>` for a custom authorization server |
+| Auth0 | `https://<your tenant>.auth0.com/` |
+| Google Workspace | `https://accounts.google.com` |
+| AWS Cognito | `https://cognito-idp.<region>.amazonaws.com/<user pool id>` |
+| Keycloak | `https://<your host>/realms/<realm>` |
+| OneLogin | `https://<your subdomain>.onelogin.com/oidc/2` |
+| GitLab | `https://gitlab.com`, or your GitLab host |
+| Any other OpenID Connect provider | The address its discovery document is published under |
+
+Check an issuer by fetching its discovery document:
+
+Replace `YOUR_TENANT_ID` with your tenant id, or set `ISSUER` to your provider's issuer:
+
+```bash
+ISSUER="https://login.microsoftonline.com/YOUR_TENANT_ID/v2.0"
+curl "$ISSUER/.well-known/openid-configuration"
+```
+
+Register the client with the authorization code flow and the `openid`,
+`email` and `profile` scopes. GitHub sign-in is OAuth without OpenID Connect,
+so it cannot be a connection.
+
+### Behind a corporate proxy
+
+If your installation reaches the internet only through an HTTP proxy, set the
+standard `HTTPS_PROXY` (or `HTTP_PROXY`) and `NO_PROXY` variables on the app and
+the workers. When you register or edit a connection, LangWatch fetches the
+discovery document through the proxy, and it fetches the domain verification
+file through the proxy too. It still checks that the address is public first,
+and checks every redirect again.
+
+`NO_PROXY` only chooses a direct connection: it does not lift that check. An
+identity provider inside your network needs its origin in
+`SSO_TRUSTED_IDP_ORIGINS`. LangWatch then reads its discovery document
+directly, never through the proxy, so that read needs no `NO_PROXY` entry. If
+you also turn on Node's environment proxy (below), add the identity provider's
+hosts to `NO_PROXY` so the rest of sign-in reaches them directly too.
+
+The proxy looks up the hostname itself, so LangWatch cannot hold the connection
+to the address it checked. Configure the proxy to refuse every address that is
+not public: loopback (such as `127.0.0.1` and `::1`), private and link-local
+ranges, and cloud metadata addresses (such as `169.254.169.254`).
+
+Only these two requests use the proxy by default, and neither is part of
+signing in. By default, every request made during sign-in goes direct, not
+through `HTTPS_PROXY`:
+
+- the discovery document, read again at every sign-in to learn which addresses
+  your identity provider signs people in from (such as `oauth2.googleapis.com`
+  for Google)
+- the token exchange
+- the signing keys
+- the user info, when the provider has a user info endpoint
+
+So by default the app and workers must reach your identity provider's
+discovery, token, keys and user info endpoints directly for sign-in to work.
+
+If you start the app and workers with `NODE_USE_ENV_PROXY=1` (or
+`--use-env-proxy` in `NODE_OPTIONS`), Node sends these sign-in requests through
+`HTTPS_PROXY` too (unless `NO_PROXY` names the host), and LangWatch reads the
+sign-in discovery document through the proxy to match. Then the proxy must
+allow your identity provider's discovery, token, keys and user info endpoints,
+unless `NO_PROXY` names their hosts.
+
+### Microsoft Entra ID
+
+- Register LangWatch as an app in Entra ID and add the redirect URI under the
+  **Web** platform.
+- Use the issuer of the tenant that holds the app registration,
+  `https://login.microsoftonline.com/<tenant id>/v2.0`. You cannot register
+  the `common`, `organizations` or `consumers` endpoints: an ID token from them
+  has the user's own tenant in `iss`.
+- LangWatch reads the address from the `email` claim, so each user needs a
+  mail address in Entra ID. In **Token configuration**, add the optional
+  `email` and `xms_edov` claims to the ID token.
+
+If you see "Your identity provider names a different issuer" on the test
+sign-in, compare the two issuers it lists. A guest user's token can carry
+their home tenant. Set the issuer on the connection to the app's tenant
+issuer.
+
+## Existing email and password accounts
+
+On a self-hosted installation, a sign-in through a connection links to an
+existing email and password account with the same address once the connection
+has verified the address's domain. This includes accounts whose address was
+never confirmed, which is every account on an installation without
+[outbound email](/self-hosting/configuration/email).
+
+The identity provider does not have to send `email_verified`. Microsoft Entra
+ID never sends it, and SAML has no such attribute. A sign-in where the provider
+reports the address as unverified, with `email_verified: false` or with Entra
+ID's `xms_edov: false`, is refused with "An account with this address already
+exists".
+
+On LangWatch Cloud, a sign-in links to an existing account only when the
+address is confirmed and the provider sends `email_verified: true`.
+
+## Upgrading an existing installation
+
+Identity and access migrations run automatically after each upgrade, one
+organization at a time. Each organization switches over as soon as it migrates
+cleanly. When an organization's historical data needs attention, it stays on
+its existing sign-in path and the deployment starts anyway. See the
+[upgrade guide](/self-hosting/upgrade#automatic-identity-and-access-migration)
+for what still blocks startup and how to check and retry a held organization.
+
+Installations that configure a sign-in provider in the deployment settings
+keep working after an upgrade, with the same redirect URI. To move to a
+connection set up in **Settings**, follow
+[Move to your own identity provider](/platform/sso-update).

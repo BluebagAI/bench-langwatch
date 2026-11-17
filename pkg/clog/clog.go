@@ -1,0 +1,347 @@
+package clog
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"regexp"
+	"sync"
+	"time"
+
+	prettyconsole "github.com/thessem/zap-prettyconsole"
+	"go.opentelemetry.io/contrib/bridges/otelzap"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	"go.uber.org/zap"
+	"go.uber.org/zap/buffer"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/langwatch/langwatch/pkg/contexts"
+)
+
+// otelScopeName is the instrumentation scope stamped on log records the
+// otelzap bridge ships to the collector.
+const otelScopeName = "github.com/langwatch/langwatch/pkg/clog"
+
+type contextKey struct{}
+
+// fallbackLogger is the process-global logger returned by Get when a context
+// carries none. Built once under fallbackOnce so a bare ctx reaching Get on a
+// hot path doesn't construct a fresh production logger on every call.
+var (
+	fallbackOnce   sync.Once
+	fallbackLogger *zap.Logger
+)
+
+// Set stores a zap logger in the context.
+func Set(ctx context.Context, logger *zap.Logger) context.Context {
+	return context.WithValue(ctx, contextKey{}, logger)
+}
+
+// Get retrieves the zap logger from context, falling back to a global production logger.
+func Get(ctx context.Context) *zap.Logger {
+	if l, ok := ctx.Value(contextKey{}).(*zap.Logger); ok && l != nil {
+		return l
+	}
+	fallbackOnce.Do(func() {
+		// The shared format, not zap.NewProduction()'s: a line that reaches a
+		// terminal through a bare context is exactly the line nobody set up,
+		// and it must still render rather than showing up as raw JSON.
+		cfg := zap.NewProductionConfig()
+		cfg.EncoderConfig = jsonEncoderConfig()
+		fallbackLogger, _ = cfg.Build()
+	})
+	return fallbackLogger
+}
+
+// With returns a child logger with additional fields, stored back into context.
+func With(ctx context.Context, fields ...zap.Field) context.Context {
+	return Set(ctx, Get(ctx).With(fields...))
+}
+
+// New creates a configured zap logger for a service.
+// If the context carries ServiceInfo, service/version/env fields are stamped
+// on every log line automatically.
+func New(ctx context.Context, cfg Config) *zap.Logger {
+	var logger *zap.Logger
+
+	if cfg.Format == "pretty" {
+		logger = zap.New(zapcore.NewCore(
+			prettyConsoleEncoder(),
+			zapcore.Lock(os.Stdout),
+			cfg.zapLevel(),
+		))
+	} else {
+		zapCfg := zap.NewProductionConfig()
+		zapCfg.EncoderConfig = jsonEncoderConfig()
+		zapCfg.Level = zap.NewAtomicLevelAt(cfg.zapLevel())
+		logger, _ = zapCfg.Build()
+	}
+
+	if fields := consoleServiceFields(ctx, cfg.Format); fields != nil {
+		logger = logger.With(fields...)
+	}
+	return logger
+}
+
+// consoleServiceFields is the constant identity a console core carries, which
+// on the pretty console is nothing at all. `service`, `version` and `env` are
+// the same on every line this process ever writes, and in a `pnpm dev`
+// terminal `concurrently` has already said which lane a line came from — so
+// there they are three repeated columns the message could have used. Nothing
+// prefixes a machine-readable line, so that one keeps them.
+func consoleServiceFields(ctx context.Context, format string) []zap.Field {
+	if format == "pretty" {
+		return nil
+	}
+	return serviceFields(ctx)
+}
+
+// serviceFields stamps service/version/env from the context's ServiceInfo, so
+// New and WithCollector attach the same base fields.
+func serviceFields(ctx context.Context) []zap.Field {
+	info := contexts.GetServiceInfo(ctx)
+	if info == nil {
+		return nil
+	}
+	return []zap.Field{
+		zap.String("service", info.Service),
+		zap.String("version", info.Version),
+		zap.String("env", info.Environment),
+	}
+}
+
+// WithCollector wires the OTLP debug collector into logging when lp is non-nil
+// (local dev). It splits the stream: the console core is gated at
+// cfg.ConsoleLevel (e.g. "warn" — a quiet terminal) and an otelzap core is
+// gated at cfg.OTelLevel (e.g. "debug" — full detail), so info/debug flow to the
+// collector while only warnings/errors reach the console. zapcore.NewTee keeps
+// stdout writing alongside the collector. When lp is nil (prod), the base logger
+// from New is returned untouched — no split, no collector, no behavior change.
+//
+// The two cores carry independent LevelEnablers, so a Debug entry is still
+// created and delivered to the otel core even though the console core rejects it.
+//
+// base is only consulted for the lp == nil case above — when lp != nil, a
+// fresh logger is built and only serviceFields(ctx) is reapplied, so any
+// fields a caller attached to base after New() are silently lost. Call this
+// immediately after New, before attaching any extra fields.
+func WithCollector(ctx context.Context, cfg Config, base *zap.Logger, lp *sdklog.LoggerProvider) *zap.Logger {
+	if lp == nil {
+		return base
+	}
+	consoleCore := buildConsoleCore(cfg.Format, cfg.consoleZapLevel())
+	otelCore := newLeveledCore(
+		otelzap.NewCore(otelScopeName, otelzap.WithLoggerProvider(lp)),
+		cfg.otelZapLevel(),
+	)
+	// The collector keeps the constant identity even when the console drops it
+	// (see consoleServiceFields): nothing prefixes an exported record with the
+	// service it came from, so there it is the only thing saying so.
+	if fields := serviceFields(ctx); fields != nil && cfg.Format == "pretty" {
+		otelCore = otelCore.With(fields)
+	}
+	// zap.New starts from a bare logger, so the caller/stacktrace annotation the
+	// New path gets from zap.NewProductionConfig has to be re-applied here or the
+	// split stream would silently lose it.
+	logger := zap.New(
+		zapcore.NewTee(consoleCore, otelCore),
+		zap.AddCaller(),
+		zap.AddStacktrace(zapcore.ErrorLevel),
+	)
+	if fields := consoleServiceFields(ctx, cfg.Format); fields != nil {
+		logger = logger.With(fields...)
+	}
+	return logger
+}
+
+// buildConsoleCore builds the stdout core at an explicit level, matching New's
+// formatting (prettyconsole for "pretty", JSON otherwise).
+func buildConsoleCore(format string, level zapcore.Level) zapcore.Core {
+	out := zapcore.Lock(os.Stdout)
+	if format == "pretty" {
+		return zapcore.NewCore(prettyConsoleEncoder(), out, level)
+	}
+	return zapcore.NewCore(jsonEncoder(), out, level)
+}
+
+// jsonEncoderConfig is the shared machine format
+// (dev/docs/best_practices/dev-log-format.md): zap's production encoder with
+// its epoch-float `ts` replaced by an RFC 3339 `time` to the millisecond, so a
+// Go record and a Node record carry the same timestamp field, spelled the same
+// way, in every environment. `level` is already the lowercase word and `msg`
+// already the message; only the timestamp differed.
+func jsonEncoderConfig() zapcore.EncoderConfig {
+	cfg := zap.NewProductionEncoderConfig()
+	cfg.TimeKey = "time"
+	cfg.EncodeTime = sharedTimeEncoder
+	return cfg
+}
+
+// sharedTimeLayout is RFC 3339 to the millisecond, the one instant format
+// every LangWatch process writes.
+const sharedTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// sharedTimeEncoder writes the instant in UTC, so a record from a laptop in
+// Amsterdam and one from a pod in eu-west sort and compare without anyone
+// having to notice an offset.
+func sharedTimeEncoder(at time.Time, encoder zapcore.PrimitiveArrayEncoder) {
+	encoder.AppendString(at.UTC().Format(sharedTimeLayout))
+}
+
+// jsonEncoder builds the shared machine encoder.
+func jsonEncoder() zapcore.Encoder { return zapcore.NewJSONEncoder(jsonEncoderConfig()) }
+
+// prettyEncoderConfig aligns the Go pretty console with the TS lanes'
+// pino-pretty console, so a terminal interleaving Go and JS services reads as
+// one format: a bracketed 24h HH:MM:SS.mmm timestamp (prettyconsole's default
+// is a bare 12h clock with no seconds) and a full-word capital level, matching
+// pino-pretty's "[13:10:46.108] INFO (name): msg".
+func prettyEncoderConfig() zapcore.EncoderConfig {
+	cfg := prettyconsole.NewEncoderConfig()
+	cfg.EncodeTime = bracketedTimeEncoder
+	cfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	return cfg
+}
+
+// bracketedTimeEncoder writes [15:04:05.000], the shape the Node lanes' console
+// prints and the one thing about it that is not configurable there.
+func bracketedTimeEncoder(at time.Time, encoder zapcore.PrimitiveArrayEncoder) {
+	encoder.AppendString("[" + at.Format("15:04:05.000") + "]")
+}
+
+// prettyMessageMarker is the "> " prettyconsole writes between the level and
+// the message, with the color codes it wraps it in and the separator ahead of
+// it. Nothing else in a `pnpm dev` terminal writes one, and prettyconsole
+// offers no option to leave it out.
+var prettyMessageMarker = regexp.MustCompile(
+	"(?:\x1b\\[[0-9;]*m)*\\s(?:\x1b\\[[0-9;]*m)*\x1b\\[1m(?:\x1b\\[[0-9;]*m)*>(?:\x1b\\[[0-9;]*m)*",
+)
+
+// prettyConsoleEncoder is prettyconsole's encoder with that marker removed and
+// error chains flattened onto the line (see error_fields.go).
+func prettyConsoleEncoder() zapcore.Encoder {
+	return markerlessEncoder{Encoder: prettyconsole.NewEncoder(prettyEncoderConfig())}
+}
+
+type markerlessEncoder struct {
+	zapcore.Encoder
+}
+
+func (e markerlessEncoder) Clone() zapcore.Encoder {
+	return markerlessEncoder{Encoder: e.Encoder.Clone()}
+}
+
+func (e markerlessEncoder) EncodeEntry(entry zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
+	encoded, err := e.Encoder.EncodeEntry(entry, flattenErrorFields(fields))
+	if err != nil || encoded == nil {
+		return encoded, err
+	}
+	line := prettyMessageMarker.ReplaceAllString(encoded.String(), "")
+	encoded.Reset()
+	encoded.AppendString(line)
+	return encoded, nil
+}
+
+// leveledCore gates an inner core to a minimum level. Used to hold the otelzap
+// bridge (which exposes no level option) at OTelLevel, independent of the
+// console core's level.
+type leveledCore struct {
+	zapcore.Core
+	enab zapcore.LevelEnabler
+}
+
+func newLeveledCore(inner zapcore.Core, enab zapcore.LevelEnabler) zapcore.Core {
+	return &leveledCore{Core: inner, enab: enab}
+}
+
+func (c *leveledCore) Enabled(l zapcore.Level) bool { return c.enab.Enabled(l) }
+
+func (c *leveledCore) Check(e zapcore.Entry, ce *zapcore.CheckedEntry) *zapcore.CheckedEntry {
+	// Standard level-filter pattern: gate on our level, then delegate to the
+	// wrapped core's own Check so it registers itself for the write.
+	if c.enab.Enabled(e.Level) {
+		return c.Core.Check(e, ce)
+	}
+	return ce
+}
+
+func (c *leveledCore) With(fields []zapcore.Field) zapcore.Core {
+	return &leveledCore{Core: c.Core.With(fields), enab: c.enab}
+}
+
+// Config controls logging setup. The env keys are shared with the TS app
+// (LOG_LEVEL / LOG_CONSOLE_LEVEL / LOG_OTEL_LEVEL) so one set of variables in
+// .env configures logging for both Go and JS.
+type Config struct {
+	Level  string `env:"LEVEL"`  // "debug", "info", "warn", "error"
+	Format string `env:"FORMAT"` // "json" (default), "pretty"
+
+	// ConsoleLevel / OTelLevel split the stream when the local observability
+	// collector is enabled (see WithCollector): the console shows only
+	// ConsoleLevel+ (e.g. "warn" — a quiet terminal) while OTelLevel+ (e.g.
+	// "debug" — full detail) ships to the collector. Empty ConsoleLevel falls
+	// back to Level; empty OTelLevel defaults to debug. Ignored without the
+	// collector (New leaves prod behavior unchanged).
+	ConsoleLevel string `env:"CONSOLE_LEVEL"`
+	OTelLevel    string `env:"OTEL_LEVEL"`
+}
+
+func (c Config) consoleZapLevel() zapcore.Level {
+	if c.ConsoleLevel != "" {
+		var lvl zapcore.Level
+		if lvl.UnmarshalText([]byte(c.ConsoleLevel)) == nil {
+			return lvl
+		}
+	}
+	return c.zapLevel()
+}
+
+func (c Config) otelZapLevel() zapcore.Level {
+	if c.OTelLevel != "" {
+		var lvl zapcore.Level
+		if lvl.UnmarshalText([]byte(c.OTelLevel)) == nil {
+			return lvl
+		}
+	}
+	return zapcore.DebugLevel
+}
+
+// Validate checks that config values are recognized.
+func (c Config) Validate() error {
+	switch c.Format {
+	case "", "json", "pretty":
+	default:
+		return fmt.Errorf("clog: unknown LOG_FORMAT %q (want json or pretty)", c.Format)
+	}
+
+	if c.Level != "" {
+		var lvl zap.AtomicLevel
+		if err := lvl.UnmarshalText([]byte(c.Level)); err != nil {
+			return fmt.Errorf("clog: unknown LOG_LEVEL %q: %w", c.Level, err)
+		}
+	}
+
+	if c.ConsoleLevel != "" {
+		var lvl zapcore.Level
+		if err := lvl.UnmarshalText([]byte(c.ConsoleLevel)); err != nil {
+			return fmt.Errorf("clog: unknown LOG_CONSOLE_LEVEL %q: %w", c.ConsoleLevel, err)
+		}
+	}
+	if c.OTelLevel != "" {
+		var lvl zapcore.Level
+		if err := lvl.UnmarshalText([]byte(c.OTelLevel)); err != nil {
+			return fmt.Errorf("clog: unknown LOG_OTEL_LEVEL %q: %w", c.OTelLevel, err)
+		}
+	}
+
+	return nil
+}
+
+func (c Config) zapLevel() zapcore.Level {
+	if c.Level == "" {
+		return zapcore.InfoLevel
+	}
+	var lvl zapcore.Level
+	_ = lvl.UnmarshalText([]byte(c.Level))
+	return lvl
+}

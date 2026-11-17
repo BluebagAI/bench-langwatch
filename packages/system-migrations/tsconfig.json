@@ -1,0 +1,30 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src",
+    "lib": ["es2023"],
+    // Node-only (a startup convergence loop): AbortSignal/AbortController and
+    // setTimeout are Node's globals here, not DOM's, and nothing else in this
+    // package's `lib` array declares them.
+    "types": ["node"],
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "tsBuildInfoFile": "dist/tsconfig.typecheck.tsbuildinfo",
+    // Consumers import the TypeScript sources directly (see the package's
+    // `exports`), so this project only ever type-checks - nothing is built.
+    "verbatimModuleSyntax": true,
+    "composite": true,
+    "noEmit": false
+  },
+  "files": [],
+  "include": [],
+  "references": [
+    {
+      "path": "./tsconfig.build.json"
+    },
+    {
+      "path": "./tsconfig.test.json"
+    }
+  ]
+}

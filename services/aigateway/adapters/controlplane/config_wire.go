@@ -1,0 +1,586 @@
+package controlplane
+
+import (
+	"encoding/json"
+	"strings"
+	"time"
+
+	"github.com/langwatch/langwatch/services/aigateway/domain"
+)
+
+// configWire matches the JSON shape returned by GET /api/internal/gateway/config/:vk_id.
+type configWire struct {
+	// ProjectID is the trace-export project, emitted by the control-plane
+	// materialiser as the sibling of project_otlp_token and resolved from the
+	// same object (config.materialiser.ts). The pair must travel together —
+	// see domain.BundleConfig.TraceProjectID.
+	ProjectID        string             `json:"project_id"`
+	ProjectOTLPToken string             `json:"project_otlp_token"`
+	DisplayPrefix    string             `json:"display_prefix"`
+	Providers        []providerSlotWire `json:"providers"`
+	Fallback         fallbackWire       `json:"fallback"`
+	ModelAliases     map[string]string  `json:"model_aliases"`
+	ModelsAllowed    []string           `json:"models_allowed"`
+	// ProvidersAllowed is the key's explicit ModelProvider allowlist. null
+	// on the wire means every provider the key reaches through its scope
+	// graph, including future ones; a list is never empty (the control
+	// plane normalises [] back to null on read).
+	ProvidersAllowed []string `json:"providers_allowed"`
+	// RoutingMode is none | fallback_all | policy (contract §4.2).
+	RoutingMode string `json:"routing_mode"`
+	// RoutingExcludedProviders / AccessExcludedProviders / RoutingPolicyName
+	// name why a provider a request could resolve to is absent from Providers,
+	// so a block can say the reason instead of failing opaque (contract §4.2).
+	RoutingExcludedProviders []excludedProviderWire `json:"routing_excluded_providers"`
+	AccessExcludedProviders  []excludedProviderWire `json:"access_excluded_providers"`
+	RoutingPolicyName        string                 `json:"routing_policy_name"`
+	RateLimits               rateLimitsWire         `json:"rate_limits"`
+	// Guardrails is the flat per-project catalog every VK in the project
+	// may reference; GuardrailAttachments is this VK's opt-in tuples
+	// (control-plane materialiser config.materialiser.ts, bug-7 step vd).
+	Guardrails           []guardrailWire           `json:"guardrails"`
+	GuardrailAttachments []guardrailAttachmentWire `json:"guardrail_attachments"`
+	PolicyRules          policyRulesWire           `json:"policy_rules"`
+	Budgets              []budgetWire              `json:"budgets"`
+	CacheRules           []cacheRuleWire           `json:"cache_rules"`
+	// VKTags are the VK's operator-assigned tags (config.metadata.tags on
+	// the control plane). Stamped on customer spans as langwatch.labels and
+	// matched by cache-rule vk_tags matchers.
+	VKTags []string `json:"vk_tags"`
+	// LangyMirrorTier is the ADR-061 mirror fidelity the control-plane
+	// materialiser resolved for this VK's organization ("content" | "structural"
+	// | "skip"). Present and non-skip only for Langy virtual keys, so ordinary
+	// customer traffic is never mirrored. Empty/absent ⇒ no mirror.
+	LangyMirrorTier string `json:"langy_mirror_tier"`
+	// ExpiresAt is the key's own expiration date in unix seconds, or null when
+	// the key has no date. Held raw so decode can tell an explicit null from a
+	// field a control plane older than it never sent, which are different
+	// answers: see keyExpiry.
+	ExpiresAt json.RawMessage `json:"expires_at"`
+	// Status is "active" or "revoked". Empty from a control plane older than
+	// the field, which reads as active.
+	Status string `json:"status"`
+}
+
+// keyExpiry reads the key's own expiration date off the wire as the tri-state
+// domain.ConfigFetchResult carries: the instant, whether the response said
+// anything about expiry at all, and an error for a field that is neither a unix
+// timestamp nor null.
+//
+// json.RawMessage is what separates the three: an absent field leaves it empty,
+// while an explicit null decodes to the four bytes of the literal.
+func (w *configWire) keyExpiry() (time.Time, bool, error) {
+	if len(w.ExpiresAt) == 0 {
+		return time.Time{}, false, nil
+	}
+	var seconds *int64
+	if err := json.Unmarshal(w.ExpiresAt, &seconds); err != nil {
+		return time.Time{}, false, err
+	}
+	if seconds == nil {
+		return time.Time{}, true, nil
+	}
+	return time.Unix(*seconds, 0).UTC(), true, nil
+}
+
+// excludedProviderWire is one provider the gateway will not dispatch to,
+// carried with its type so the gateway can match it against the provider a
+// request resolved to (these rows are absent from Providers, so the type is
+// not otherwise knowable). Mirrors the {id, type} shape of providerSlotWire.
+type excludedProviderWire struct {
+	ID   string `json:"id"`
+	Type string `json:"type"`
+	// Handle is the row's routing handle, carried so a request naming the
+	// handle of a dropped provider is told which setting dropped it instead of
+	// being told the handle means nothing.
+	Handle string `json:"handle,omitempty"`
+}
+
+type providerSlotWire struct {
+	ID          string                 `json:"id"`
+	Type        string                 `json:"type"`
+	Credentials map[string]interface{} `json:"credentials"`
+	// BaseURL overrides the provider's default endpoint. Emitted by the
+	// control-plane materialiser for OpenAI-compatible providers
+	// (type "custom": self-hosted vLLM, LiteLLM proxies, ...) — see
+	// config.materialiser.ts:buildProviderSlot.
+	BaseURL string `json:"base_url,omitempty"`
+	// DeploymentMap maps public model ids to provider-native deployment
+	// names (Azure routes on deployment, Bedrock on inference profile,
+	// etc.). Emitted by the control-plane materialiser as a top-level
+	// sibling of credentials — see config.materialiser.ts:buildProviderSlot.
+	DeploymentMap map[string]string `json:"deployment_map,omitempty"`
+	// Handle is the operator-chosen routing handle of this ModelProvider row
+	// (ModelProvider.routingHandle), unique inside the organization. Absent
+	// when the operator set none.
+	Handle string `json:"handle,omitempty"`
+	// Models is what this provider declares it serves: the customer's declared
+	// custom models and embeddings models, and for the hosted families the
+	// model catalog the platform ships. Used for ROUTING a bare model name to
+	// the provider that owns it; authorization stays with models_allowed.
+	Models []string `json:"models,omitempty"`
+}
+
+// fallbackWire is the fallback block of the config payload. Only max_attempts
+// and chain are read. A control plane that predates this build still sends
+// "on" and "timeout_ms"; they are ignored on decode, which is what keeps a
+// rolling deploy from needing the two sides to agree.
+type fallbackWire struct {
+	Chain       []string `json:"chain"`
+	MaxAttempts int      `json:"max_attempts"`
+}
+
+type rateLimitsWire struct {
+	RPM *int `json:"rpm"`
+	TPM *int `json:"tpm"`
+	RPD *int `json:"rpd"`
+}
+
+// guardrailWire is one row of the project guardrail catalog
+// (bundle.guardrails[]). evaluator_slug is preferred for invocation;
+// evaluator_id is the stable fallback.
+type guardrailWire struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	EvaluatorID   string `json:"evaluator_id"`
+	EvaluatorSlug string `json:"evaluator_slug"`
+	Direction     string `json:"direction"`
+	FailureMode   string `json:"failure_mode"`
+}
+
+// guardrailAttachmentWire is the VK's per-direction opt-in
+// (bundle.guardrail_attachments[]).
+type guardrailAttachmentWire struct {
+	Direction    string   `json:"direction"`
+	GuardrailIDs []string `json:"guardrail_ids"`
+}
+
+type policyRulesWire struct {
+	Tools  policyRuleSetWire `json:"tools"`
+	MCP    policyRuleSetWire `json:"mcp"`
+	URLs   policyRuleSetWire `json:"urls"`
+	Models policyRuleSetWire `json:"models"`
+}
+
+type policyRuleSetWire struct {
+	Deny  []string `json:"deny"`
+	Allow []string `json:"allow"`
+}
+
+type budgetWire struct {
+	ID    string `json:"id"`
+	Scope string `json:"scope"`
+	// ScopeID is the enforcement bucket, not always the raw target: GROUP
+	// budgets arrive as "<groupId>:<userId>" (one bucket per member) and
+	// provider-filtered budgets suffix "|provider:<mpId>". Computed by the
+	// control plane's budgetResolution.service.ts; carried verbatim.
+	ScopeID string `json:"scope_id"`
+	// PrincipalID names the member a GROUP bucket belongs to. Absent for
+	// every other scope.
+	PrincipalID string `json:"principal_id"`
+	// ProviderKey is the ModelProvider row id the budget is filtered to.
+	// null on the wire (= counts every dispatch) decodes to "".
+	ProviderKey string `json:"provider_key"`
+	// PerUser marks an attributed-user TEMPLATE: ScopeID is the anchor and
+	// the limit applies to each distinct external end user separately. The
+	// gateway resolves the request's own bucket through the cached
+	// bucket-spend read; SpentMicroUSD is 0 on templates.
+	PerUser       bool   `json:"per_user"`
+	Window        string `json:"window"`
+	LimitMicroUSD int64  `json:"limit_micro_usd"`
+	SpentMicroUSD int64  `json:"spent_micro_usd"`
+	ResetsAt      int64  `json:"resets_at"`
+	OnBreach      string `json:"on_breach"`
+}
+
+type cacheRuleWire struct {
+	ID       string            `json:"id"`
+	Priority int               `json:"priority"`
+	Matchers cacheMatchersWire `json:"matchers"`
+	Action   cacheActionWire   `json:"action"`
+}
+
+// cacheMatchersWire mirrors the matchers shape emitted by the control-plane
+// materialiser (modules/gateway/process/src/services/gateway-config-materialisation.service.ts:121-128).
+// Every recognized matcher must have an explicit field — silently dropping a
+// matcher at unmarshal collapses the rule's effective scope to "match all",
+// which has caused stripped `cache_control` on system blocks in matrix tests.
+type cacheMatchersWire struct {
+	Model           string            `json:"model"`
+	PrincipalID     string            `json:"principal_id"`
+	VKID            string            `json:"vk_id"`
+	VKPrefix        string            `json:"vk_prefix"`
+	VKTags          []string          `json:"vk_tags"`
+	RequestMetadata map[string]string `json:"request_metadata"`
+}
+
+type cacheActionWire struct {
+	Mode string `json:"mode"`
+	TTL  *int   `json:"ttl"`
+}
+
+func (w *configWire) toDomain() domain.BundleConfig {
+	creds := make([]domain.Credential, 0, len(w.Providers))
+	for _, p := range w.Providers {
+		creds = append(creds, providerSlotToCredential(p))
+	}
+
+	cfg := domain.BundleConfig{
+		Credentials:              creds,
+		TraceProjectID:           w.ProjectID,
+		ProjectOTLPToken:         w.ProjectOTLPToken,
+		MirrorTier:               w.LangyMirrorTier,
+		VKDisplayPrefix:          w.DisplayPrefix,
+		VKTags:                   w.VKTags,
+		AllowedModels:            w.ModelsAllowed,
+		ProvidersAllowed:         w.ProvidersAllowed,
+		RoutingMode:              w.RoutingMode,
+		RoutingExcludedProviders: toExcludedProviders(w.RoutingExcludedProviders),
+		AccessExcludedProviders:  toExcludedProviders(w.AccessExcludedProviders),
+		RoutingPolicyName:        w.RoutingPolicyName,
+		Fallback: domain.FallbackConfig{
+			MaxAttempts: w.Fallback.MaxAttempts,
+		},
+		Guardrails: buildGuardrails(w.Guardrails, w.GuardrailAttachments),
+	}
+
+	// No-fallback keys get exactly one dispatch attempt. The control plane
+	// already pins max_attempts to 1 when routing_mode is none; re-pinning at
+	// decode means a drifted or hand-crafted bundle cannot quietly re-arm
+	// fallback on a key whose owner chose not to have it.
+	if w.RoutingMode == domain.RoutingModeNone {
+		cfg.Fallback.MaxAttempts = 1
+	}
+
+	if w.RateLimits.RPM != nil {
+		cfg.RateLimits.RPM = *w.RateLimits.RPM
+	}
+	if w.RateLimits.RPD != nil {
+		cfg.RateLimits.RPD = *w.RateLimits.RPD
+	}
+
+	if len(w.ModelAliases) > 0 {
+		cfg.ModelAliases = make(map[string]domain.ModelAlias, len(w.ModelAliases))
+		for alias, model := range w.ModelAliases {
+			cfg.ModelAliases[alias] = buildModelAlias(model)
+		}
+	}
+
+	cfg.Budget.Scopes = toBudgetScopes(w.Budgets)
+	cfg.Budget.ValidUntil = budgetsValidUntil(w.Budgets)
+	cfg.PolicyRules = buildPolicyRules(w.PolicyRules)
+	cfg.CacheRules = buildCacheRules(w.CacheRules)
+
+	return cfg
+}
+
+// buildGuardrails reconstructs the per-direction domain.GuardrailsConfig
+// from the flat project catalog + the VK's attachment tuples. The VK
+// invokes a guardrail in the direction declared on its attachment;
+// the evaluator is resolved from the catalog (slug preferred, id
+// fallback). Catalog entries the VK did not attach are dropped — the
+// gateway only runs what the VK opted into.
+func buildGuardrails(
+	catalog []guardrailWire,
+	attachments []guardrailAttachmentWire,
+) domain.GuardrailsConfig {
+	byID := make(map[string]guardrailWire, len(catalog))
+	for _, g := range catalog {
+		byID[g.ID] = g
+	}
+	cfg := domain.GuardrailsConfig{}
+	var requestFailClosed, responseFailClosed bool
+	for _, att := range attachments {
+		for _, id := range att.GuardrailIDs {
+			g, ok := byID[id]
+			if !ok {
+				// Dangling reference — the control plane already filters
+				// these, but stay defensive so a stale id never injects an
+				// empty-evaluator entry.
+				continue
+			}
+			evaluator := g.EvaluatorSlug
+			if evaluator == "" {
+				evaluator = g.EvaluatorID
+			}
+			entry := domain.GuardrailEntry{ID: g.ID, Evaluator: evaluator}
+			switch att.Direction {
+			case "pre", "request":
+				cfg.Pre = append(cfg.Pre, entry)
+				requestFailClosed = requestFailClosed || failsClosed(g)
+			case "post", "response":
+				cfg.Post = append(cfg.Post, entry)
+				responseFailClosed = responseFailClosed || failsClosed(g)
+			case "stream_chunk":
+				cfg.StreamChunk = append(cfg.StreamChunk, entry)
+			}
+		}
+	}
+	// failure_mode is per guardrail, but the data plane's flag is per
+	// direction, because a direction is one call and an unreachable control
+	// plane produces no per-guardrail verdicts to apply a mode to. A direction
+	// therefore fails open only when every guardrail on it opted into that: one
+	// guardrail set to fail closed means the operator asked for the request to
+	// stop when it cannot be evaluated, and a control-plane outage is exactly
+	// that case.
+	//
+	// A direction with no guardrails is vacuously fail-open, which is right:
+	// there is nothing there to bypass.
+	cfg.RequestFailOpen = !requestFailClosed
+	cfg.ResponseFailOpen = !responseFailClosed
+	return cfg
+}
+
+// failsClosed reports whether a guardrail should stop the request when it
+// cannot be evaluated. Anything other than an explicit fail_open is treated as
+// fail closed, matching the control plane, where FAIL_CLOSED is the Prisma
+// default and the only opt-out is the operator choosing FAIL_OPEN.
+func failsClosed(g guardrailWire) bool {
+	return g.FailureMode != "fail_open"
+}
+
+// buildModelAlias splits an alias target into the provider that serves it
+// and the model name the provider knows. The control-plane writes aliases
+// in "provider/model" form ("openai/gpt-5-mini"), which is a routing
+// instruction, not a model ID: keeping the prefix on Model would send the
+// provider a model name it has never heard of. A bare target carries no
+// provider and resolves against the credential chain like any other
+// unqualified model.
+// The prefix has to name a provider family the gateway knows. A target whose
+// first segment is a routing handle, or a model id that simply contains a
+// slash, is left whole for the resolver, which holds the key's config and can
+// tell the two apart. Splitting those here produced an alias pointing at a
+// provider nobody holds, so no request for it could ever be served.
+func buildModelAlias(target string) domain.ModelAlias {
+	providerID, model, _ := domain.SplitModelSpelling(target)
+	return domain.ModelAlias{ProviderID: providerID, Model: model}
+}
+
+func buildPolicyRules(pr policyRulesWire) []domain.PolicyRule {
+	var rules []domain.PolicyRule
+	for _, d := range pr.Tools.Deny {
+		rules = append(rules, domain.PolicyRule{Pattern: d, Type: domain.PolicyDeny, Target: domain.PolicyTargetTool})
+	}
+	for _, a := range pr.Tools.Allow {
+		rules = append(rules, domain.PolicyRule{Pattern: a, Type: domain.PolicyAllow, Target: domain.PolicyTargetTool})
+	}
+	for _, d := range pr.MCP.Deny {
+		rules = append(rules, domain.PolicyRule{Pattern: d, Type: domain.PolicyDeny, Target: domain.PolicyTargetMCP})
+	}
+	for _, a := range pr.MCP.Allow {
+		rules = append(rules, domain.PolicyRule{Pattern: a, Type: domain.PolicyAllow, Target: domain.PolicyTargetMCP})
+	}
+	for _, d := range pr.URLs.Deny {
+		rules = append(rules, domain.PolicyRule{Pattern: d, Type: domain.PolicyDeny, Target: domain.PolicyTargetURL})
+	}
+	for _, a := range pr.URLs.Allow {
+		rules = append(rules, domain.PolicyRule{Pattern: a, Type: domain.PolicyAllow, Target: domain.PolicyTargetURL})
+	}
+	for _, d := range pr.Models.Deny {
+		rules = append(rules, domain.PolicyRule{Pattern: d, Type: domain.PolicyDeny, Target: domain.PolicyTargetModel})
+	}
+	for _, a := range pr.Models.Allow {
+		rules = append(rules, domain.PolicyRule{Pattern: a, Type: domain.PolicyAllow, Target: domain.PolicyTargetModel})
+	}
+	return rules
+}
+
+func buildCacheRules(wires []cacheRuleWire) []domain.CacheRule {
+	rules := make([]domain.CacheRule, len(wires))
+	for i := range wires {
+		w := &wires[i]
+		var models []string
+		if w.Matchers.Model != "" {
+			models = []string{w.Matchers.Model}
+		}
+		var principals []string
+		if w.Matchers.PrincipalID != "" {
+			principals = []string{w.Matchers.PrincipalID}
+		}
+		var vkIDs []string
+		if w.Matchers.VKID != "" {
+			vkIDs = []string{w.Matchers.VKID}
+		}
+		var vkPrefixes []string
+		if w.Matchers.VKPrefix != "" {
+			vkPrefixes = []string{w.Matchers.VKPrefix}
+		}
+		// request_metadata is intentionally not yet evaluated end-to-end
+		// (the gateway doesn't surface the inbound request headers to the
+		// cache evaluator yet). Until that wiring lands, a rule that
+		// depends on request_metadata must not silently match every VK —
+		// route it through the same fail-safe as VKTags by collapsing it
+		// into a never-matchable VKTag sentinel. Drops the rule instead
+		// of misapplying it.
+		vkTags := w.Matchers.VKTags
+		if len(w.Matchers.RequestMetadata) > 0 {
+			vkTags = append(vkTags, "__unsupported_matcher_request_metadata__")
+		}
+		rules[i] = domain.CacheRule{
+			ID:       w.ID,
+			Priority: w.Priority,
+			Match: domain.CacheRuleMatch{
+				Models:     models,
+				Principals: principals,
+				VKIDs:      vkIDs,
+				VKPrefixes: vkPrefixes,
+				VKTags:     vkTags,
+			},
+			Action: domain.CacheAction(w.Action.Mode),
+		}
+	}
+	return rules
+}
+
+func toBudgetScopes(ws []budgetWire) []domain.BudgetScope {
+	scopes := make([]domain.BudgetScope, len(ws))
+	for i := range ws {
+		b := &ws[i]
+		scopes[i] = domain.BudgetScope{
+			ID:            b.ID,
+			Scope:         b.Scope,
+			ScopeID:       b.ScopeID,
+			PrincipalID:   b.PrincipalID,
+			PerUser:       b.PerUser,
+			ProviderKey:   b.ProviderKey,
+			Window:        b.Window,
+			LimitMicroUSD: b.LimitMicroUSD,
+			SpentMicroUSD: b.SpentMicroUSD,
+			OnBreach:      b.OnBreach,
+		}
+	}
+	return scopes
+}
+
+// budgetsValidUntil is the earliest boundary any enforceable budget on this
+// bundle is heading for: the instant its spend figures stop describing the
+// current period. See domain.BudgetConfig.ValidUntil for what the cache does
+// with it.
+//
+// Scopes without a limit are skipped because the checker skips them too, so
+// their boundary would shorten the config's life for a budget that can never
+// block. A non-positive resets_at is skipped as no answer rather than read as
+// 1970: TOTAL and MANUAL windows ship a far-future sentinel, and a control
+// plane older than the field ships nothing at all, neither of which is a
+// period that has ended.
+func budgetsValidUntil(ws []budgetWire) time.Time {
+	var earliest time.Time
+	for i := range ws {
+		b := &ws[i]
+		if b.LimitMicroUSD <= 0 || b.ResetsAt <= 0 {
+			continue
+		}
+		at := time.Unix(b.ResetsAt, 0)
+		if earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+	}
+	return earliest
+}
+
+// toExcludedProviders maps the {id, type} exclusion wire entries onto domain
+// rows, normalizing the provider type the same way credentials are so the
+// gateway matches a resolved request's provider kind consistently.
+func toExcludedProviders(ws []excludedProviderWire) []domain.ExcludedModelProvider {
+	if len(ws) == 0 {
+		return nil
+	}
+	out := make([]domain.ExcludedModelProvider, 0, len(ws))
+	for _, w := range ws {
+		out = append(out, domain.ExcludedModelProvider{
+			ID:         w.ID,
+			ProviderID: domain.NormalizeProviderID(w.Type),
+			Handle:     strings.ToLower(w.Handle),
+		})
+	}
+	return out
+}
+
+func providerSlotToCredential(p providerSlotWire) domain.Credential {
+	cred := domain.Credential{
+		ID:         p.ID,
+		ProviderID: domain.NormalizeProviderID(p.Type),
+		Handle:     strings.ToLower(p.Handle),
+		Models:     p.Models,
+	}
+
+	getString := func(key string) string {
+		if v, ok := p.Credentials[key]; ok {
+			if s, ok := v.(string); ok {
+				return s
+			}
+		}
+		return ""
+	}
+
+	// deployment_map is a top-level sibling of credentials on the wire
+	// (materialiser emits it at ProviderSlot.deployment_map when the
+	// ModelProvider has a non-empty deploymentMapping). Providers that
+	// don't use deployment routing get nil here and ignore it.
+	if len(p.DeploymentMap) > 0 {
+		cred.DeploymentMap = p.DeploymentMap
+	}
+
+	switch cred.ProviderID {
+	case domain.ProviderAzure:
+		cred.APIKey = getString("api_key")
+		cred.Extra = map[string]string{
+			"endpoint":    getString("endpoint"),
+			"api_version": getString("api_version"),
+		}
+	case domain.ProviderBedrock:
+		cred.Extra = map[string]string{
+			"access_key":    getString("access_key"),
+			"secret_key":    getString("secret_key"),
+			"session_token": getString("session_token"),
+			"region":        getString("region"),
+		}
+	case domain.ProviderVertex:
+		cred.Extra = map[string]string{
+			"project_id":       getString("project_id"),
+			"project_number":   getString("project_number"),
+			"region":           getString("region"),
+			"auth_credentials": getString("auth_credentials"),
+		}
+	case domain.ProviderOpenAICodex:
+		// OAuth session, not an API key: the access token rides APIKey (it
+		// is the bearer), the ChatGPT account id becomes a request header,
+		// and the provider row id is the refresh callback's address.
+		cred.APIKey = getString("access_token")
+		cred.Extra = map[string]string{
+			"account_id":      getString("account_id"),
+			"provider_row_id": getString("provider_row_id"),
+		}
+	case domain.ProviderLangWatch:
+		// The license token is the bearer and the instance id rides a header,
+		// because the registry binds a license to one install and refuses the
+		// token presented from anywhere else (ADR-139 section 4).
+		cred.APIKey = getString("api_key")
+		cred.Extra = map[string]string{"instance_id": getString("instance_id")}
+	case domain.ProviderGemini:
+		// Gemini's second door: a credential carrying project_id + region
+		// is an Agent Platform key, and mapProvider routes it to
+		// aiplatform.googleapis.com off exactly these two Extra fields
+		// (credentialIsAgentPlatform). Dropping them here silently sends
+		// the key to the Gemini API host, where it is refused. Emitted by
+		// config.materialiser.ts's gemini branch together or not at all.
+		cred.APIKey = getString("api_key")
+		if project, region := getString("project_id"), getString("region"); project != "" && region != "" {
+			cred.Extra = map[string]string{
+				"project_id": project,
+				"region":     region,
+			}
+		}
+	default:
+		cred.APIKey = getString("api_key")
+	}
+
+	if p.BaseURL != "" {
+		if cred.Extra == nil {
+			cred.Extra = map[string]string{}
+		}
+		cred.Extra["base_url"] = p.BaseURL
+	}
+
+	return cred
+}

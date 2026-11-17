@@ -1,0 +1,77 @@
+{
+  "name": "@langwatch/mcp-server",
+  "version": "3.1.0",
+  "description": "An MCP server for Langwatch.",
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/langwatch/langwatch.git",
+    "directory": "mcp-server"
+  },
+  "bin": {
+    "langwatch-mcp-server": "./dist/index.js"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./create-mcp-server": {
+      "types": "./src/create-mcp-server.d.ts",
+      "import": "./dist/create-mcp-server.js",
+      "require": "./dist/create-mcp-server.cjs",
+      "default": "./dist/create-mcp-server.js"
+    },
+    "./config": {
+      "types": "./src/config.d.ts",
+      "import": "./dist/config.js",
+      "require": "./dist/config.cjs",
+      "default": "./dist/config.js"
+    }
+  },
+  "scripts": {
+    "start": "node --experimental-transform-types src/index.ts",
+    "build": "tsup && node build.js",
+    "typecheck": "GOMAXPROCS=2 GOMEMLIMIT=2GiB pnpm -w exec tsc -b mcp/typescript",
+    "prepublish": "pnpm run build",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.js",
+    "test:scenario": "vitest run --config vitest.scenario.config.js",
+    "smoke": "vitest run --config vitest.smoke.config.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "catalog:",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@ai-sdk/anthropic": "catalog:",
+    "@anthropic-ai/claude-code": "2.1.228",
+    "@langwatch/egress": "workspace:*",
+    "@langwatch/evaluator-contract": "workspace:*",
+    "@langwatch/handled-error": "workspace:*",
+    "@langwatch/redaction": "workspace:*",
+    "@langwatch/scenario": "catalog:",
+    "@types/debug": "catalog:",
+    "@types/express": "^5.0.6",
+    "@types/node": "catalog:",
+    "@types/yargs": "^17.0.33",
+    "ai": "catalog:",
+    "chalk": "catalog:",
+    "dotenv": "catalog:",
+    "esbuild": "catalog:",
+    "express": "^5.2.1",
+    "node-pty": "catalog:",
+    "tsup": "catalog:",
+    "typescript": "catalog:sdk-toolchain",
+    "vitest": "catalog:",
+    "yargs": "^18.0.0",
+    "zod-validation-error": "catalog:"
+  },
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1"
+  }
+}

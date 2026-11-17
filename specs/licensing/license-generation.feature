@@ -1,0 +1,114 @@
+Feature: License Generation
+
+  # Licenses are issued by a LangWatch operator on the Backoffice Licenses
+  # screen, signed with the server's signing key. No private key is ever typed
+  # or pasted into a form. What the registry records for each issued license is
+  # specified in specs/self-hosting/connected-services/license-registry.feature.
+  #
+  # The UI scenarios below describe the issue drawer on that screen and have no
+  # component-level harness yet. The underlying generateLicenseKey function is
+  # unit-tested in ee/licensing/__tests__/licenseGenerationService.unit.test.ts.
+
+  As a LangWatch operator
+  I want to issue licenses for customer organizations
+  So that I can provide valid license keys for self-hosted deployments
+
+  Background:
+    Given I am signed in as a LangWatch operator
+    And I am on the Backoffice Licenses screen
+
+  # Happy path - full system flow
+  @e2e @unimplemented
+  Scenario: Generate a valid license for an organization
+    Given I navigate to the license generation section
+    When I fill in the organization name "Acme Corp"
+    And I fill in the email "admin@acme.corp"
+    And I select the plan type "PRO"
+    And I set the expiration date to "2025-12-31"
+    And I set the plan limits:
+      | Field               | Value  |
+      | maxMembers          | 10     |
+      | maxMembersLite      | 5      |
+      | maxMessagesPerMonth | 100000 |
+      | canPublish          | true   |
+      | usageUnit           | traces |
+    And I click "Generate License"
+    Then a license file is automatically downloaded
+    And the downloaded file is named "Acme Corp.langwatch-license"
+    And I see a success message confirming the download
+
+  # Form validation and error handling
+  @integration @unimplemented
+  Scenario: Display validation error for missing required fields
+    Given I navigate to the license generation section
+    When I click "Generate License" without filling any fields
+    Then I see validation errors for:
+      | Field            | Error                            |
+      | organizationName | Organization name is required    |
+      | email            | Email is required                |
+      | expiresAt        | Expiration date is required      |
+      | planType         | Plan type is required            |
+
+  @integration @unimplemented
+  Scenario: Generate license with preset plan template
+    Given I navigate to the license generation section
+    And I fill in the organization name "Enterprise Corp"
+    And I fill in the email "admin@enterprise.corp"
+    When I select the plan type "ENTERPRISE"
+    Then the plan limits are populated with enterprise defaults:
+      | Field               | Value    |
+      | maxMembers          | 100      |
+      | maxMembersLite      | 50       |
+      | maxMessagesPerMonth | 10000000 |
+      | canPublish          | true     |
+      | usageUnit           | traces   |
+
+  @integration @unimplemented
+  Scenario: Customize plan limits after selecting template
+    Given I navigate to the license generation section
+    And I fill in the organization name "Custom Corp"
+    And I fill in the email "admin@custom.corp"
+    And I select the plan type "PRO"
+    When I change maxMembers to "25"
+    And I change maxMembersLite to "12"
+    Then the form retains the custom values
+    And other fields keep the PRO template defaults
+
+  @integration @unimplemented
+  Scenario: License file download uses organization name in filename
+    Given I have filled in the organization name "Test Company Inc"
+    And I have completed all other required fields
+    When I click "Generate License"
+    Then the downloaded file is named "Test Company Inc.langwatch-license"
+
+  @integration @unimplemented
+  Scenario: License file download sanitizes special characters in filename
+    Given I have filled in the organization name "Company/With:Special*Characters"
+    And I have completed all other required fields
+    When I click "Generate License"
+    Then the downloaded file has a sanitized filename
+    And the filename uses the .langwatch-license extension
+
+  @integration @unimplemented
+  Scenario: Generate another license after successful generation
+    Given I have successfully generated a license
+    When I click "Generate Another"
+    Then the form is cleared
+    And I can enter new license details
+
+  # API-level validation
+
+  Rule: Entitlement flags survive generation and mapping
+
+    @unit
+    Scenario: A generated enterprise license carries the webhook entitlement
+      Given the ENTERPRISE plan template enables webhook endpoints
+      When a license is generated and validated
+      Then the validated plan still carries the entitlement
+
+    @unit
+    Scenario: A licensed webhook entitlement survives the PlanInfo mapping
+      Given a validated license whose plan enables webhook endpoints
+      When the license is mapped to the active PlanInfo
+      Then webhook endpoints stay available
+      And they are available too on an enterprise license that never mentioned them

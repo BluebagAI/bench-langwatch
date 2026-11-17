@@ -1,0 +1,107 @@
+---
+title: Guardrails
+description: Run LangWatch evaluators on gateway traffic and block a request, a response or a stream before it reaches the other side.
+sidebarTitle: Guardrails
+---
+
+## What a guardrail is
+
+A guardrail is a project-scoped evaluator that the LangWatch AI Gateway runs inline on a request. The evaluator returns pass or fail. On fail, the gateway blocks the request instead of forwarding it, or blocks the response instead of returning it.
+
+A guardrail has three parts:
+
+| Part         | Values                                                                                  |
+| ------------ | --------------------------------------------------------------------------------------- |
+| Evaluator    | Any evaluator of the project that has an enabled monitor set to run as a guardrail.     |
+| Direction    | **Pre (request)**, **Post (response)** or **Stream chunk**.                             |
+| Failure mode | Fail closed (default) or fail open. Decides what happens when the evaluator cannot run. |
+
+A virtual key attaches guardrails per direction. The gateway evaluates them on every request through that key.
+
+## Directions
+
+**Request.** Runs on the inbound prompt before it reaches the provider. The evaluator receives the `messages`, `tools` and `mcps` fields of the body, so a policy that inspects tool definitions sees them. A blocked request never reaches the provider and costs no tokens.
+
+**Response.** Runs on the full completion before it returns to the caller. The evaluator receives the assistant text of the first choice. A blocked response is replaced by the error below; the provider call has already been billed.
+
+**Stream chunk.** Runs on each streamed chunk as it passes through. On a fail verdict the gateway closes the stream at that chunk. The caller sees the stream end with the usual `data: [DONE]` frame and no error frame. Chunks already sent stay with the caller.
+
+The gateway waits up to 5 seconds for a request or response evaluation and 50 milliseconds for a stream chunk evaluation.
+
+## Failure modes
+
+An evaluation that cannot complete (a timeout, an evaluator error, an evaluator that is no longer marked as a guardrail) is not a pass.
+
+- **Fail closed** refuses the request. This is the default. An evaluator that throws or returns an error answers `403 guardrail_blocked` with the message `guardrail evaluator failed to run`, or the evaluator's own error text. When the gateway cannot reach LangWatch to run the check, or the check does not answer within the timeout, the answer is `503 guardrail_upstream_unavailable` with the message `guardrail could not be evaluated`.
+- **Fail open** lets the request through and stamps `langwatch.guardrail.fail_open=true` and `langwatch.guardrail.direction` on the span, with a `guardrail_fail_open` span event that carries the cause.
+
+Stream chunk guardrails always fail open, so a slow evaluator never stalls a stream. The span records `langwatch.guardrail.stream_chunk_fail_open` with the cause.
+
+Several guardrails on the same direction run in parallel. One fail verdict blocks; the block reason joins the reasons of every guardrail that failed.
+
+## What a blocked caller gets
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{
+  "error": {
+    "type": "guardrail_blocked",
+    "code": "guardrail_blocked",
+    "message": "<the evaluator's reason>",
+    "fault": "customer"
+  }
+}
+```
+
+The message is the evaluator's own reason when it returns one, otherwise `<guardrail name> did not pass`. An evaluator's reason can quote the input that failed, so the message can contain the prompt text. The response also carries `X-LangWatch-Handled-Error: guardrail_blocked`; there is no other guardrail header, and an allowed request carries no header that says a guardrail ran. Read the exact wire shape and the other codes on [API Reference, Errors](/ai-gateway/api/errors).
+
+## Requests that skip guardrails
+
+A realtime session mint (`POST /v1/realtime/client_secrets`, `GET /v1/convai/conversation/get-signed-url`) carries a session declaration, not a prompt, and the conversation itself never passes through the gateway. The gateway skips every guardrail on it and sets `X-LangWatch-Guardrails-Not-Applied: realtime_session` on the response, so a skipped guardrail is visible instead of silent.
+
+## Set up a guardrail
+
+<Steps>
+  <Step title="Mark an evaluator as a guardrail">
+    Open **Online Evals**, edit the evaluator's monitor and set **Execution Mode** to **As a Guardrail**. The option exists only on evaluators that can run as a guardrail. Only evaluators with an enabled monitor in that mode appear in the next step.
+  </Step>
+  <Step title="Create the guardrail">
+    Open **AI Gateway, Guardrails** in the sidebar (`/gateway/guardrails`). Click **New guardrail**, pick the evaluator, the direction and the failure mode.
+
+    <Frame caption="The New guardrail drawer. The evaluator list holds only the evaluators marked as guardrails in the previous step.">
+
+  <img src="/images/ai-gateway/guardrail-drawer.png" alt="The New guardrail drawer with the name, evaluator, direction and failure mode fields" />
+</Frame>
+
+    <Frame caption="The Guardrails list: one guardrail on the request, one on the response.">
+
+  <img src="/images/ai-gateway/guardrails-list.png" alt="The Guardrails list with the Name, Direction, Evaluator and Failure mode columns" />
+</Frame>
+  </Step>
+  <Step title="Attach it to a virtual key">
+    Open the key's detail page under **AI Gateway, Virtual Keys** (`/gateway/virtual-keys/<id>`). In the **Guardrails** section, tick the guardrail under **Pre-request**, **Post-response** or **Stream chunk**, and click **Save guardrails**. The edit drawer has no guardrail field. Guardrails are project-scoped: the key must be scoped to that single project to attach them.
+
+    <Frame caption="The Guardrails section of a key's detail page, with the request guardrail ticked.">
+
+  <img src="/images/ai-gateway/vk-guardrails-attach.png" alt="The Guardrails section of a virtual key detail page with Pre-request and Post-response groups and the Save guardrails button" />
+</Frame>
+  </Step>
+  <Step title="Verify">
+    Send a request the evaluator rejects and check the response for `403` and `"code": "guardrail_blocked"`. Open the trace in Trace Explorer: the span records `error.type` as `guardrail_blocked`.
+
+    A stream chunk guardrail has no error response to read. Send a streaming request whose output the evaluator rejects: the stream ends early at the rejected chunk, with the usual `data: [DONE]` frame and no error frame.
+
+  </Step>
+</Steps>
+
+Creating, editing or archiving a guardrail is written to the audit log as `gateway.guardrail.created`, `gateway.guardrail.updated` or `gateway.guardrail.archived`. The `gatewayGuardrails:attach` permission in the project gates the attach step.
+
+## Boundaries
+
+- Guardrails block or allow. They do not rewrite content in either direction.
+- The guardrail check is a call from the gateway to the LangWatch control plane, which runs the evaluator. The prompt or completion is sent to the evaluator as evaluation input and is not stored by the check itself; the evaluator's own trace records what it scored.
+- A request guardrail on a streaming request runs before the stream opens. A stream chunk guardrail is the only check on the streamed content; there is no whole-response check after a stream ends.
+
+**Also check:** [Policy Rules](/ai-gateway/policy-rules) for regex allow and deny lists that need no evaluator, [Evaluators](/evaluations/evaluators/overview) for the evaluator catalog, [Observability](/ai-gateway/observability) for the span attributes.

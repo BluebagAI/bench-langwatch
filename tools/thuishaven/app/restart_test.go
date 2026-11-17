@@ -1,0 +1,524 @@
+package app
+
+import (
+	"context"
+	"errors"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/langwatch/langwatch/tools/thuishaven/domain"
+)
+
+func restartStack() domain.Stack {
+	return domain.Stack{
+		Slug: "feat-x", WorktreeDir: "/wt/feat-x", LauncherPID: 42,
+		APIPort: 9100, WorkerMetricsPort: 9200,
+		Services: []domain.Service{
+			{Name: "app", Port: 9000},
+			{Name: "gateway", Port: 9001},
+			{Name: "nlp", Port: 9002, IsFallback: true}, // baseline fallback — not ours to bounce
+			{Name: "clickhouse", Port: 8123},            // shared DB server — never a restart target
+		},
+	}
+}
+
+func restartOrch(store *fakeStore, sys *fakeSystem) *Orchestrator {
+	return &Orchestrator{
+		cfg:   Config{Naming: domain.DefaultNaming("")},
+		store: store, sys: sys, proxy: &fakeProxy{}, log: zap.NewNop(),
+	}
+}
+
+// @scenario "Restarting one service bounces only that service"
+// @scenario "Restarting with no service named bounces every supervised child"
+// @scenario "Bouncing the backend lane touches only its own process group"
+// @scenario "The Go data-plane services are restarted as one lane"
+func TestRestart(t *testing.T) {
+	ctx := context.Background()
+	params := UpParams{WorktreeDir: "/wt/feat-x", IsLinkedWorktree: true}
+
+	newFixture := func() (*fakeStore, *fakeSystem, *Orchestrator) {
+		store := &fakeStore{
+			stacks:    []domain.Stack{restartStack()},
+			slugCache: map[string]string{"/wt/feat-x": "feat-x"},
+		}
+		sys := &fakeSystem{
+			alive: map[int]bool{42: true},
+			pidsByPort: map[int][]int{
+				9000: {100}, 9001: {101}, 9100: {102}, 9200: {103},
+			},
+		}
+		return store, sys, restartOrch(store, sys)
+	}
+
+	t.Run("given a live stack", func(t *testing.T) {
+		// gateway and nlp share one process, so they are offered as the one `go`
+		// lane rather than two names that would each take the other down without
+		// saying so.
+		t.Run("when restarting one service, it kills only that service's group", func(t *testing.T) {
+			_, sys, o := newFixture()
+			if err := o.Restart(ctx, params, GoLane, false); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if len(sys.groupTerminated) != 1 || sys.groupTerminated[0] != 101 {
+				t.Errorf("only the go lane's group should be terminated, got %v", sys.groupTerminated)
+			}
+		})
+
+		t.Run("when restarting the backend, it resolves the API port", func(t *testing.T) {
+			_, sys, o := newFixture()
+			if err := o.Restart(ctx, params, APILane, false); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if len(sys.groupTerminated) != 1 || sys.groupTerminated[0] != 102 {
+				t.Errorf("backend group should be terminated, got %v", sys.groupTerminated)
+			}
+		})
+
+		t.Run("when restarting with no service named, it bounces every supervised child", func(t *testing.T) {
+			_, sys, o := newFixture()
+			if err := o.Restart(ctx, params, "", false); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			// ui, go, backend — NOT the fallback nlp, NOT clickhouse. The
+			// worker's metrics port is inside the backend process, so it is not
+			// a target of its own.
+			want := map[int]bool{100: true, 101: true, 102: true}
+			if len(sys.groupTerminated) != len(want) {
+				t.Fatalf("expected %d groups terminated, got %v", len(want), sys.groupTerminated)
+			}
+			for _, pid := range sys.groupTerminated {
+				if !want[pid] {
+					t.Errorf("unexpected group %d terminated", pid)
+				}
+			}
+		})
+
+		t.Run("when naming an unknown or shared service, it refuses with the restartable list", func(t *testing.T) {
+			for _, name := range []string{"clickhouse", "nlp", "backend", "workers", "bogus"} {
+				_, sys, o := newFixture()
+				if err := o.Restart(ctx, params, name, false); err == nil {
+					t.Errorf("Restart(%q) should refuse", name)
+				}
+				if len(sys.groupTerminated) != 0 {
+					t.Errorf("Restart(%q) must terminate nothing, got %v", name, sys.groupTerminated)
+				}
+			}
+		})
+
+		t.Run("when the launcher itself owns the port, it is never signalled", func(t *testing.T) {
+			store, sys, _ := newFixture()
+			sys.pidsByPort[9000] = []int{42}
+			store.stacks[0].Refresh = domain.RefreshHMR
+			o := restartOrch(store, sys)
+			if err := o.Restart(ctx, params, "ui", false); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			if len(sys.groupTerminated) != 0 {
+				t.Errorf("the launcher's own pid must never be group-terminated, got %v", sys.groupTerminated)
+			}
+		})
+
+		// The API and the worker share the backend process locally, so `backend`
+		// is the one name that bounces both, and it can never reach the ui lane's
+		// group or the go lane's.
+		t.Run("when `backend` is named, only the backend's own group is bounced", func(t *testing.T) {
+			store, sys, o := newFixture()
+			if err := o.Restart(ctx, params, APILane, false); err != nil {
+				t.Fatalf("Restart(backend): %v", err)
+			}
+			_ = store
+			if len(sys.groupTerminated) != 1 || sys.groupTerminated[0] != 102 {
+				t.Errorf("expected only the backend group (pid 102) bounced, got %v", sys.groupTerminated)
+			}
+		})
+
+		t.Run("when nothing is named, both Node lanes and the go lane are bounced", func(t *testing.T) {
+			_, sys, o := newFixture()
+			if err := o.Restart(ctx, params, "", false); err != nil {
+				t.Fatalf("Restart(all): %v", err)
+			}
+			// ui (9000), go (9001), backend (9100).
+			want := map[int]bool{100: true, 101: true, 102: true}
+			for _, pid := range sys.groupTerminated {
+				if !want[pid] {
+					t.Errorf("unexpected group %d bounced, got %v", pid, sys.groupTerminated)
+				}
+			}
+			if len(sys.groupTerminated) != len(want) {
+				t.Fatalf("expected %d groups terminated, got %v", len(want), sys.groupTerminated)
+			}
+		})
+	})
+
+	t.Run("given the stack is not running", func(t *testing.T) {
+		t.Run("when restarting, it refuses and points at up", func(t *testing.T) {
+			store, sys, _ := newFixture()
+			sys.alive = map[int]bool{}
+			o := restartOrch(store, sys)
+			if err := o.Restart(ctx, params, "ui", false); err == nil {
+				t.Error("Restart should refuse when the launcher is dead")
+			}
+		})
+	})
+}
+
+// @scenario "Up on an already-running stack reconciles"
+// @scenario "Up recovers a half-dead stack without a force flag"
+func TestUpReconcilesRunningStack(t *testing.T) {
+	params := UpParams{WorktreeDir: "/wt/feat-x", IsLinkedWorktree: true}
+
+	newFixture := func(launcherAlive bool) (*fakeStore, *fakeSystem, *Orchestrator) {
+		store := &fakeStore{
+			stacks:    []domain.Stack{restartStack()},
+			slugCache: map[string]string{"/wt/feat-x": "feat-x"},
+		}
+		sys := &fakeSystem{alive: map[int]bool{42: launcherAlive}}
+		return store, sys, restartOrch(store, sys)
+	}
+
+	t.Run("given the stack is live and matches the selection", func(t *testing.T) {
+		t.Run("when up runs, it is a friendly no-op — nothing terminated, nothing provisioned", func(t *testing.T) {
+			_, sys, o := newFixture(true)
+			// Spelled out rather than derived through SelectionFromStack: deriving
+			// the expectation with the same function reconcile compares with makes
+			// the assertion f(x) == f(x), which holds for any implementation.
+			// restartStack runs the three Node lanes + a real gateway; its nlp is a
+			// baseline fallback, so it is not part of the selection.
+			opts := PlanOptions{Selection: domain.Selection{Gateway: true}}
+			proceed, err := o.reconcileRunningStack(params, opts)
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if proceed {
+				t.Error("a matching live stack must not be re-provisioned")
+			}
+			if len(sys.terminated) != 0 {
+				t.Errorf("nothing may be terminated, got %v", sys.terminated)
+			}
+		})
+
+		// --rebuild exists to force fresh image bytes; reporting "nothing to do"
+		// hands the developer a stale image and no indication of it.
+		t.Run("when up runs with --rebuild, the stack is replaced so the image is rebuilt", func(t *testing.T) {
+			store, _, o := newFixture(true)
+			opts := PlanOptions{
+				Selection:           domain.SelectionFromStack(store.stacks[0]),
+				ShouldRebuildImages: true,
+			}
+			proceed, err := o.reconcileRunningStack(params, opts)
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if !proceed {
+				t.Error("--rebuild must re-provision even a matching stack")
+			}
+		})
+
+		// The isolation tier is a security posture: turning the sandbox back on
+		// must take effect, not be reported as already-matching.
+		t.Run("when the langy isolation tier differs, the stack is replaced", func(t *testing.T) {
+			store, sys, o := newFixture(true)
+			// The running stack is at the zero value (sandboxed); ask for a
+			// different posture and reconcile must act on it.
+			opts := PlanOptions{
+				Selection: domain.SelectionFromStack(store.stacks[0]),
+				LangyTier: domain.LangyTierHostUnsafe,
+			}
+			proceed, err := o.reconcileRunningStack(params, opts)
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if !proceed {
+				t.Error("a changed langy isolation tier must re-provision")
+			}
+			if len(sys.terminated) != 1 || sys.terminated[0] != 42 {
+				t.Errorf("the old launcher must be terminated, got %v", sys.terminated)
+			}
+		})
+	})
+
+	t.Run("given the stack is live with a different selection", func(t *testing.T) {
+		t.Run("when up runs, the old launcher is replaced without any force flag", func(t *testing.T) {
+			store, sys, o := newFixture(true)
+			desired := domain.SelectionFromStack(store.stacks[0])
+			desired.Langy = !desired.Langy
+			proceed, err := o.reconcileRunningStack(params, PlanOptions{Selection: desired})
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if !proceed {
+				t.Error("a selection change must re-provision")
+			}
+			if len(sys.terminated) != 1 || sys.terminated[0] != 42 {
+				t.Errorf("the old launcher must be terminated, got %v", sys.terminated)
+			}
+		})
+	})
+
+	t.Run("given a matching live stack and -f", func(t *testing.T) {
+		t.Run("when up runs with force, the stack is replaced anyway", func(t *testing.T) {
+			store, sys, o := newFixture(true)
+			opts := PlanOptions{Selection: domain.SelectionFromStack(store.stacks[0]), ShouldForce: true}
+			proceed, err := o.reconcileRunningStack(params, opts)
+			if err != nil {
+				t.Fatalf("reconcile: %v", err)
+			}
+			if !proceed {
+				t.Error("-f must re-provision even a matching stack")
+			}
+			if len(sys.terminated) != 1 {
+				t.Errorf("-f must terminate the old launcher, got %v", sys.terminated)
+			}
+		})
+	})
+
+	t.Run("given the registered stack's launcher already exited", func(t *testing.T) {
+		t.Run("when up runs, the stale entry is cleaned and provisioning proceeds", func(t *testing.T) {
+			store, sys, o := newFixture(false)
+			proceed, err := o.reconcileRunningStack(params, PlanOptions{})
+			if err != nil {
+				t.Fatalf("a dead launcher must not block up: %v", err)
+			}
+			if !proceed {
+				t.Error("a dead launcher must not block provisioning")
+			}
+			if len(sys.terminated) != 0 {
+				t.Errorf("nothing to terminate, got %v", sys.terminated)
+			}
+			if len(store.stacks) != 0 {
+				t.Errorf("the stale registry entry must be cleaned, got %v", store.stacks)
+			}
+		})
+	})
+}
+
+// @scenario "Down keeps the databases unless it is told to destroy"
+func TestDownKeepsDatabases(t *testing.T) {
+	ctx := context.Background()
+	params := UpParams{WorktreeDir: "/wt/feat-x", IsLinkedWorktree: true}
+	store := &fakeStore{
+		stacks:    []domain.Stack{restartStack()},
+		slugCache: map[string]string{"/wt/feat-x": "feat-x"},
+	}
+	sys := &fakeSystem{alive: map[int]bool{42: true}}
+	ch := &fakeDBServer{databases: []string{"lw_feat_x"}}
+	pg := &fakeDBServer{databases: []string{"lw_feat_x"}}
+	o := &Orchestrator{
+		cfg:   Config{ShouldManageClickHouse: true, ShouldManagePostgres: true, Naming: domain.DefaultNaming("")},
+		store: store, sys: sys, proxy: &fakeProxy{}, ch: ch, pg: pg, log: zap.NewNop(),
+	}
+
+	t.Run("when downing, databases are kept and the launcher is stopped", func(t *testing.T) {
+		if err := o.Down(ctx, params, false); err != nil {
+			t.Fatalf("Down: %v", err)
+		}
+		if len(ch.dropped) != 0 || len(pg.dropped) != 0 {
+			t.Errorf("down must never drop databases, got ch=%v pg=%v", ch.dropped, pg.dropped)
+		}
+		if len(sys.terminated) != 1 || sys.terminated[0] != 42 {
+			t.Errorf("down should stop the live launcher, got %v", sys.terminated)
+		}
+		if len(store.stacks) != 0 {
+			t.Errorf("the registry entry must be removed, got %v", store.stacks)
+		}
+	})
+}
+
+// @scenario "Down --force kills hard"
+func TestDownForceKillsHard(t *testing.T) {
+	ctx := context.Background()
+	params := UpParams{WorktreeDir: "/wt/feat-x", IsLinkedWorktree: true}
+	store := &fakeStore{
+		stacks:    []domain.Stack{restartStack()},
+		slugCache: map[string]string{"/wt/feat-x": "feat-x"},
+	}
+	sys := &fakeSystem{alive: map[int]bool{42: true}}
+	o := &Orchestrator{
+		cfg:   Config{ShouldManageClickHouse: true, ShouldManagePostgres: true, Naming: domain.DefaultNaming("")},
+		store: store, sys: sys, proxy: &fakeProxy{}, ch: &fakeDBServer{}, pg: &fakeDBServer{}, log: zap.NewNop(),
+	}
+
+	t.Run("when downing with force, the launcher group is SIGKILLed with no graceful wait", func(t *testing.T) {
+		if err := o.Down(ctx, params, true); err != nil {
+			t.Fatalf("Down: %v", err)
+		}
+		if len(sys.groupKilled) != 1 || sys.groupKilled[0] != 42 {
+			t.Errorf("force must kill the launcher group, got killed=%v", sys.groupKilled)
+		}
+		if len(sys.terminated) != 0 {
+			t.Errorf("force must not bother with SIGTERM, got %v", sys.terminated)
+		}
+	})
+}
+
+// @scenario "The daemon prunes databases idle past the TTL"
+func TestPruneIdleDatabases(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC)
+	ttl := 14 * 24 * time.Hour
+
+	newOrch := func(activity map[string]time.Time, stacks []domain.Stack) (*fakeStore, *fakeDBServer, *fakeDBServer, *Orchestrator) {
+		store := &fakeStore{stacks: stacks, dbActivity: activity}
+		ch := &fakeDBServer{databases: []string{"lw_idle", "lw_fresh", "lw_main"}}
+		pg := &fakeDBServer{databases: []string{"lw_idle", "lw_fresh", "lw_main"}}
+		o := &Orchestrator{
+			cfg:   Config{DBIdleTTL: ttl, ShouldManageClickHouse: true, ShouldManagePostgres: true, Naming: domain.DefaultNaming("")},
+			store: store, sys: &fakeSystem{now: now}, proxy: &fakeProxy{}, ch: ch, pg: pg, log: zap.NewNop(),
+		}
+		return store, ch, pg, o
+	}
+
+	t.Run("given one slug idle past the TTL and one fresh", func(t *testing.T) {
+		t.Run("when the daemon prunes, only the idle slug's databases are dropped", func(t *testing.T) {
+			store, ch, pg, o := newOrch(map[string]time.Time{
+				"idle":  now.Add(-ttl - time.Hour),
+				"fresh": now.Add(-time.Hour),
+			}, nil)
+			o.pruneIdleDatabases(ctx)
+			if len(ch.dropped) != 1 || ch.dropped[0] != "lw_idle" {
+				t.Errorf("only the idle clickhouse db should drop, got %v", ch.dropped)
+			}
+			if len(pg.dropped) != 1 || pg.dropped[0] != "lw_idle" {
+				t.Errorf("only the idle postgres db should drop, got %v", pg.dropped)
+			}
+			if _, ok := store.dbActivity["idle"]; ok {
+				t.Error("the pruned slug's activity record should be removed")
+			}
+			if _, ok := store.dbActivity["fresh"]; !ok {
+				t.Error("the fresh slug's activity record should remain")
+			}
+		})
+	})
+
+	t.Run("given an idle slug that still has a registered stack", func(t *testing.T) {
+		t.Run("when the daemon prunes, its databases survive", func(t *testing.T) {
+			_, ch, pg, o := newOrch(
+				map[string]time.Time{"idle": now.Add(-ttl - time.Hour)},
+				[]domain.Stack{{Slug: "idle", LauncherPID: 9}},
+			)
+			o.pruneIdleDatabases(ctx)
+			if len(ch.dropped) != 0 || len(pg.dropped) != 0 {
+				t.Errorf("a registered stack's databases must never be idle-pruned, got ch=%v pg=%v", ch.dropped, pg.dropped)
+			}
+		})
+	})
+
+	t.Run("given the protected main database's slug is idle", func(t *testing.T) {
+		t.Run("when the daemon prunes, lw_main survives", func(t *testing.T) {
+			_, ch, pg, o := newOrch(map[string]time.Time{"main": now.Add(-ttl - time.Hour)}, nil)
+			o.pruneIdleDatabases(ctx)
+			if len(ch.dropped) != 0 || len(pg.dropped) != 0 {
+				t.Errorf("the protected main database must never be pruned, got ch=%v pg=%v", ch.dropped, pg.dropped)
+			}
+		})
+	})
+
+	t.Run("given pruning is disabled (TTL 0)", func(t *testing.T) {
+		t.Run("when the daemon prunes, nothing is touched", func(t *testing.T) {
+			_, ch, pg, o := newOrch(map[string]time.Time{"idle": now.Add(-1000 * time.Hour)}, nil)
+			o.cfg.DBIdleTTL = 0
+			o.pruneIdleDatabases(ctx)
+			if len(ch.dropped) != 0 || len(pg.dropped) != 0 {
+				t.Errorf("TTL 0 disables pruning, got ch=%v pg=%v", ch.dropped, pg.dropped)
+			}
+		})
+	})
+}
+
+// Selection is keyed by worktree directory, so two checkouts of the same repo
+// never inherit each other's choice — the whole point of making it sticky
+// rather than an env var the shell carries between them.
+//
+// @scenario "Selection is per-worktree"
+func TestSelectionIsPerWorktree(t *testing.T) {
+	store := &fakeStore{}
+	o := restartOrch(store, &fakeSystem{})
+
+	t.Run("given one worktree has added langy", func(t *testing.T) {
+		if _, err := o.ResolveSelection("/wt/a", []string{"+langy"}); err != nil {
+			t.Fatalf("ResolveSelection(/wt/a): %v", err)
+		}
+
+		t.Run("when a second worktree resolves its own selection", func(t *testing.T) {
+			other, err := o.ResolveSelection("/wt/b", nil)
+			if err != nil {
+				t.Fatalf("ResolveSelection(/wt/b): %v", err)
+			}
+
+			t.Run("it starts from the lean default, not the neighbour's choice", func(t *testing.T) {
+				if other.Langy {
+					t.Error("/wt/b inherited langy from /wt/a")
+				}
+			})
+		})
+
+		t.Run("when the first worktree resolves again with no deltas", func(t *testing.T) {
+			again, err := o.ResolveSelection("/wt/a", nil)
+			if err != nil {
+				t.Fatalf("ResolveSelection(/wt/a): %v", err)
+			}
+
+			t.Run("its own choice stuck", func(t *testing.T) {
+				if !again.Langy {
+					t.Error("/wt/a lost the langy it selected")
+				}
+			})
+		})
+	})
+}
+
+// @scenario "Restarting one service bounces only that service"
+func TestRestartUIOnABuiltStackRebuildsTheBundleWithoutBouncingTheBackend(t *testing.T) {
+	newFixture := func(mode domain.RefreshMode) (*fakeSystem, *Orchestrator, *[]string) {
+		st := restartStack()
+		st.Refresh = mode
+		store := &fakeStore{stacks: []domain.Stack{st}}
+		sys := &fakeSystem{alive: map[int]bool{42: true}, pidsByPort: map[int][]int{9000: {100}}}
+		o := restartOrch(store, sys)
+		var built []string
+		o.uiBuild = func(_ context.Context, dir string, _ io.Writer) error {
+			built = append(built, dir)
+			return nil
+		}
+		return sys, o, &built
+	}
+
+	for _, mode := range []domain.RefreshMode{domain.RefreshStill, domain.RefreshWatch} {
+		t.Run("a "+mode.Name()+" stack rebuilds the bundle and kills nothing", func(t *testing.T) {
+			sys, o, built := newFixture(mode)
+			msg, err := o.RestartStackQuiet("feat-x", "ui")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(msg, "the backend was not restarted") || len(*built) != 1 {
+				t.Fatalf("want one build and the swap message, got %q after %v", msg, *built)
+			}
+			if len(sys.groupTerminated) != 0 {
+				t.Fatalf("the backend must not be bounced, terminated %v", sys.groupTerminated)
+			}
+		})
+	}
+
+	t.Run("an hmr stack still bounces the ui lane", func(t *testing.T) {
+		sys, o, built := newFixture(domain.RefreshHMR)
+		if _, err := o.RestartStackQuiet("feat-x", "ui"); err != nil {
+			t.Fatal(err)
+		}
+		if len(*built) != 0 || len(sys.groupTerminated) == 0 {
+			t.Fatalf("want a bounce and no build, got build %v terminated %v", *built, sys.terminated)
+		}
+	})
+
+	t.Run("a failed build is an error", func(t *testing.T) {
+		_, o, _ := newFixture(domain.RefreshStill)
+		o.uiBuild = func(context.Context, string, io.Writer) error { return errors.New("vite failed") }
+		if _, err := o.RestartStackQuiet("feat-x", "ui"); err == nil {
+			t.Fatal("want the build error")
+		}
+	})
+}

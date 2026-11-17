@@ -1,0 +1,284 @@
+{{- include "langwatch.validateSecrets" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-app
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}-app
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    {{- include "langwatch.labels" . | nindent 4 }}
+    {{- if .Values.app.deployment.labels }}
+    {{- toYaml .Values.app.deployment.labels | nindent 4 }}
+    {{- end }}
+  {{- with .Values.app.deployment.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.app.replicaCount }}
+  {{- if .Values.app.deployment.strategy }}
+  strategy:
+    {{- toYaml .Values.app.deployment.strategy | nindent 8 }}
+  {{- else if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+  {{/* Default kill-then-start under local-FS: the pod holds the RWO
+       stored-objects PVC, and the k8s default RollingUpdate (25% surge) starts
+       the new pod BEFORE the old one releases the volume — on a multi-node
+       cluster the new pod can land on another node and wedge Pending on a
+       multi-attach error (the scheduler does not avoid RWO conflicts for CSI
+       volumes). maxSurge=0/maxUnavailable=1 at replicas=1 behaves exactly like
+       Recreate (old pod terminates and releases the volume before the new one
+       schedules), at the cost of a brief downtime — honest for the
+       single-replica local-FS tier.
+
+       Deliberately NOT `type: Recreate`: switching a live Deployment from the
+       k8s-defaulted RollingUpdate to Recreate requires DELETING the live
+       `rollingUpdate` struct, and Helm's 3-way merge cannot emit that deletion
+       when the previous release's manifest never had a `strategy` key (the
+       pre-#5083 chart) — the API then rejects the patch with
+       "spec.strategy.rollingUpdate: Forbidden: may not be specified when
+       strategy `type` is 'Recreate'", failing every upgrade across this
+       boundary. Setting maxSurge/maxUnavailable only UPDATES existing fields,
+       which the merge applies cleanly. An explicit app.deployment.strategy
+       overrides this. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
+  {{- if hasKey (default (dict) .Values.app.deployment) "revisionHistoryLimit" }}
+  revisionHistoryLimit: {{ .Values.app.deployment.revisionHistoryLimit }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}-app
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}-app
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- if .Values.app.pod.labels }}
+        {{- toYaml .Values.app.pod.labels | nindent 8 }}
+        {{- end }}
+        {{- with (include "langwatch.cloudIdentityPodLabels" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with (coalesce .Values.app.pod.annotations .Values.global.podAnnotations) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.app.telemetry.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ include "langwatch.metricsPort" . | quote }}
+        {{- end }}
+    spec:
+      {{- with (include "langwatch.serviceAccountName" .) }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      # The app does not call the Kubernetes API, so don't mount the SA token.
+      # Cloud workload identity is unaffected by this flag: the platform
+      # webhook injects its own projected token volume, which the chart
+      # deliberately does not hand-roll.
+      automountServiceAccountToken: {{ .Values.global.automountServiceAccountToken }}
+      # The API drains in well under its grace period; it is a ceiling, not a
+      # wait. With workers.enabled false the worker sidecar drains in this pod
+      # too, so the pod takes the longer of the two.
+      {{- $grace := int (include "langwatch.terminationGracePeriod" (dict "component" .Values.app "name" "app")) }}
+      {{- if not .Values.workers.enabled }}
+      {{- $grace = max $grace (int (include "langwatch.terminationGracePeriod" (dict "component" .Values.workers "name" "workers"))) }}
+      {{- end }}
+      {{- /* The preStop sleep runs inside the grace period, before SIGTERM, so the
+             grace must still cover the sleep plus the process deadline (drain + 20s)
+             plus 5s for the last log line. specs/background/worker-graceful-shutdown.feature */}}
+      {{- $appDrain := int (include "langwatch.positiveSeconds" (dict "name" "app.shutdownDrainSeconds" "value" .Values.app.shutdownDrainSeconds "fallback" 25)) }}
+      {{- $preStop := 0 }}
+      {{- if kindIs "invalid" .Values.app.preStopSleepSeconds }}
+      {{- /* Unset: 15s, shortened to the room a pinned grace period leaves, so an upgrade never refuses. */}}
+      {{- $preStop = min 15 (sub $grace (add $appDrain 25)) }}
+      {{- else }}
+      {{- $preStop = .Values.app.preStopSleepSeconds }}
+      {{- /* By its string, as langwatch.positiveSeconds does: Helm v3.18.0 hands values.yaml's 5 over as a string. */}}
+      {{- $preStopRaw := toString $preStop }}
+      {{- if or (not (regexMatch "^[0-9]+$" $preStopRaw)) (ne (toString (int $preStop)) $preStopRaw) }}
+      {{- fail (printf "app.preStopSleepSeconds must be a whole number of seconds, zero or more, got %v" $preStop) }}
+      {{- end }}
+      {{- $preStop = int $preStop }}
+      {{- end }}
+      {{- $withPreStop := add $preStop $appDrain 25 }}
+      {{- if lt $grace $withPreStop }}
+      {{- fail (printf "app.terminationGracePeriodSeconds is %d, too short for a %ds preStop sleep before a %ds shutdown drain: it needs at least %d. Raise it, or lower app.preStopSleepSeconds." $grace $preStop $appDrain $withPreStop) }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $grace }}
+      # Pod security context - https://kubespec.dev/v1/Pod#spec.securityContext
+      securityContext:
+        {{- include "langwatch.podSecurityContext" (dict "ctx" . "component" .Values.app) | nindent 8 }}
+
+      # Node selection - https://kubespec.dev/v1/Pod#spec.nodeSelector
+      {{- with (coalesce .Values.app.nodeSelector .Values.global.scheduling.nodeSelector)}}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # Tolerations - https://kubespec.dev/v1/Pod#spec.tolerations
+      {{- with (coalesce .Values.app.tolerations .Values.global.scheduling.tolerations)}}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # Affinity - https://kubespec.dev/v1/Pod#spec.affinity
+      {{- with (coalesce .Values.app.affinity .Values.global.scheduling.affinity)}}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # Topology spread constraints - https://kubespec.dev/v1/Pod#spec.topologySpreadConstraints
+      {{- with (coalesce .Values.app.topologySpreadConstraints .Values.global.scheduling.topologySpreadConstraints)}}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # PriorityClass - https://kubespec.dev/v1/Pod#spec.priorityClassName
+      {{- with (coalesce .Values.app.priorityClassName .Values.global.scheduling.priorityClassName)}}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+
+      {{- with .Values.app.extraInitContainers}}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        {{- with .Values.app.extraContainers}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: {{ .Release.Name }}-app
+          securityContext:
+            {{- include "langwatch.containerSecurityContext" (dict "ctx" . "component" .Values.app) | nindent 12 }}
+          image: "{{ .Values.images.app.repository }}:{{ .Values.images.app.tag }}"
+          imagePullPolicy: "{{ .Values.images.app.pullPolicy }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.app.service.port }}
+              protocol: TCP
+          env:
+            {{- include "langwatch.sharedEnv" . | nindent 12 }}
+            {{- include "langwatch.shutdownEnv" (dict "component" .Values.app "name" "app") | nindent 12 }}
+
+            # Names this process in telemetry. It becomes the OTel resource
+            # `service.name` and the `service` field on every stdout log line,
+            # which log shipping promotes to the Loki `service_name` label.
+            # Set per role so app / workers / cronjobs stay distinguishable —
+            # unset, all three collapse onto the same code default.
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.app.otel.serviceName | default "langwatch-app" | quote }}
+
+            {{/* NEXTAUTH_URL comes from langwatch.sharedEnv: every process
+                 needs the same answer for what this installation is called.
+                 NEXTAUTH_URL_INTERNAL used to be emitted here too; no process
+                 reads it — the API resolves its own base URL from NEXTAUTH_URL
+                 and BASE_HOST — so it is gone rather than left as a knob that
+                 does nothing. */}}
+
+            # Internal platform-API base URL that in-pod scenario/simulation
+            # runners call back to. Post-#3541 the app boot-validates it as a
+            # required URL. On the app pod the app IS local, so self-reference
+            # over localhost, like NEXTAUTH_URL — no Service/DNS hop.
+            # Workers/nlp are separate pods and use the app's service DNS
+            # instead. Override only if in-pod runners must reach the app
+            # through a different URL.
+            - name: LANGWATCH_ENDPOINT
+              value: {{ .Values.app.http.langwatchEndpoint | default (printf "http://localhost:%v" (.Values.app.service.port | default 5560)) | quote }}
+            # The api process listens on API_PORT; the container port, the
+            # probes and the Service all name the service port.
+            - name: API_PORT
+              value: {{ .Values.app.service.port | default 5560 | quote }}
+            {{- include "langwatch.heapCeilingEnv" (dict "global" .Values.global "resources" .Values.app.resources "extraEnvs" (default (list) .Values.app.extraEnvs)) | nindent 12 }}
+
+            {{- /* Everything else the app is given, the workers are given too:
+                   both processes parse one config (Alex, 2026-09-30). */}}
+            {{- include "langwatch.processEnv" . | nindent 12 }}
+
+            {{- with .Values.app.extraEnvs}}
+            {{- include "langwatch.assertNoReservedTimeoutEnvs" (dict "envs" . "path" "app.extraEnvs") }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+          {{- include "langwatch.envFromWithOfflineDefaults" (dict "root" $ "extraEnvFrom" .Values.app.extraEnvFrom) | nindent 10 }}
+
+          {{- /* A short sleep before SIGTERM, so the endpoint removal reaches every proxy
+                 before the process stops taking new requests. An extraLifecycle preStop wins. */}}
+          {{- $ownPreStop := and (gt $preStop 0) (not (hasKey (.Values.app.extraLifecycle | default dict) "preStop")) }}
+          {{- if or .Values.app.extraLifecycle $ownPreStop }}
+          lifecycle:
+            {{- if $ownPreStop }}
+            preStop:
+              exec:
+                command: ["sleep", "{{ $preStop }}"]
+            {{- end }}
+            {{- with .Values.app.extraLifecycle}}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.app.resources | nindent 12 }}
+          # 40 minutes (15s x 160). The app never migrates: serving starts only
+          # once its upgrade gate admits it, which on a first install means
+          # running `pnpm task upgrade` once, which can take up to 35 minutes
+          # (the pre-roll Job's deadline). A
+          # shorter budget turns a slow first install into CrashLoopBackOff,
+          # which hides the error the gate would otherwise report by name.
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            failureThreshold: 160
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+          volumeMounts:
+            {{- with .Values.app.extraVolumeMounts}}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            - name: tmp-dir
+              mountPath: /tmp
+            {{- if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+            # Stored-objects local-FS mount — renders ONLY when local-FS is
+            # the active backend (dataplane disabled). Single-replica only
+            # (the chart refuses to render when replicaCount > 1). PVC-backed
+            # so bytes survive pod restarts; without this they'd land on the
+            # container's ephemeral writable layer and disappear on every
+            # rollout.
+            - name: stored-objects-data
+              mountPath: {{ .Values.app.storedObjects.localFilesystem.path }}
+            {{- end }}
+        {{- if not .Values.workers.enabled }}
+        {{- include "langwatch.workersContainer" . | nindent 8 }}
+        {{- end }}
+
+      volumes:
+        {{- with .Values.app.extraVolumes}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if not .Values.workers.enabled }}
+        {{- with .Values.workers.extraVolumes}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        - name: tmp-dir
+          emptyDir:
+            sizeLimit: {{ .Values.app.scratchSizeLimit }}
+        {{- if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+        - name: stored-objects-data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-stored-objects
+        {{- end }}

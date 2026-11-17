@@ -1,0 +1,39 @@
+---
+title: Governance overview
+description: Set up the LangWatch AI Gateway for an organization, give every member a personal key with its own budget, and keep the audit and export trail your security team needs.
+sidebarTitle: Overview
+---
+
+Governance covers the admin side of the LangWatch AI Gateway: who can call which model, on which budget, and what record is kept of it. Members get a personal key without seeing a provider secret. Admins set the providers, the routing policies and the budgets once for the whole organization.
+
+## Pages in this section
+
+<CardGroup cols={2}>
+  <Card title="Personal keys" icon="user" href="/ai-gateway/governance/personal-keys">
+    Sign in from the LangWatch CLI and get a personal virtual key that Claude Code, Codex, Cursor,
+    Gemini CLI and OpenCode use.
+  </Card>
+  <Card title="Admin setup" icon="list-check" href="/ai-gateway/governance/admin-setup">
+    Add a model provider, create a routing policy, mint the first virtual key, set a budget and
+    invite members, in order.
+  </Card>
+  <Card title="Routing policies" icon="route" href="/ai-gateway/governance/routing-policies">
+    Decide once which providers and models a key can reach. Virtual keys point at the policy.
+  </Card>
+  <Card title="Retention" icon="clock-rotate-left" href="/ai-gateway/governance/retention">
+    What the gateway stores, and which platform setting governs how long each record lives.
+  </Card>
+  <Card title="OCSF export" icon="file-export" href="/ai-gateway/governance/ocsf-export">
+    Pull governance events into your SIEM as OCSF records through a cursor-paginated API.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/ai-gateway/governance/architecture">
+    The gateway service, the control plane routes, the change feed, the spend spool and the auth
+    cache.
+  </Card>
+  <Card title="Audit log" icon="scroll" href="/ai-gateway/audit">
+    Who did what, when, to which gateway resource.
+  </Card>
+  <Card title="RBAC" icon="user-shield" href="/ai-gateway/rbac">
+    The gateway resources, the actions on them, and the default role mappings.
+  </Card>
+</CardGroup>

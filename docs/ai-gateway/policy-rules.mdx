@@ -1,0 +1,103 @@
+---
+title: Policy Rules
+description: Regex deny and allow lists on a routing policy that refuse a request by the tools, MCP servers, web addresses or models it names.
+sidebarTitle: Policy rules
+---
+
+## What a policy rule is
+
+A policy rule is a regular expression that the LangWatch AI Gateway checks against one part of every request. Rules live on a [routing policy](/ai-gateway/governance/routing-policies) under **Restrictions**, and apply to every virtual key that uses the policy.
+
+Each of the four targets has two lists:
+
+- **Refuse**: a request that matches any pattern is refused.
+- **Allow only**: when the list is not empty, every candidate in the request must match at least one pattern, or the request is refused.
+
+| Target        | What the gateway matches the patterns against                                                            |
+| ------------- | -------------------------------------------------------------------------------------------------------- |
+| Tools         | Every tool name in the body: `tools[].function.name` (OpenAI shape) or `tools[].name` (Anthropic shape). |
+| MCP servers   | Every entry of `mcp`, `mcps` or `mcp_servers` in the body, by `name`, then `id`, then the raw string.    |
+| Web addresses | Every `http://` and `https://` string anywhere in the body, longer than 8 characters, deduplicated.      |
+| Models        | The resolved model, judged in both spellings, `provider/model` and the bare model id.                    |
+
+Patterns are regular expressions. They are not anchored: `shell` matches `run_shell_command`. Write `^shell_.*` to match a prefix.
+
+## When the check runs
+
+Tools, MCP servers and web addresses are checked on the body as sent, before the model resolves and before any guardrail runs. A refused request never reaches the provider.
+
+Model rules run after the model resolves, on the model that will be served. An alias or a tier that resolves to a refused model is refused; a refused name that resolves to a permitted model is served, because the rule checks the served model, not the requested name. A rule written `openai/gpt-4.*` and one written `gpt-4.*` refuse the same model.
+
+A pattern that does not compile fails the request closed with `500 internal_error`. The gateway never skips a rule it cannot read.
+
+## What a refused caller gets
+
+```http
+HTTP/1.1 403 Forbidden
+
+{
+  "error": {
+    "type": "policy_violation",
+    "code": "policy_violation",
+    "message": "tool \"run_shell_command\" is blocked by policy",
+    "fault": "customer"
+  }
+}
+```
+
+The message names the target and the value: `is blocked by policy` for a refuse hit, `is not in allowlist` for an allow-only miss. The response carries `X-LangWatch-Handled-Error: policy_violation`. There is no `meta` block and no header that names the policy or the pattern.
+
+## Set up rules
+
+<Steps>
+  <Step title="Open the routing policy">
+    Open **AI Gateway, Routing Policies** in the sidebar (`/gateway/routing-policies`) and edit the policy the keys use.
+  </Step>
+  <Step title="Fill the Restrictions section">
+    Expand **Restrictions**. For each target, enter one pattern per line under **Refuse**, or under **Allow only**. Leave **Allow only** blank to allow anything that is not refused.
+
+    <Frame caption="The Restrictions section: a refuse pattern on tools and an allow-only list on models.">
+      <img src="/images/ai-gateway/routing-policy-restrictions.png" alt="The Restrictions section of the routing policy drawer with Refuse and Allow only boxes for tools, MCP servers, web addresses and models" />
+    </Frame>
+
+  </Step>
+  <Step title="Verify">
+    Send a request that names a refused tool through a key on that policy and check the response for `403` and `"code": "policy_violation"`.
+  </Step>
+</Steps>
+
+Policy changes are written to the audit log and reach the gateway on its next change-feed poll. No key needs to be reissued.
+
+## Examples
+
+Refuse shell execution and a destructive tool:
+
+```text
+^shell_.*
+delete_user
+```
+
+Allow only the tools an agent is meant to use:
+
+```text
+^(read_file|list_files|search_docs)$
+```
+
+Keep web addresses inside your own domain (Allow only on Web addresses):
+
+```text
+^https://api\.acme\.example/
+```
+
+Refuse a model family on every key of the policy (Refuse on Models):
+
+```text
+^gpt-4o-search.*
+```
+
+## Boundaries
+
+- Rules read the request body. They do not inspect a tool call the model returns in a response or a stream; attach a response [guardrail](/ai-gateway/guardrails) for that.
+- The model target and the key's own model allowlist are separate checks. A model must pass both.
+
+**Also check:** [Routing policies](/ai-gateway/governance/routing-policies), [Guardrails](/ai-gateway/guardrails), [API Reference, Errors](/ai-gateway/api/errors).

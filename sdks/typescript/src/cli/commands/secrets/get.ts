@@ -1,0 +1,74 @@
+import chalk from "chalk";
+
+import { resolveControlPlaneUrl } from "@/cli/utils/governance/resolveEndpoint";
+import { buildRequestHeaders } from "@/internal/api/request-headers";
+import { scopedApiKey } from "@/internal/credentialContext";
+import { langwatchFetch } from "@/internal/http/langwatchFetch";
+
+import { resolveCredentials } from "../../utils/apiKey.ts";
+import { failSpinnerFromResponse } from "../../utils/failFromResponse.ts";
+import type { CommandResult } from "../../utils/output.ts";
+import { createSpinner } from "../../utils/spinner.ts";
+import { failSpinner } from "../../utils/spinnerError.ts";
+
+/**
+ * Returns the secret's metadata rather than printing it (output port
+ * renders per-format). The endpoint never returns the VALUE, so the raw
+ * record is metadata only and safe as a payload.
+ */
+export const getSecretCommand = async (id: string): Promise<CommandResult | void> => {
+  const credentials = await resolveCredentials();
+  if (!credentials.projectId) {
+    throw new Error("A project must be selected for secret operations");
+  }
+
+  const apiKey = scopedApiKey() ?? process.env.LANGWATCH_API_KEY ?? "";
+  const endpoint = resolveControlPlaneUrl();
+
+  const spinner = createSpinner(`Fetching secret "${id}"...`).start();
+
+  try {
+    const response = await langwatchFetch(
+      `${endpoint}/api/v1/secrets/${encodeURIComponent(id)}?projectId=${encodeURIComponent(credentials.projectId)}`,
+      {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildRequestHeaders({ apiKey }),
+        },
+      },
+    );
+
+    if (!response.ok) {
+      await failSpinnerFromResponse({ spinner, response, action: "fetch secret" });
+      process.exit(1);
+    }
+
+    const secret = (await response.json()) as {
+      id: string;
+      name: string;
+      projectId: string;
+      createdAt: string;
+      updatedAt: string;
+    };
+
+    spinner.succeed(`Secret "${secret.name}"`);
+
+    return {
+      data: secret,
+      table: () => {
+        console.log();
+        console.log(`  ${chalk.gray("ID:")}      ${chalk.green(secret.id)}`);
+        console.log(`  ${chalk.gray("Name:")}    ${chalk.cyan(secret.name)}`);
+        console.log(`  ${chalk.gray("Created:")} ${new Date(secret.createdAt).toLocaleString()}`);
+        console.log(`  ${chalk.gray("Updated:")} ${new Date(secret.updatedAt).toLocaleString()}`);
+        console.log();
+        console.log(chalk.gray("  (Secret values are never returned for security)"));
+        console.log();
+      },
+    };
+  } catch (error) {
+    failSpinner({ spinner, error, action: "fetch secret" });
+    process.exit(1);
+  }
+};

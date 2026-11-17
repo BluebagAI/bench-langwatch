@@ -1,0 +1,702 @@
+// Package procsupervisor implements app.Supervisor: it runs child processes via
+// `bash -lc` with prefixed output, restarts them on crash, and tears the whole
+// process tree down when the context is cancelled. In agent mode it emits plain,
+// colorless, redraw-free lines so an AI driver wastes no tokens on ANSI.
+package procsupervisor
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"regexp"
+	"slices"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/langwatch/langwatch/tools/thuishaven/app"
+	"github.com/langwatch/langwatch/tools/thuishaven/domain/logfmt"
+)
+
+// Supervisor is the real process-backed implementation of app.Supervisor.
+type Supervisor struct {
+	isPlain bool
+	recent  *recentLogs
+	// startedAt is when this up began; captures older than it are rotated out.
+	startedAt time.Time
+}
+
+type recentLogs struct {
+	sync.Mutex
+	lines []string
+}
+
+// New returns a Supervisor. isAgent=true suppresses color for token-free output.
+func New(isAgent bool) Supervisor {
+	return Supervisor{isPlain: isAgent, recent: &recentLogs{}, startedAt: time.Now()}
+}
+
+// RunOnce runs a command to completion, streaming its output.
+func (s Supervisor) RunOnce(ctx context.Context, name, dir, shell string, env []string) error {
+	c := proc{name: name, dir: dir, shell: shell, env: env, color: "90", isPlain: s.isPlain}
+	cmd := c.command(ctx)
+	waitStreams := c.pipe(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go killOnCancel(ctx, cmd, done)
+	waitStreams()
+	err := cmd.Wait()
+	close(done)
+	return err
+}
+
+// WaitReady blocks until url answers non-5xx, logging under name so the wait is
+// visible in the same stream as the lanes. It is the same probe that gates a
+// child on its dependency, exposed for callers that are not a child themselves:
+// the play sandbox's seed ingest, which has to reach the stack it just started.
+func (s Supervisor) WaitReady(ctx context.Context, name, url string) bool {
+	c := proc{name: name, color: "90", isPlain: s.isPlain}
+	waitForReady(ctx, url, c.logln)
+	return ctx.Err() == nil
+}
+
+// RunOnceBounded is RunOnce plus a reaper: a background poll kills the whole
+// process group (the child owns its own group via Setpgid, same as every other
+// supervised child) if its total RSS or wall-clock time crosses limits. Reaping
+// returns a descriptive error rather than letting the caller see a bare "killed"
+// exit status.
+func (s Supervisor) RunOnceBounded(ctx context.Context, name, dir, shell string, env []string, limits app.ReapLimits) error {
+	c := proc{name: name, dir: dir, shell: shell, env: env, color: "90", isPlain: s.isPlain}
+	cmd := c.command(ctx)
+	waitStreams := c.pipe(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go killOnCancel(ctx, cmd, done)
+
+	reapCtx, cancelReap := context.WithCancel(ctx)
+	defer cancelReap()
+	reaped := make(chan string, 1)
+	if limits.MaxRSSBytes > 0 || limits.MaxDuration > 0 {
+		go reap(reapCtx, cmd.Process.Pid, limits, reaped)
+	}
+
+	waitStreams()
+	err := cmd.Wait()
+	close(done)
+	select {
+	case reason := <-reaped:
+		return fmt.Errorf("%s: %s", name, reason)
+	default:
+		return err
+	}
+}
+
+// reap polls the process group's total RSS every 2s and enforces MaxDuration,
+// killing the group (SIGKILL — a runaway tsgo has already ignored its chance to
+// exit cleanly) the first time either bound is crossed.
+func reap(ctx context.Context, pgid int, limits app.ReapLimits, reaped chan<- string) {
+	start := time.Now()
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if limits.MaxDuration > 0 && time.Since(start) > limits.MaxDuration {
+				reaped <- fmt.Sprintf("killed — running longer than %s", limits.MaxDuration)
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+				return
+			}
+			if limits.MaxRSSBytes > 0 {
+				if rss := groupRSSBytes(pgid); rss > limits.MaxRSSBytes {
+					reaped <- fmt.Sprintf("killed — %dMB RSS over the %dMB limit", rss>>20, limits.MaxRSSBytes>>20)
+					_ = syscall.Kill(-pgid, syscall.SIGKILL)
+					return
+				}
+			}
+		}
+	}
+}
+
+// groupRSSBytes sums RSS (in bytes) across every process in the group. Shells
+// out to `ps -axo` (portable: Linux `ps -g` selects by session, not group) —
+// the same "ask the OS's own tool" approach adapters/system already uses.
+func groupRSSBytes(pgid int) int64 {
+	out, err := exec.Command("ps", "-axo", "pgid=,rss=").Output()
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, line := range strings.Split(string(out), "\n") {
+		var g int
+		var kb int64
+		if _, err := fmt.Sscanf(line, "%d %d", &g, &kb); err == nil && g == pgid {
+			total += kb * 1024
+		}
+	}
+	return total
+}
+
+// Supervise runs every child concurrently, restarting any that exit until the
+// context is cancelled, then SIGTERMs (and finally SIGKILLs) the whole tree.
+func (s Supervisor) Supervise(ctx context.Context, children []app.Child) {
+	reapOrphans(children, os.Getpid())
+	if !s.isPlain {
+		fmt.Print("\x1b[?1049h\x1b[?25l")
+		defer fmt.Print("\x1b[?25h\x1b[?1049l\x1b[0m")
+		go renderUp(ctx, s.recent, children)
+	}
+	var wg sync.WaitGroup
+	for _, ch := range children {
+		wg.Add(1)
+		go func(ac app.Child) {
+			defer wg.Done()
+			s.superviseChild(ctx, ac)
+		}(ch)
+	}
+	wg.Wait()
+}
+
+func killOnCancel(ctx context.Context, cmd *exec.Cmd, done <-chan struct{}) {
+	select {
+	case <-done:
+		return
+	case <-ctx.Done():
+		if cmd.Process != nil {
+			// The first Ctrl-C is a hard stop for the launcher tree. Cleanup runs
+			// after the children are gone and must never hold the terminal hostage.
+			killTree(cmd.Process.Pid)
+		}
+	}
+}
+
+// reapOrphans SIGTERMs a dead launcher's lanes: each PPID-1 dev-runtime
+// orphan's group AND every descendant. A group alone missed the `sh -c` restart
+// loop pnpm runs a script in, which leads a group of its own: it outlived the
+// lane, reparented to PID 1, and kept its node child up for hours.
+func reapOrphans(children []app.Child, self int) {
+	knownDirs := make([]string, 0, len(children))
+	for _, child := range children {
+		if child.Dir != "" {
+			knownDirs = append(knownDirs, child.Dir)
+		}
+	}
+	out, err := exec.Command("ps", "-axo", "pid=,ppid=,pgid=,command=").Output()
+	if err != nil {
+		return
+	}
+	groups, pids := orphanTargets(parsePS(string(out)), knownDirs, self)
+	for _, pgid := range groups {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+	}
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGTERM)
+	}
+}
+
+// psRow is one line of `ps -axo pid=,ppid=,pgid=,command=`.
+type psRow struct {
+	pid, ppid, pgid int
+	command         string
+}
+
+func parsePS(out string) []psRow {
+	var rows []psRow
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		var r psRow
+		if _, err := fmt.Sscanf(fields[0], "%d", &r.pid); err != nil {
+			continue
+		}
+		if _, err := fmt.Sscanf(fields[1], "%d", &r.ppid); err != nil {
+			continue
+		}
+		if _, err := fmt.Sscanf(fields[2], "%d", &r.pgid); err != nil {
+			continue
+		}
+		r.command = strings.Join(fields[3:], " ")
+		rows = append(rows, r)
+	}
+	return rows
+}
+
+// orphanTargets is the groups of the matched PPID-1 orphans and the pids of
+// every descendant, listed before anything is signalled.
+func orphanTargets(rows []psRow, knownDirs []string, self int) (groups, pids []int) {
+	parents := make(map[int]int, len(rows))
+	for _, r := range rows {
+		parents[r.pid] = r.ppid
+	}
+	for _, r := range rows {
+		if r.pid == self || r.ppid != 1 || r.pgid <= 1 {
+			continue
+		}
+		if !knownDevRuntime(r.command) || !containsAny(r.command, knownDirs) {
+			continue
+		}
+		groups = append(groups, r.pgid)
+		for _, pid := range descendantsOf(r.pid, parents) {
+			if pid != self {
+				pids = append(pids, pid)
+			}
+		}
+	}
+	return groups, pids
+}
+
+func ReapOrphans(dirs []string) {
+	children := make([]app.Child, 0, len(dirs))
+	for _, dir := range dirs {
+		children = append(children, app.Child{Dir: dir})
+	}
+	reapOrphans(children, os.Getpid())
+}
+
+func knownDevRuntime(command string) bool {
+	for _, token := range []string{"tsgo", "vite", "tsx", "pnpm", "node", "go run", "service", "uv", "python"} {
+		if strings.Contains(command, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAny(value string, needles []string) bool {
+	for _, needle := range needles {
+		if needle != "" && strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// superviseChild runs one child, restarting it (1s backoff) on exit until ctx
+// is cancelled, then SIGTERMs the process group and SIGKILLs after 5s.
+func (s Supervisor) superviseChild(ctx context.Context, ac app.Child) {
+	c := proc{
+		name: ac.Name, dir: ac.Dir, shell: ac.Shell, env: ac.Env, color: ac.Color, isPlain: s.isPlain,
+		preview: s.recent, sink: newCapture(ac, s.startedAt), crash: &crashDedup{},
+	}
+	// Gate the start on a dependency being ready (e.g. the web lane on the API),
+	// so this process — and the hostname routed to it — never comes up before what
+	// it needs is serving.
+	if ac.ReadyProbeURL != "" {
+		waitForReady(ctx, ac.ReadyProbeURL, c.logln)
+		if ctx.Err() != nil {
+			return
+		}
+	}
+	for ctx.Err() == nil {
+		cmd := c.command(ctx)
+		waitStreams := c.pipe(cmd)
+		if err := cmd.Start(); err != nil {
+			c.logln(fmt.Sprintf("failed to start: %v", err))
+			return
+		}
+		done := make(chan struct{})
+		go func() {
+			// Drain both pipes to EOF before Wait, which closes them.
+			waitStreams()
+			_ = cmd.Wait()
+			close(done)
+		}()
+		reaped := capMemory(ctx, cmd.Process.Pid, ac.MaxRSSBytes, done)
+		select {
+		case <-ctx.Done():
+			if cmd.Process != nil {
+				killTree(cmd.Process.Pid)
+			}
+			<-done
+			return
+		case <-done:
+			if ctx.Err() != nil {
+				return
+			}
+			why := "exited"
+			select {
+			case reason := <-reaped:
+				why = reason
+				if ac.OnReap != nil {
+					ac.OnReap(reason)
+				}
+			default:
+			}
+			c.logln(levelRecordLine("warn", why+" — restarting in 1s", time.Time{}))
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
+
+// capMemory runs reap's RSS check on a long-running lane until it exits, so a
+// lane past its ceiling is killed and the restart loop brings it back.
+func capMemory(ctx context.Context, pgid int, maxRSS int64, done <-chan struct{}) <-chan string {
+	reaped := make(chan string, 1)
+	if maxRSS <= 0 {
+		return reaped
+	}
+	reapCtx, cancel := context.WithCancel(ctx)
+	go func() {
+		<-done
+		cancel()
+	}()
+	go reap(reapCtx, pgid, app.ReapLimits{MaxRSSBytes: maxRSS}, reaped)
+	return reaped
+}
+
+// waitForReady blocks until an HTTP GET to url gets a non-5xx response (the
+// dependency is up and serving) or ctx is cancelled. It announces the wait once
+// so it's visible in the output. There is deliberately NO timeout: "don't start
+// until healthy" is the whole point, and Ctrl-C (ctx cancel) is the escape.
+func waitForReady(ctx context.Context, url string, log func(string)) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	announced := false
+	for ctx.Err() == nil {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err == nil {
+			if resp, derr := client.Do(req); derr == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode < 500 {
+					if announced {
+						log("dependency is ready — starting")
+					}
+					return
+				}
+			}
+		}
+		if !announced {
+			log(fmt.Sprintf("waiting for %s before starting …", url))
+			announced = true
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+type proc struct {
+	name, dir, shell, color string
+	env                     []string
+	isPlain                 bool
+	preview                 *recentLogs
+	// sink captures every line (timestamped) to the per-service log file the
+	// `haven logs` command reads — nil for one-shot lanes. Capture always
+	// gets the full line, dedup or not: only the live echo below is folded.
+	sink *capture
+	// crash collapses a fatal line repeated across consecutive restarts into
+	// a short counter instead of the same failure once per restart — nil for
+	// a proc that never restarts (RunOnce, RunOnceBounded, WaitReady).
+	crash *crashDedup
+}
+
+// crashDedup tracks the last fatal message a proc rendered, across restarts:
+// superviseChild's loop reuses the same proc value for the life of the lane,
+// so this state survives from one crash to the next.
+type crashDedup struct {
+	mu      sync.Mutex
+	lastMsg string
+	repeat  int
+}
+
+// observe records one fatal record's message and reports what to render: the
+// message itself the first time a failure is seen (or once it changes), or a
+// short "same failure, restart N" line — still worth a line, never worth
+// repeating the location — for every consecutive repeat of the same one.
+func (d *crashDedup) observe(msg string) (renderMsg string, isRepeat bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.repeat > 0 && msg == d.lastMsg {
+		d.repeat++
+		return fmt.Sprintf("same failure, restart %d", d.repeat), true
+	}
+	d.lastMsg = msg
+	d.repeat = 1
+	return msg, false
+}
+
+// dedupeFatal rewrites a line that is a repeat of the previous fatal message
+// into the short counter form; anything else — a first occurrence, a
+// different failure, or a line that is not a fatal record at all — passes
+// through unchanged.
+func (c proc) dedupeFatal(line string) string {
+	if c.crash == nil {
+		return line
+	}
+	rec, ok := logfmt.Parse(line)
+	if !ok || rec.Level != logfmt.LevelFatal {
+		return line
+	}
+	renderMsg, isRepeat := c.crash.observe(rec.Message)
+	if !isRepeat {
+		return line
+	}
+	return levelRecordLine("fatal", renderMsg, rec.Time)
+}
+
+// levelRecordLine builds the minimal structured line logfmt.Parse reads back
+// — level, message, a timestamp (now, for a zero one) — for a line this
+// supervisor decided to print itself, so it renders with the same one-line,
+// correctly-leveled discipline as everything a supervised child writes.
+func levelRecordLine(level, msg string, at time.Time) string {
+	if at.IsZero() {
+		at = time.Now()
+	}
+	encoded, err := json.Marshal(map[string]string{
+		"time":  at.UTC().Format(logfmt.TimeFormat),
+		"level": level,
+		"msg":   msg,
+	})
+	if err != nil {
+		// Only ever a plain string map; Marshal cannot fail on one. Kept as a
+		// safety net rather than asserted away, same as this file's other
+		// "cannot actually happen" branches.
+		return msg
+	}
+	return string(encoded)
+}
+
+func (c proc) command(ctx context.Context) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "bash", "-lc", c.shell)
+	cmd.Dir = c.dir
+	cmd.Env = append(os.Environ(), c.env...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own group so we kill the tree
+	cmd.Cancel = func() error { return nil }              // we manage teardown ourselves
+	return cmd
+}
+
+// pipe attaches a reader to each of the child's output streams and returns a
+// function that blocks until both readers have seen EOF. The caller MUST call
+// it before cmd.Wait(): Wait closes the pipes, and os/exec documents that as
+// incorrect while goroutines are still reading them. The readers then lose
+// whatever is still buffered, which is how a lane's log file goes quiet while
+// the process keeps talking.
+func (c proc) pipe(cmd *exec.Cmd) (waitStreams func()) {
+	stdout, outErr := cmd.StdoutPipe()
+	stderr, errErr := cmd.StderrPipe()
+	var wg sync.WaitGroup
+	for _, r := range []io.Reader{stdout, stderr} {
+		if r == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(r io.Reader) {
+			defer wg.Done()
+			c.stream(r)
+		}(r)
+	}
+	if outErr != nil {
+		c.logln(fmt.Sprintf("could not capture stdout: %v", outErr))
+	}
+	if errErr != nil {
+		c.logln(fmt.Sprintf("could not capture stderr: %v", errErr))
+	}
+	return wg.Wait
+}
+
+// streamMaxLine is the longest single line captured as one line. Longer output
+// is split across several captured lines rather than dropped: the api lane
+// prints its errors as one-line JSON (pino-pretty singleLine), so a stack dump
+// arrives as a single line that can run to megabytes. A reader that gives up on
+// such a line stops draining the pipe, the kernel buffer fills, and the child
+// blocks on its next write. The process is then wedged, not just unlogged.
+const streamMaxLine = 1 << 20
+
+// streamReadBuffer is the read-ahead size. Lines longer than this are assembled
+// across reads, so it bounds a syscall, not a line.
+const streamReadBuffer = 64 << 10
+
+// stream captures one output stream line by line for the life of the pipe. It
+// returns only at EOF, or when the pipe cannot be read at all, never on a
+// single bad line.
+//
+// A raw window is local to this call: stdout and stderr are read by separate
+// goroutines, each with its own window, so a structured line on one stream
+// can never cut short a raw run still building on the other.
+func (c proc) stream(r io.Reader) {
+	br := bufio.NewReaderSize(r, streamReadBuffer)
+	var line []byte
+	var w rawWindow
+	for {
+		chunk, err := br.ReadSlice('\n')
+		line = append(line, chunk...)
+		switch {
+		case err == nil:
+			c.captureLine(&w, string(line))
+			line = line[:0]
+			if br.Buffered() == 0 { // a crash dump arrives in one burst; a pause ends the raw run
+				c.flushRaw(&w)
+			}
+		case errors.Is(err, bufio.ErrBufferFull):
+			// No newline yet. Emit a segment once the line is over the cap and
+			// keep reading the rest of it, so memory stays bounded and the pipe
+			// stays drained.
+			if len(line) >= streamMaxLine {
+				c.captureLine(&w, string(line))
+				line = line[:0]
+			}
+		default:
+			if len(line) > 0 {
+				c.captureLine(&w, string(line))
+			}
+			c.flushRaw(&w)
+			if !errors.Is(err, io.EOF) {
+				c.logln(fmt.Sprintf("log capture read error: %v", err))
+				// Keep draining: if the error was transient the child stays
+				// unblocked, and if it was not this returns at once.
+				_, _ = io.Copy(io.Discard, br)
+			}
+			return
+		}
+	}
+}
+
+// rawWindow batches consecutive lines that are not the shared structured
+// format, so a Node ESM link failure — the whole stack dumped straight to
+// stderr, before any handler exists to catch and log it — renders as one
+// line rather than one per frame.
+type rawWindow struct {
+	lines []string
+}
+
+// captureLine keeps full fidelity in the sink, then either renders a
+// structured line at once (flushing any raw run ahead of it) or adds a raw
+// line to the window instead of rendering it immediately.
+func (c proc) captureLine(w *rawWindow, line string) {
+	line = strings.TrimRight(line, "\r\n")
+	c.sink.write(line, false)
+	if logfmt.Muted(c.name, line) {
+		return
+	}
+	if _, ok := logfmt.Parse(line); !ok {
+		w.lines = append(w.lines, line)
+		return
+	}
+	c.flushRaw(w)
+	c.render(c.dedupeFatal(line))
+}
+
+// flushRaw renders whatever the window collected: the line unchanged when it
+// never grew past one, otherwise one collapsed line naming the first line and
+// how many more followed, with the raw run still readable in full through
+// `haven logs <lane> --raw` (the sink already has every one of them).
+func (c proc) flushRaw(w *rawWindow) {
+	switch {
+	case len(w.lines) == 0:
+		return
+	case len(w.lines) <= plainRunLines && !slices.ContainsFunc(w.lines, crashLine.MatchString):
+		for _, line := range w.lines { // plain output (a build note, a summary) is not a crash
+			c.render(line)
+		}
+	case !slices.ContainsFunc(w.lines, crashLine.MatchString):
+		c.render(levelRecordLine("info", fmt.Sprintf("%s (+%d lines in haven logs %s --raw)",
+			w.lines[0], len(w.lines)-1, c.name), time.Time{}))
+	default:
+		msg := fmt.Sprintf(
+			"%s (+%d lines, stack in haven logs %s --raw)",
+			w.lines[0], len(w.lines)-1, c.name,
+		)
+		c.render(levelRecordLine("error", msg, time.Time{}))
+	}
+	w.lines = nil
+}
+
+// plainRunLines is the longest burst of plain lines shown line by line; a longer one (a build's
+// output) folds into one info line.
+const plainRunLines = 8
+
+// crashLine is a line only a crash dump prints: a JS or Go stack frame, an Error: header, a panic.
+var crashLine = regexp.MustCompile(`^\s+at |\w*Error:|^panic:|^goroutine \d+ \[`)
+
+// logln captures one line and echoes it live. Used for the supervisor's own
+// synthetic lines (a restart notice, a start failure) — never for a child's
+// raw stream, which goes through captureLine/flushRaw instead so a burst of
+// unstructured output collapses to one line rather than one per frame.
+func (c proc) logln(line string) {
+	line = strings.TrimRight(line, "\r\n")
+	c.sink.write(line, true)
+	// Captured first, echoed second: a tool banner — or a fatal line about to
+	// be folded into a repeat counter below — is still in the log file
+	// `haven logs --raw` replays in full, it just does not reach the terminal
+	// a second (or fifth) time.
+	if logfmt.Muted(c.name, line) {
+		return
+	}
+	c.render(c.dedupeFatal(line))
+}
+
+// render is the one place a line reaches the terminal (or the `up` preview
+// buffer), through the same domain/logfmt every other viewer uses. The
+// capture into the sink has already happened by the time anything calls this.
+func (c proc) render(line string) {
+	rendered := logfmt.Render(line, logfmt.Options{
+		Lane:      c.name,
+		LaneColor: c.color,
+		Time:      time.Now(),
+		Color:     !c.isPlain,
+	})
+	if rendered == "" {
+		return
+	}
+	if c.preview != nil {
+		c.preview.Lock()
+		c.preview.lines = append(c.preview.lines, rendered)
+		if len(c.preview.lines) > 12 {
+			c.preview.lines = c.preview.lines[len(c.preview.lines)-12:]
+		}
+		c.preview.Unlock()
+		return
+	}
+	fmt.Println(rendered)
+}
+
+func renderUp(ctx context.Context, logs *recentLogs, children []app.Child) {
+	t := time.NewTicker(250 * time.Millisecond)
+	defer t.Stop()
+	render := func() {
+		var b strings.Builder
+		b.WriteString("\x1b[H\x1b[2J\x1b[1m haven up \x1b[0m\x1b[2m— live stack · Ctrl-C stops immediately\x1b[0m\n\n")
+		b.WriteString("\x1b[1m stack\x1b[0m  ")
+		for i, child := range children {
+			if i > 0 {
+				b.WriteString(" · ")
+			}
+			b.WriteString(child.Name)
+		}
+		b.WriteString("\n\n\x1b[2m recent output (full logs remain in Grafana)\x1b[0m\n")
+		logs.Lock()
+		for _, line := range logs.lines {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+		logs.Unlock()
+		fmt.Print(b.String())
+	}
+	render()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			render()
+		}
+	}
+}

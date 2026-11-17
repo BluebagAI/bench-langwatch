@@ -1,0 +1,370 @@
+Feature: AI Gateway Governance — CLI login (RFC 8628 device-code flow)
+  As an enterprise developer at an org that has rolled out LangWatch governance
+  I want to authenticate the `langwatch` CLI on my laptop using my company SSO
+  So that every coding tool I run (Claude Code, Codex, Cursor, Gemini CLI) goes
+  through the LangWatch gateway with my identity, my org's policy, and my own
+  attribution — without me ever handling a raw provider API key
+
+  This realises gateway.md "screens 0-4" of the personal-keys storyboard.
+  The CLI implements the OAuth 2.0 Device Authorization Grant (RFC 8628):
+  the device requests a short user_code + verification_uri, opens a browser
+  for the user to authenticate via SAML/OIDC SSO at LangWatch (which hops to
+  the customer Okta/Azure AD), then polls /exchange until the user completes
+  the browser flow. The result is an access_token + refresh_token persisted
+  to ~/.langwatch/config (refresh token in OS keyring on macOS/Windows;
+  fall back to file with 0600 perms on Linux without keyring).
+
+  Background:
+    Given the LangWatch app is running at "https://app.langwatch.example.com"
+    And organization "acme" has SAML SSO configured against "acme.okta.com"
+    And user "jane@acme.com" exists in organization "acme" with role MEMBER
+    And user "jane@acme.com" has a personal team and personal project auto-created
+
+  # ---------------------------------------------------------------------------
+  # Device authorization — happy path
+  # ---------------------------------------------------------------------------
+
+  @bdd @cli @device-flow
+  Scenario: CLI requests a device code and receives a short user code + verification URI
+    When the CLI POSTs to "/api/auth/cli/device-code"
+    Then the response status is 200
+    And the response body contains:
+      | field             | shape                                             |
+      | device_code       | opaque ≥32-char string                            |
+      | user_code         | 8 chars, base32 alphabet, dashed XXXX-XXXX        |
+      | verification_uri  | absolute URL ending with "/cli/auth"              |
+      | expires_in        | integer seconds, ≥ 300 and ≤ 900                  |
+      | interval          | integer seconds, ≥ 5 (polling minimum)            |
+    And the device_code is stored server-side keyed for fast lookup
+    And the device_code expires after `expires_in` seconds
+
+  @bdd @cli @device-flow @ux
+  Scenario: CLI prints the user_code and opens the browser
+    Given the CLI received a valid device-code response
+    When the CLI proceeds with the login flow
+    Then it prints the user_code prominently to stdout
+    And it prints the verification_uri
+    And it attempts to open the verification_uri in the default browser
+    And it begins polling "/api/auth/cli/exchange" at the returned interval
+
+  @bdd @cli @device-flow @sso
+  Scenario: User completes browser SSO and approves the device
+    Given the CLI is polling with a valid device_code
+    And the verification page shows the user_code "ABCD-EFGH"
+    When user "jane@acme.com" enters her email at "/cli/auth"
+    And LangWatch redirects to "acme.okta.com" for SAML authentication
+    And Jane completes the Okta SSO + MFA prompt
+    And LangWatch resolves Jane to user_id "user_jane_123" + organization "acme"
+    And Jane confirms the device prompt showing user_code "ABCD-EFGH"
+    Then the device is marked APPROVED for user_jane_123 + organization "acme"
+
+  @bdd @cli @device-flow @poll
+  Scenario: CLI exchange returns tokens once user has approved
+    Given the device with user_code "ABCD-EFGH" has been APPROVED
+    When the CLI POSTs to "/api/auth/cli/exchange" with the device_code
+    Then the response status is 200
+    And the response body contains:
+      | field                    | shape                                       |
+      | access_token             | JWT, ≤ 1h TTL                               |
+      | refresh_token            | opaque ≥40-char string                      |
+      | expires_in               | integer seconds                             |
+      | user.id                  | "user_jane_123"                             |
+      | user.email               | "jane@acme.com"                             |
+      | user.name                | non-empty string                            |
+      | organization.id          | "acme"                                      |
+      | organization.name        | non-empty string                            |
+    And the body carries no `default_personal_vk`, because login issues no virtual key
+
+  @bdd @cli @device-flow @poll
+  Scenario: CLI exchange returns 428 while user has not yet completed approval
+    Given the device_code is valid but the user has not yet approved it
+    When the CLI POSTs to "/api/auth/cli/exchange" with the device_code
+    Then the response status is 428
+    And the response body contains `{ "status": "pending" }`
+    And the CLI keeps polling at the returned interval
+
+  @bdd @cli @device-flow @poll @timeout
+  Scenario: CLI exchange returns 408 once the device_code has expired
+    Given the device_code has expired
+    When the CLI POSTs to "/api/auth/cli/exchange" with the device_code
+    Then the response status is 408
+    And the response body contains `{ "status": "expired" }`
+    And the CLI prints a clear "Login expired, please re-run langwatch login" message
+    And the CLI exits with non-zero status
+
+  @bdd @cli @device-flow @poll
+  Scenario: CLI exchange returns 410 when the user explicitly denied the device
+    Given the user explicitly clicked "Deny" on the device confirmation page
+    When the CLI POSTs to "/api/auth/cli/exchange" with the device_code
+    Then the response status is 410
+    And the response body contains `{ "status": "denied" }`
+    And the CLI prints a clear denial message and exits non-zero
+
+  @bdd @cli @device-flow @rate-limit
+  Scenario: CLI exchange enforces minimum polling interval
+    Given the device_code is valid and pending
+    When the CLI polls "/api/auth/cli/exchange" faster than the returned interval
+    Then the second response within the interval window returns 429
+    And the response body suggests the safe `interval` value
+
+  # ---------------------------------------------------------------------------
+  # Approval latency — the wait is the round trip, not the poll interval
+  #
+  # Polling alone made the CLI wait out its whole interval after an approval
+  # the user had already given. The first poll now goes out immediately, and a
+  # stream tells the CLI to poll the moment the browser settles the code. Both
+  # are accelerators over the same timer: a server or network that supports
+  # neither still logs in at the interval it was given.
+  # ---------------------------------------------------------------------------
+
+  @unit
+  Scenario: The CLI asks once before it starts waiting
+    Given the CLI has a device_code and the user approves in the browser at once
+    When the CLI starts waiting for the approval
+    Then it polls "/api/auth/cli/exchange" before its first wait
+    And the login finishes without costing a whole poll interval
+
+  @unit
+  Scenario: The approval stream cuts the wait short
+    Given the CLI is waiting between polls
+    When the approval stream emits a frame for its device_code
+    Then the CLI polls "/api/auth/cli/exchange" straight away
+    And it does not treat the frame as the approval itself
+
+  @unit
+  Scenario: A server without the approval stream still logs in
+    Given the control plane has no "/api/auth/cli/device-approval" route
+    When the CLI waits for the approval
+    Then it keeps polling at the interval the server asked for
+    And the missing stream changes nothing about the outcome
+
+  @integration
+  Scenario: The approval stream tells the CLI to poll the moment the browser settles the code
+    Given the CLI is on "/api/auth/cli/device-approval" for its device_code
+    When the browser approves or denies that code
+    Then the stream emits the settled status, approved or denied
+    And a code that settled before the stream opened emits at once
+    And an unknown code is reported as expired rather than held open
+    And the pod refuses a new stream once it holds too many, so the CLI polls
+
+  @integration
+  Scenario: A publication is lost if the stream has not subscribed yet
+    Given a device code settles before the stream subscribes to its channel
+    When the stream subscribes afterwards
+    Then it hears nothing, because the channel keeps no history
+    And this is why the stream re-reads the code once its channel is live
+    And a settlement published after that point is always heard, so the re-read
+      covers the whole gap
+
+  @integration
+  Scenario: A poll on a settled device code is answered, not rate limited
+    Given the CLI polled once and is inside the per-device poll window
+    When the code is approved or denied and the CLI polls again straight away
+    Then the response carries the settled outcome instead of 429
+    And a code still pending inside that window is told to slow down
+
+  @integration
+  Scenario: Two exchanges racing the same approval redeem it once
+    Given a device code has been approved
+    When two exchange calls for that code arrive at the same time
+    Then exactly one of them receives the credential
+    And the other is told to slow down instead of receiving a second one
+
+  # WHAT THE FENCE COSTS, AND WHERE IT IS PAID. The redemption claim is held
+  # for long enough to cover the whole handout, so releasing it correctly is
+  # the difference between a CLI that retries and one that waits half a minute
+  # for nothing — and between one credential per approval and two.
+
+  @integration
+  Scenario: A refused exchange releases the claim so the CLI can retry
+    Given an approved device code whose exchange cannot be completed yet
+    When the CLI polls and is told the authorization is still pending
+    Then the claim is released rather than held to its timeout
+    And the next poll is answered the same way instead of being told to slow down
+
+  @integration
+  Scenario: A successful exchange keeps its claim until it expires on its own
+    Given a device code that has just been exchanged for its credential
+    When another caller reaches the redemption holding a record it read beforehand
+    Then it is told to slow down rather than handed a second credential
+    And the claim is left to expire on its own, which is what fences that caller out
+
+  @unit
+  Scenario: An approval that lands during a poll still cuts the next wait short
+    Given the CLI has a poll in flight
+    When the approval stream emits a frame before that poll answers
+    Then the next poll goes out without waiting the interval
+    And the frame is spent by that poll, so the loop keeps its interval afterwards
+
+  # ---------------------------------------------------------------------------
+  # Token persistence and refresh
+  # ---------------------------------------------------------------------------
+
+  @bdd @cli @config
+  Scenario: CLI persists tokens to local config after successful exchange
+    Given the CLI successfully exchanged a device_code for tokens
+    Then the access_token is stored in "~/.langwatch/config" with 0600 perms
+    And the refresh_token is stored in the OS keyring on macOS/Windows
+    And on Linux without keyring, the refresh_token is stored in the same file with 0600 perms
+    And the config file records `user.email` and `organization.id`
+    And the config file records no `default_personal_vk` until a tool first uses the gateway
+
+  @bdd @cli @refresh
+  Scenario: CLI refreshes the access token before it expires
+    Given the access_token has 5 minutes or less remaining
+    And the CLI is asked to run a wrapped command (e.g. `langwatch claude`)
+    When the CLI POSTs to "/api/auth/cli/refresh" with the refresh_token
+    Then the response status is 200
+    And the response body contains a fresh `access_token` and a fresh `refresh_token`
+    And both tokens are persisted as in the previous scenario
+
+  @bdd @cli @refresh
+  Scenario: A refresh retried within a minute keeps the session
+    Given the CLI or an MCP client presented its refresh_token and lost the response
+    When it POSTs to "/api/auth/cli/refresh" with the same refresh_token within 60 seconds
+    Then the response status is 200
+    And the response body carries the same tokens the first refresh minted
+    And after 60 seconds the same refresh_token is answered 401 "invalid_grant"
+
+  @bdd @cli @refresh @errors
+  Scenario: CLI handles refresh-token revocation cleanly
+    Given the refresh_token has been revoked (e.g. user deactivated, admin revoke)
+    When the CLI POSTs to "/api/auth/cli/refresh" with the refresh_token
+    Then the response status is 401
+    And the CLI deletes the local config + keyring entry
+    And the CLI prints "Session revoked — run `langwatch login` to sign in again"
+    And the CLI exits non-zero
+
+  # Each refresh mints a fresh refresh_token, so its lifetime is how long a CLI
+  # session survives idle. LANGWATCH_CLI_REFRESH_TOKEN_TTL_SECONDS shortens it.
+  @unit @cli @refresh
+  Scenario: A CLI refresh token lives 90 days unless the deployment says otherwise
+    Given the deployment sets no CLI refresh-token lifetime
+    When a CLI session is minted
+    Then its refresh_token expires 90 days after it was issued
+
+  @unit @cli @refresh
+  Scenario: An operator shortens the CLI refresh-token lifetime
+    Given the deployment sets "LANGWATCH_CLI_REFRESH_TOKEN_TTL_SECONDS" to "3600"
+    When a CLI session is minted
+    Then its refresh_token expires one hour after it was issued
+
+  @unit @cli @refresh
+  Scenario: An unreadable CLI refresh-token lifetime keeps the default
+    Given the deployment sets "LANGWATCH_CLI_REFRESH_TOKEN_TTL_SECONDS" to "0", "-5", "1.5", "soon" or ""
+    Then the deployment still boots
+    And CLI refresh tokens keep the 90 day lifetime, never a lifetime of zero
+
+  # ---------------------------------------------------------------------------
+  # Personal virtual key: issued on first gateway use
+  # ---------------------------------------------------------------------------
+  # Login proves identity and nothing more. The personal virtual key is a
+  # billable, revocable credential, so it is minted only when a tool actually
+  # resolves to gateway mode, through POST /api/auth/cli/virtual-key. Minting
+  # at login instead left one extra VirtualKey row behind on every re-login,
+  # and gave a key to users who only ever send traces.
+
+  @integration @cli @personal-keys
+  Scenario: The personal virtual key is issued on first gateway use, not at login
+    Given user "jane@acme.com" has never logged in via the CLI
+    When she completes the device-code flow successfully
+    Then no personal virtual key exists for her in organization "acme"
+    When the CLI POSTs to "/api/auth/cli/virtual-key" with her access token
+    Then the response status is 201
+    And the response body contains `id`, `secret` and `prefix`
+    And exactly one personal virtual key named "default" exists for her
+
+  @integration @cli @personal-keys
+  Scenario: A second machine asks for a key of its own
+    Given user "jane@acme.com" already holds her default personal virtual key
+    When her second machine POSTs to "/api/auth/cli/virtual-key" with `device_label`
+    Then the response status is 201
+    And a further personal virtual key is issued, named after the device label
+    And the default key keeps working
+
+  @integration @cli @personal-keys
+  Scenario: Asking for a personal virtual key with no providers configured is refused
+    Given organization "acme" has no model provider reachable by Jane
+    When the CLI POSTs to "/api/auth/cli/virtual-key" with her access token
+    Then the response status is 409
+    And the response body contains `{ "error": "no_eligible_providers" }`
+    And no personal virtual key is created
+
+  @integration @cli @personal-keys
+  Scenario: Logging in again creates no virtual keys
+    Given user "jane@acme.com" has logged in on this machine before
+    When she runs "langwatch login" again and approves the device
+    Then the number of personal virtual keys she owns does not change
+
+  # ---------------------------------------------------------------------------
+  # Logout
+  # ---------------------------------------------------------------------------
+
+  @bdd @cli @logout
+  Scenario: `langwatch logout` revokes the refresh token and wipes local state
+    Given the CLI is currently authenticated
+    When I run "langwatch logout"
+    Then the CLI POSTs to "/api/auth/cli/logout"
+    And the server revokes both the access_token and refresh_token
+    And the CLI deletes "~/.langwatch/config" and the OS keyring entry
+    And the CLI prints "Logged out"
+
+  # ---------------------------------------------------------------------------
+  # Login completion when the organization carries deleted accounts
+  # ---------------------------------------------------------------------------
+  # Membership rows survive the deletion of the account behind them, so an org
+  # can list an admin nobody can email. Login completion must still hand the
+  # CLI its policy map, otherwise the wrapper caches nothing and enforces
+  # nothing.
+
+  @integration @cli @bootstrap
+  Scenario: Login completes when the earliest admin account is gone
+    Given organization "acme" lists two admins
+    And the account behind the admin who joined first has been deleted
+    When Jane completes login and the CLI asks for its bootstrap data
+    Then login completion succeeds
+    And the "contact your admin" address is the remaining admin's email
+    And the CLI receives a policy entry for every tool it can run
+
+  @integration @cli @bootstrap
+  Scenario: Login completes when every admin account is gone
+    Given organization "acme" lists one admin
+    And the account behind that admin has been deleted
+    When Jane completes login and the CLI asks for its bootstrap data
+    Then login completion succeeds
+    And no "contact your admin" address is offered
+    And the CLI receives a policy entry for every tool it can run
+
+  # ---------------------------------------------------------------------------
+  # A personal workspace still being set up
+  # ---------------------------------------------------------------------------
+
+  @unit @cli
+  Scenario: A device session names no personal project while it is still being created
+    Given Jane's personal project is still being created
+    When her device session is approved
+    Then the session carries no personal project
+
+  @unit @cli
+  Scenario: The CLI personal-project read answers failed while the personal project is still being created
+    Given Jane's personal project is still being created
+    When the CLI reads her personal project
+    Then it answers failed without an error log
+
+  @unit @cli
+  Scenario: The CLI key route refuses with a retryable 409 while the personal workspace is set up
+    Given Jane's personal project is still being created
+    When the CLI asks for her personal virtual key
+    Then it refuses with "personal_workspace_pending", a retryable 409, and issues no key
+
+  # ---------------------------------------------------------------------------
+  # Multi-org user (out of scope this iteration but pinned for design clarity)
+  # ---------------------------------------------------------------------------
+
+  @bdd @cli @multi-org @future
+  Scenario: User in multiple orgs is asked to pick a default during exchange
+    Given user "jane@acme.com" is a member of organizations ["acme", "personal-side-project"]
+    When she completes the SSO flow
+    Then the device confirmation page asks her to pick a default organization
+    And the chosen organization is bound to the issued access_token
+    And `langwatch organization switch <org-slug>` (deferred) re-issues a token bound to a different org

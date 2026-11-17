@@ -1,0 +1,92 @@
+# size-minimal.yaml - smallest footprint that still boots and serves.
+# For CI smoke tests and tiny demos, not real workloads.
+#
+# The Node app and workers need ~2Gi to start: they cold-load the TS server
+# via tsx, and below that V8 can't size its heap and the pod OOMs at boot.
+# ClickHouse auto-tunes to its limit, so give it >=1Gi.
+#
+# Budget accordingly: this totals ~4.9Gi of memory requests and ~2.4 CPU across
+# the release, which is more than a single 2-vCPU node can schedule once
+# control-plane reservations are counted. "Minimal" here means the smallest
+# that actually boots, not something that fits anywhere.
+#
+# ~1Gi / 500m of that is the Langy assistant, which ships enabled and which this
+# overlay does not disable. Stack examples/overlays/langy-disabled.yaml to drop
+# it if you are trying to fit a small node.
+#
+# Usage:
+#   helm install lw . \
+#     -f examples/overlays/size-minimal.yaml \
+#     -f examples/overlays/access-nodeport.yaml \
+#     --set autogen.enabled=true
+
+app:
+  replicaCount: 1
+  features:
+    skipEnvValidation: true
+  resources:
+    requests: { cpu: 250m, memory: 768Mi }
+    limits: { cpu: 1, memory: 2Gi }
+
+workers:
+  # Pinned true rather than inherited: an overlay has to be self-contained, or
+  # stacking it after a base values file that disables workers silently drops
+  # them (tests/values-e2e.yaml does exactly that).
+  enabled: true
+  replicaCount: 1
+  resources:
+    requests: { cpu: 250m, memory: 768Mi }
+    limits: { cpu: 1, memory: 2Gi }
+
+langwatch_nlp:
+  replicaCount: 1
+  resources:
+    requests: { cpu: 50m, memory: 256Mi }
+    limits: { cpu: 250m, memory: 512Mi }
+
+langevals:
+  replicaCount: 1
+  # One worker holding every local model needs ~2.6Gi. The limit is a ceiling,
+  # not a reservation, so it costs nothing until an evaluator loads a model.
+  resources:
+    requests: { cpu: 100m, memory: 768Mi }
+    limits: { cpu: 500m, memory: 4Gi }
+  extraEnvs:
+    - { name: DISABLE_EVALUATORS_PRELOAD, value: "true" }
+
+clickhouse:
+  chartManaged: true
+  replicas: 1
+  # 1Gi covers smoke/light use only. ClickHouse memory scales with ingest
+  # burst size and background merges, so a real trace flood will OOM this -
+  # raise clickhouse.memory (and cpu) before pushing meaningful volume.
+  memory: 1Gi
+  cpu: 1
+  storage:
+    size: 1Gi
+
+postgresql:
+  chartManaged: true
+  auth:
+    database: "langwatch"
+  primary:
+    persistence:
+      size: 1Gi
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 250m, memory: 256Mi }
+
+redis:
+  chartManaged: true
+  master:
+    persistence:
+      size: 1Gi
+    resources:
+      requests: { cpu: 25m, memory: 32Mi }
+      limits: { cpu: 100m, memory: 128Mi }
+
+prometheus:
+  chartManaged: false
+
+cronjobs:
+  enabled: false

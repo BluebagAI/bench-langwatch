@@ -1,0 +1,54 @@
+---
+title: Tracking Custom DSPy Optimizer
+sidebarTitle: Custom Optimizer Tracking
+description: Track custom DSPy optimizer logic in LangWatch to visualize optimization steps and improve AI agent testing workflows.
+---
+
+`langwatch.dspy.init` tracks `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `COPRO`, `MIPROv2` and `GEPA` out of the box. The three steps below add tracking to any other optimizer.
+
+## 1. Initialize LangWatch DSPy with optimizer=None
+
+Before the compilation step, explicitly provide `None` on the `optimizer` parameter to be able to track the steps manually:
+
+```python
+langwatch.dspy.init(experiment="dspy-custom-optimizer-example", optimizer=None)
+
+compiled_rag = my_awesome_optimizer.compile(RAG(), trainset=trainset)
+```
+
+## 2. Track the metric function
+
+Either before instantiating your optimizer, or inside the compilation step, don't forget to wrap the metric function with `langwatch.dspy.track_metric` so that it's tracked:
+
+```python
+metric = langwatch.dspy.track_metric(metric)
+```
+
+## 3. Track each step
+
+Now at each step your optimizer progresses, call `langwatch.dspy.log_step` to capture the score at the current step index, optimizer info and predictors being used on this step evaluation:
+
+```python
+import langwatch
+
+langwatch.dspy.log_step(
+    optimizer=DSPyOptimizer(
+        name="MyAwesomeOptimizer",
+        parameters={
+            "hyperparam": 1,
+        },
+    ),
+    index="1", # step index
+    score=0.5,
+    label="score",
+    predictors=candidate_program.predictors(),
+)
+```
+
+The LLM calls and the examples being evaluated are tracked automatically and logged together with the `log_step` call.
+
+## Wrapping up
+
+The steps of the optimizer now appear in the LangWatch dashboard.
+
+For any questions or issues, feel free to contact our support, join our channel on [Discord](https://discord.com/invite/kT4PhDS2gH) or [open an issue](https://github.com/langwatch/langwatch/issues) on our GitHub.

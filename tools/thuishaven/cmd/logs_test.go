@@ -1,0 +1,446 @@
+package cmd
+
+import (
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+func writeLog(t *testing.T, dir, service string, lines ...string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, service+".log"), []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func stamp(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+// lanes names whole-lane views, the selection every test but the half-split
+// ones uses.
+func lanes(names ...string) []logSource {
+	out := make([]logSource, 0, len(names))
+	for _, n := range names {
+		out = append(out, logSource{file: n, label: fileToCLIService(n)})
+	}
+	return out
+}
+
+// @scenario "Everything, labelled and interleaved"
+func TestReadLogTailsInterleavesByTime(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir, "nlp", stamp(base.Add(2*time.Second))+" nlp second")
+	writeLog(t, dir, "app", stamp(base.Add(1*time.Second))+" app first", stamp(base.Add(3*time.Second))+" app third")
+
+	lines, offsets, _ := readLogTails(dir, lanes("app", "nlp"))
+	if len(lines) != 3 {
+		t.Fatalf("lines = %d, want 3", len(lines))
+	}
+	order := []string{lines[0].text, lines[1].text, lines[2].text}
+	if order[0] != "app first" || order[1] != "nlp second" || order[2] != "app third" {
+		t.Errorf("merge order = %v, want time order across services", order)
+	}
+	if offsets["app"] == 0 || offsets["nlp"] == 0 {
+		t.Error("offsets must record each live file's end for follow to continue from")
+	}
+}
+
+// @scenario "Filtering to one service is a plain argument"
+func TestSelectLogServices(t *testing.T) {
+	dir := t.TempDir()
+	writeLog(t, dir, "app", stamp(time.Now())+" x")
+	writeLog(t, dir, "langyagent", stamp(time.Now())+" y")
+
+	t.Run("when no service is named, every captured one is read", func(t *testing.T) {
+		got, err := selectLogServices(dir, nil)
+		if err != nil {
+			t.Fatalf("selectLogServices: %v", err)
+		}
+		if len(got) != 2 {
+			t.Errorf("got %v, want both services", got)
+		}
+	})
+
+	t.Run("when the CLI name langy is used, the langyagent capture is read", func(t *testing.T) {
+		got, err := selectLogServices(dir, []string{"langy"})
+		if err != nil {
+			t.Fatalf("selectLogServices: %v", err)
+		}
+		if len(got) != 1 || got[0].file != "langyagent" {
+			t.Errorf("got %v, want the langyagent capture", got)
+		}
+	})
+
+	t.Run("when a service has no capture, the error lists what exists in CLI spelling", func(t *testing.T) {
+		_, err := selectLogServices(dir, []string{"nlp"})
+		if err == nil || !strings.Contains(err.Error(), "langy") || strings.Contains(err.Error(), "langyagent") {
+			t.Fatalf("want available services in CLI spelling, got %v", err)
+		}
+	})
+}
+
+// @scenario "A time window is one flag"
+// @scenario "Severity is a filter, not a grep"
+func TestFilterLogLines(t *testing.T) {
+	base := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	lines := []logLine{
+		{ts: base, service: "app", text: "INFO booted"},
+		{ts: base.Add(time.Minute), service: "app", text: "WARN slow query"},
+		{ts: base.Add(2 * time.Minute), service: "nlp", text: "ERROR exploded"},
+		{ts: base.Add(3 * time.Minute), service: "nlp", text: "no level here"},
+	}
+
+	t.Run("since drops older lines", func(t *testing.T) {
+		got := filterLogLines(lines, base.Add(90*time.Second), "")
+		if len(got) != 2 {
+			t.Errorf("got %d lines, want the 2 after the window start", len(got))
+		}
+	})
+
+	t.Run("level warn keeps warn and worse only", func(t *testing.T) {
+		got := filterLogLines(lines, time.Time{}, "warn")
+		if len(got) != 2 || got[0].text != "WARN slow query" || got[1].text != "ERROR exploded" {
+			t.Errorf("got %v, want the warn and error lines", got)
+		}
+	})
+
+	t.Run("no filter passes level-less lines through", func(t *testing.T) {
+		if got := filterLogLines(lines, time.Time{}, ""); len(got) != 4 {
+			t.Errorf("got %d, want all 4", len(got))
+		}
+	})
+
+	// Captured output is raw service stdout, so the level word arrives wrapped in
+	// colour escapes. Hand-written plain fixtures pass while the filter drops
+	// every real line, so these are shaped like what the sink actually stores.
+	t.Run("given colourised output, as every real service emits", func(t *testing.T) {
+		colourised := []logLine{
+			{ts: base, service: "nlp", text: "\x1b[0m\x1b[32mINFO\x1b[0m\x1b[32m listening on :5561\x1b[0m"},
+			{ts: base.Add(time.Minute), service: "nlp", text: "\x1b[0m\x1b[33mWARN\x1b[0m\x1b[33m slow query\x1b[0m"},
+			{ts: base.Add(2 * time.Minute), service: "app", text: "\x1b[31mERROR\x1b[0m exploded"},
+		}
+
+		t.Run("when filtering by level, the escapes do not hide the severity", func(t *testing.T) {
+			got := filterLogLines(colourised, time.Time{}, "warn")
+			if len(got) != 2 {
+				t.Errorf("got %d lines, want the warn and error lines — ANSI must be stripped before sniffing", len(got))
+			}
+		})
+	})
+
+	// "trace" and "debug" are ordinary nouns in this codebase, so a level word
+	// found deep in prose is almost always a false positive.
+	t.Run("given a level word appearing in the middle of a message", func(t *testing.T) {
+		prose := []logLine{
+			{ts: base, service: "app", text: "ERROR failed to fetch trace abc: connection refused"},
+		}
+
+		t.Run("when filtering by warn, the line is still surfaced", func(t *testing.T) {
+			if got := filterLogLines(prose, time.Time{}, "warn"); len(got) != 1 {
+				t.Error("an ERROR line must not be reclassified by the word 'trace' later in the message")
+			}
+		})
+	})
+}
+
+// @scenario "Logs outlive the stack"
+func TestReadLogTailsIncludesRotatedGeneration(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app.log.1"), []byte(stamp(base)+" old generation\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, dir, "app", stamp(base.Add(time.Second))+" live generation")
+
+	lines, _, _ := readLogTails(dir, lanes("app"))
+	if len(lines) != 2 || lines[0].text != "old generation" {
+		t.Errorf("lines = %v, want the rotated generation first", lines)
+	}
+}
+
+// A stack left up writes a capture far larger than any view of it. Reading the
+// whole file to print the last 200 lines is the difference between megabytes
+// and hundreds of them, and `haven logs` is the command an agent reaches for
+// most — so the read is bounded, and the bound never costs the lines the
+// command was going to display.
+//
+// The cap is injected rather than taken from logReadCapBytes: a fixture sized
+// off the production constant would cost whatever that constant is next raised
+// to, which is how this test first hung instead of failing.
+//
+// @scenario "A huge capture is read from its tail, not whole"
+func TestReadLogTailsBoundsWhatItReadsFromAHugeCapture(t *testing.T) {
+	const capBytes = 16 << 10
+
+	dir := t.TempDir()
+	base := time.Date(2026, 7, 23, 10, 0, 0, 0, time.UTC)
+
+	// ~100 bytes a line, written well past the cap so the tail is a small
+	// fraction of the file — the shape of a stack left up overnight.
+	filler := strings.Repeat("x", 64)
+	var b strings.Builder
+	written := 0
+	for i := 0; b.Len() < capBytes*8; i++ {
+		b.WriteString(stamp(base.Add(time.Duration(i) * time.Millisecond)))
+		b.WriteString(" ")
+		b.WriteString(filler)
+		b.WriteString("\n")
+		written++
+	}
+	path := filepath.Join(dir, "app.log")
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("given a capture larger than the read cap", func(t *testing.T) {
+		t.Run("when the tail is read", func(t *testing.T) {
+			data, size, capped, err := readLogTailCapped(path, capBytes)
+			if err != nil {
+				t.Fatalf("readLogTailCapped: %v", err)
+			}
+			if !capped {
+				t.Error("a capture past the cap must report that history was elided")
+			}
+			if int64(len(data)) > capBytes {
+				t.Errorf("read %d bytes, want no more than the %d-byte cap", len(data), capBytes)
+			}
+			if size != info.Size() {
+				t.Errorf("size = %d, want the file's full size %d so a follow continues from the end", size, info.Size())
+			}
+			// A capped read starts mid-line; that fragment must never be parsed
+			// as a line, so what survives begins at a real record boundary.
+			if _, ok := parseLogLine("app", strings.SplitN(string(data), "\n", 2)[0]); !ok {
+				t.Error("the first surviving line is a fragment — the partial leading line was not dropped")
+			}
+		})
+
+		t.Run("when the command reads its tails", func(t *testing.T) {
+			lines, offsets, elided := readLogTailsCapped(dir, lanes("app"), capBytes)
+			if !elided {
+				t.Error("readLogTails must report the elision so the developer is told")
+			}
+			if len(lines) >= written {
+				t.Errorf("parsed %d lines of %d written; the read was not bounded", len(lines), written)
+			}
+			if len(lines) == 0 {
+				t.Fatal("the bounded read produced nothing")
+			}
+			if offsets["app"] != info.Size() {
+				t.Errorf("offset = %d, want the full size %d — a follow must not replay the whole tail", offsets["app"], info.Size())
+			}
+			// The tail is the newest history, which is the part anyone asked for.
+			if last := lines[len(lines)-1].ts; !last.Equal(base.Add(time.Duration(written-1) * time.Millisecond)) {
+				t.Errorf("last line is %v, want the newest line written", last)
+			}
+		})
+	})
+
+	// The production cap has to be generous enough that no ordinary capture ever
+	// meets it — a developer must not be told history was elided on a file the
+	// command would have read whole anyway.
+	t.Run("given an ordinary capture", func(t *testing.T) {
+		t.Run("when the command reads its tails", func(t *testing.T) {
+			ordinary := t.TempDir()
+			writeLog(t, ordinary, "app", stamp(base)+" one line")
+
+			if _, _, elided := readLogTails(ordinary, lanes("app")); elided {
+				t.Error("a one-line capture was reported as elided; the production cap is too small")
+			}
+		})
+	})
+}
+
+// @scenario "The raw bytes are one flag away"
+func TestRenderModeRawPrintsThePayloadUntouched(t *testing.T) {
+	raw := `{"time":"2026-09-07T11:10:46.108Z","level":"info","msg":"listening"}`
+	line := logLine{ts: time.Now(), service: "api", text: raw}
+
+	if got := formatLogLine(line, renderRaw, true); got != raw {
+		t.Errorf("--raw rendered %q, want the payload byte for byte", got)
+	}
+	if got := formatLogLine(line, renderHuman, true); got == raw {
+		t.Error("the human rendering must not be the raw payload")
+	}
+}
+
+// @scenario "The two applications the api lane hosts are addressable by name"
+func TestSelectLogServicesSplitsTheAPILaneByHalf(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir,
+		"api",
+		stamp(base)+` {"level":"info","service":"langwatch-worker","msg":"queue drained"}`,
+		stamp(base.Add(time.Second))+` {"level":"info","service":"langwatch-api","msg":"listening"}`,
+		stamp(base.Add(2*time.Second))+" dev-supervisor: restarting",
+	)
+
+	t.Run("when the worker is named, only the worker application's lines appear", func(t *testing.T) {
+		sources, err := selectLogServices(dir, []string{"worker"})
+		if err != nil {
+			t.Fatalf("selectLogServices: %v", err)
+		}
+		lines, _, _ := readLogTails(dir, sources)
+		if len(lines) != 1 || !strings.Contains(lines[0].text, "queue drained") {
+			t.Fatalf("lines = %v, want only the worker's line", lines)
+		}
+		if lines[0].service != "worker" {
+			t.Errorf("label = %q, want the half's own name so it does not read as the lane's", lines[0].service)
+		}
+	})
+
+	// The unstructured third line names no application, so it follows the record
+	// above it — the rule that keeps a stack trace under its own error rather
+	// than under whichever half the lane defaults to.
+	t.Run("when both halves are named, each keeps its own label", func(t *testing.T) {
+		sources, err := selectLogServices(dir, []string{"api", "worker"})
+		if err != nil {
+			t.Fatalf("selectLogServices: %v", err)
+		}
+		lines, _, _ := readLogTails(dir, sources)
+		got := make([]string, len(lines))
+		for i, l := range lines {
+			got[i] = l.service
+		}
+		want := []string{"worker", "api", "api"}
+		if !slices.Equal(got, want) {
+			t.Errorf("labels = %v, want %v — each half labelled its own, the continuation following the api record", got, want)
+		}
+	})
+
+	t.Run("when a service has no capture, the halves are among the choices listed", func(t *testing.T) {
+		_, err := selectLogServices(dir, []string{"nope"})
+		if err == nil {
+			t.Fatal("naming an absent service must be an error")
+		}
+		if !strings.Contains(err.Error(), "api") || !strings.Contains(err.Error(), "worker") {
+			t.Errorf("error = %q, want api and worker listed as selectable", err)
+		}
+	})
+}
+
+// @scenario "The api lane is still readable whole"
+func TestUnfilteredLogsKeepTheAPILaneWhole(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir,
+		"api",
+		stamp(base)+` {"level":"info","service":"langwatch-api","msg":"listening"}`,
+		stamp(base.Add(time.Second))+" dev-supervisor: restarting",
+	)
+
+	sources, err := selectLogServices(dir, nil)
+	if err != nil {
+		t.Fatalf("selectLogServices: %v", err)
+	}
+	lines, _, _ := readLogTails(dir, sources)
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d, want every line of the lane including the launcher's own", len(lines))
+	}
+	for _, l := range lines {
+		if l.service != "api" {
+			t.Errorf("label = %q, want the lane's own name when nothing was filtered", l.service)
+		}
+	}
+}
+
+// @scenario "The two applications the api lane hosts are addressable by name"
+func TestHalfSelectionFindsACaptureWrittenUnderTheOldLaneName(t *testing.T) {
+	// The lane was called "backend" before it was named for the application it
+	// serves. A capture written then is still on disk, and the half filter has
+	// to find it there rather than reporting the worker has no logs.
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir, "backend",
+		stamp(base)+` {"level":"info","service":"langwatch-worker","msg":"queue drained"}`,
+	)
+
+	sources, err := selectLogServices(dir, []string{"worker"})
+	if err != nil {
+		t.Fatalf("selectLogServices: %v", err)
+	}
+	lines, _, _ := readLogTails(dir, sources)
+	if len(lines) != 1 || !strings.Contains(lines[0].text, "queue drained") {
+		t.Fatalf("lines = %v, want the worker's line out of the old capture", lines)
+	}
+}
+
+// @scenario "A simulator hosted in the go lane is still read by its own name"
+func TestSelectLogServicesFindsTheSimulatorsInTheGoLane(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir,
+		"go",
+		stamp(base)+` {"level":"info","service":"langwatch-service-aigateway","msg":"listening"}`,
+		stamp(base.Add(time.Second))+` {"level":"info","service":"langwatch-service-mailsim","msg":"mailsim catching mail"}`,
+	)
+	sources, err := selectLogServices(dir, []string{"mail"})
+	if err != nil {
+		t.Fatalf("selectLogServices: %v", err)
+	}
+	lines, _, _ := readLogTails(dir, sources)
+	if len(lines) != 1 || !strings.Contains(lines[0].text, "mailsim") || lines[0].service != "mail" {
+		t.Fatalf("lines = %v, want only mailsim's line, labelled mail", lines)
+	}
+	if _, err := selectLogServices(dir, []string{"nope"}); err == nil || !strings.Contains(err.Error(), "idp") {
+		t.Errorf("error = %v, want idp listed as selectable beside the go lane", err)
+	}
+}
+
+func TestSelectLogServicesFindsTheSimulatorsInTheSimsLane(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	writeLog(t, dir,
+		"sims",
+		stamp(base)+` {"level":"info","service":"langwatch-service-analyticssim","msg":"analyticssim up"}`,
+		stamp(base.Add(time.Second))+` {"level":"info","service":"langwatch-service-mailsim","msg":"mailsim up"}`,
+	)
+	sources, err := selectLogServices(dir, []string{"analytics"})
+	if err != nil {
+		t.Fatalf("selectLogServices: %v", err)
+	}
+	lines, _, _ := readLogTails(dir, sources)
+	if len(lines) != 1 || !strings.Contains(lines[0].text, "analyticssim") {
+		t.Fatalf("lines = %v, want only analyticssim's line", lines)
+	}
+}
+
+// @scenario "The one-process lane's logs are captured per application"
+func TestSelectLogServicesReadsTheSplitCapture(t *testing.T) {
+	dir := t.TempDir()
+	base := time.Date(2026, 10, 10, 10, 0, 0, 0, time.UTC)
+	launcher := stamp(base) + ` {"level":"info","msg":"backend ready"}`
+	writeLog(t, dir, "ui", stamp(base.Add(-time.Second))+" built in 812ms")
+	writeLog(t, dir, "api", launcher, stamp(base.Add(time.Second))+` {"service":"langwatch-api","msg":"listening"}`)
+	writeLog(t, dir, "worker", launcher, stamp(base.Add(2*time.Second))+` {"service":"langwatch-worker","msg":"drained"}`)
+
+	worker, err := selectLogServices(dir, []string{"worker"})
+	if err != nil {
+		t.Fatalf("selectLogServices: %v", err)
+	}
+	if lines, _, _ := readLogTails(dir, worker); len(lines) != 2 || !strings.Contains(lines[1].text, "drained") {
+		t.Errorf("worker = %v, want the launcher line and its own", lines)
+	}
+	all, err := selectLogServices(dir, []string{"app"})
+	if err != nil {
+		t.Fatalf("`haven logs app` is no longer an alias: %v", err)
+	}
+	if got := len(all); got != 3 {
+		t.Errorf("app selects %d sources, want ui, api and worker", got)
+	}
+	if names := logSelectableNames(capturedServices(dir)); strings.Join(names, ",") != "api,ui,worker" {
+		t.Errorf("selectable = %v, want api, ui and worker once each", names)
+	}
+}

@@ -1,0 +1,54 @@
+{
+  "name": "@langwatch/react-rum",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Real user monitoring for React apps: browser tracing that joins to backend traces, plus session identity",
+  "keywords": [
+    "langwatch",
+    "opentelemetry",
+    "react",
+    "rum",
+    "tracing"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./src/index.ts"
+    },
+    "./constants": {
+      "types": "./dist/constants.d.ts",
+      "default": "./src/constants.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "GOMAXPROCS=2 GOMEMLIMIT=2GiB tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@langwatch/time": "workspace:*",
+    "@opentelemetry/api": "catalog:",
+    "@opentelemetry/core": "catalog:",
+    "@opentelemetry/exporter-trace-otlp-http": "catalog:",
+    "@opentelemetry/instrumentation": "catalog:",
+    "@opentelemetry/instrumentation-document-load": "^0.66.0",
+    "@opentelemetry/instrumentation-fetch": "^0.221.0",
+    "@opentelemetry/resources": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@opentelemetry/sdk-trace-web": "catalog:",
+    "@opentelemetry/semantic-conventions": "catalog:"
+  },
+  "devDependencies": {
+    "@langwatch/vitest-config": "workspace:*",
+    "@types/node": "catalog:",
+    "jsdom": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "packageManager": "pnpm@12.6.0",
+  "langwatch": {
+    "group": "browser"
+  }
+}

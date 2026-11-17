@@ -1,0 +1,6 @@
+model: openai/gpt-6-luna
+messages:
+  - role: system
+    content: You are a helpful assistant 3
+  - role: user
+    content: "{{input}}"

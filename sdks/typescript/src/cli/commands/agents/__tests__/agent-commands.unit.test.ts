@@ -1,0 +1,342 @@
+import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
+
+import { AgentsApiError, AgentsApiService } from "@/client-sdk/services/agents/agents-api.service";
+
+vi.mock("@/client-sdk/services/agents/agents-api.service", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    AgentsApiService: vi.fn(),
+  };
+});
+
+vi.mock("../../../utils/apiKey", () => ({
+  resolveCredentials: vi.fn(async () => ({
+    apiKey: "test-key",
+    source: "env",
+    endpoint: "https://app.langwatch.ai",
+  })),
+}));
+
+vi.mock("ora", () => ({
+  default: () => ({
+    start: vi.fn().mockReturnThis(),
+    stop: vi.fn().mockReturnThis(),
+    succeed: vi.fn(),
+    fail: vi.fn(),
+  }),
+}));
+
+import { createAgentCommand } from "../create";
+import { deleteAgentCommand } from "../delete";
+import { getAgentCommand } from "../get";
+import { listAgentsCommand } from "../list";
+
+class ProcessExitError extends Error {
+  constructor(public code: number) {
+    super(`process.exit(${code})`);
+  }
+}
+
+const noop = () => {
+  // intentionally empty — suppresses output during tests
+};
+
+let exitSpy: MockInstance<typeof process.exit>;
+
+const mockProcessExit = () => {
+  exitSpy = vi.spyOn(process, "exit").mockImplementation((code) => {
+    throw new ProcessExitError(code as number);
+  });
+};
+
+const makeAgent = (overrides = {}) => ({
+  id: "agent_abc123",
+  name: "Test Agent",
+  type: "http",
+  config: { url: "https://api.example.com" },
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-01-02T00:00:00Z",
+  ...overrides,
+});
+
+describe("listAgentsCommand()", () => {
+  let mockList: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockList = vi.fn();
+    vi.mocked(AgentsApiService).mockImplementation(function () {
+      return {
+        list: mockList,
+        get: vi.fn(),
+        create: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as AgentsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when agents exist", () => {
+    it("calls list and prints output", async () => {
+      mockList.mockResolvedValue({
+        data: [makeAgent()],
+        pagination: { page: 1, limit: 100, total: 1, totalPages: 1 },
+      });
+
+      await listAgentsCommand();
+
+      expect(mockList).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("when no agents exist", () => {
+    it("prints empty-state message", async () => {
+      mockList.mockResolvedValue({
+        data: [],
+        pagination: { page: 1, limit: 100, total: 0, totalPages: 0 },
+      });
+
+      await listAgentsCommand();
+
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("when a machine format is requested", () => {
+    it("returns the raw listing as the payload instead of printing", async () => {
+      const listing = {
+        data: [makeAgent()],
+        pagination: { page: 1, limit: 100, total: 1, totalPages: 1 },
+      };
+      mockList.mockResolvedValue(listing);
+
+      const result = await listAgentsCommand();
+
+      // The command no longer decides the format — it hands the payload to
+      // the output port, which renders json/yaml/agents/--jq from this value.
+      expect(result?.data).toEqual({ ...listing, hiddenStaleRows: 0 });
+      expect(console.log).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("when the API call fails", () => {
+    it("exits with code 1", async () => {
+      mockList.mockRejectedValue(new AgentsApiError("Network error", "list agents"));
+
+      await expect(listAgentsCommand()).rejects.toThrow(ProcessExitError);
+    });
+  });
+
+  describe("when asked to wait for an agent to come online", () => {
+    const offline = () => ({
+      data: [makeAgent({ name: "acme-checkout", type: "connected", status: "offline" })],
+      pagination: { page: 1, limit: 100, total: 1, totalPages: 1 },
+    });
+    const online = () => ({
+      data: [makeAgent({ name: "acme-checkout", type: "connected", status: "online" })],
+      pagination: { page: 1, limit: 100, total: 1, totalPages: 1 },
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** @scenario "The list can wait for an agent to come online" */
+    it("reads the list again until the agent reports online, then returns the list", async () => {
+      vi.useFakeTimers();
+      mockList
+        .mockResolvedValueOnce({
+          data: [],
+          pagination: { page: 1, limit: 100, total: 0, totalPages: 0 },
+        })
+        .mockResolvedValueOnce(offline())
+        .mockResolvedValue(online());
+
+      const pending = listAgentsCommand({ waitOnline: "acme-checkout" });
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.advanceTimersByTimeAsync(3000);
+      const result = await pending;
+
+      expect(mockList).toHaveBeenCalledTimes(3);
+      expect(result?.data).toEqual({ ...online(), hiddenStaleRows: 0 });
+    });
+
+    /** @scenario "The list can wait for an agent to come online" */
+    it("fails once the timeout passes with the agent still offline", async () => {
+      vi.useFakeTimers();
+      mockList.mockResolvedValue(offline());
+
+      const pending = listAgentsCommand({ waitOnline: "acme-checkout", timeout: 6 });
+      const outcome = pending.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.advanceTimersByTimeAsync(3000);
+
+      expect(await outcome).toBeInstanceOf(ProcessExitError);
+      expect(console.error).toHaveBeenCalledWith(
+        expect.stringContaining("Read the process's own output for the reason"),
+      );
+    });
+
+    /** @scenario "The wait's timeout names the agent, the wait and the credentials, never a login" */
+    it("says on stderr which agent it waited for, for how long, and which credentials read the list", async () => {
+      vi.useFakeTimers();
+      mockList.mockResolvedValue(offline());
+
+      const pending = listAgentsCommand({ waitOnline: "acme-checkout", timeout: 6 });
+      const outcome = pending.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.advanceTimersByTimeAsync(3000);
+      await vi.advanceTimersByTimeAsync(3000);
+      await outcome;
+
+      const lines = vi.mocked(console.error).mock.calls.map((call) => String(call[0]));
+      const timeoutLine = lines.find((line) => line.includes("--wait-online"));
+      expect(timeoutLine).toBe(
+        "No agent named acme-checkout reported online within 6 seconds of --wait-online. The listing was read as the API key from the environment at https://app.langwatch.ai and answered; the agent process never reported online.",
+      );
+      // The line goes through console.error, not the spinner, so it is
+      // printed under --format json as well, where the spinner is silent.
+      for (const line of lines) {
+        expect(line).not.toContain("login");
+        expect(line).not.toContain("Switch:");
+      }
+    });
+  });
+});
+
+describe("getAgentCommand()", () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn();
+    vi.mocked(AgentsApiService).mockImplementation(function () {
+      return {
+        list: vi.fn(),
+        get: mockGet,
+        create: vi.fn(),
+        update: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as AgentsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when agent is found", () => {
+    it("calls get with the provided ID", async () => {
+      mockGet.mockResolvedValue(makeAgent());
+
+      await getAgentCommand("agent_abc123");
+
+      expect(mockGet).toHaveBeenCalledWith("agent_abc123", {});
+    });
+  });
+
+  describe("when agent is not found", () => {
+    it("exits with code 1", async () => {
+      mockGet.mockRejectedValue(new AgentsApiError("Not found", "get agent"));
+
+      await expect(getAgentCommand("nonexistent")).rejects.toThrow(ProcessExitError);
+    });
+  });
+});
+
+describe("createAgentCommand()", () => {
+  let mockCreate: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreate = vi.fn();
+    vi.mocked(AgentsApiService).mockImplementation(function () {
+      return {
+        list: vi.fn(),
+        get: vi.fn(),
+        create: mockCreate,
+        update: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as AgentsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when creation succeeds", () => {
+    it("calls create with name, type, and config", async () => {
+      mockCreate.mockResolvedValue(makeAgent());
+
+      await createAgentCommand("Test Agent", {
+        type: "http",
+        config: '{"url":"https://api.example.com"}',
+      });
+
+      expect(mockCreate).toHaveBeenCalledWith({
+        name: "Test Agent",
+        type: "http",
+        config: { url: "https://api.example.com" },
+      });
+    });
+  });
+
+  describe("when config is invalid JSON", () => {
+    it("exits with code 1 with JSON error", async () => {
+      await expect(
+        createAgentCommand("Test", { type: "http", config: "not-json" }),
+      ).rejects.toThrow(ProcessExitError);
+    });
+  });
+
+  describe("when creation fails", () => {
+    it("exits with code 1", async () => {
+      mockCreate.mockRejectedValue(new AgentsApiError("Limit reached", "create agent"));
+
+      await expect(createAgentCommand("Test", { type: "http" })).rejects.toThrow(ProcessExitError);
+    });
+  });
+});
+
+describe("deleteAgentCommand()", () => {
+  let mockDelete: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockDelete = vi.fn();
+    vi.mocked(AgentsApiService).mockImplementation(function () {
+      return {
+        list: vi.fn(),
+        get: vi.fn(),
+        create: vi.fn(),
+        update: vi.fn(),
+        delete: mockDelete,
+      } as unknown as AgentsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when deletion succeeds", () => {
+    it("calls delete with the ID", async () => {
+      mockDelete.mockResolvedValue({ id: "agent_abc123", name: "Test Agent" });
+
+      await deleteAgentCommand("agent_abc123");
+
+      expect(mockDelete).toHaveBeenCalledWith("agent_abc123");
+    });
+  });
+
+  describe("when deletion fails", () => {
+    it("exits with code 1", async () => {
+      mockDelete.mockRejectedValue(new AgentsApiError("Not found", "delete agent"));
+
+      await expect(deleteAgentCommand("nonexistent")).rejects.toThrow(ProcessExitError);
+    });
+  });
+});

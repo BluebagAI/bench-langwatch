@@ -1,0 +1,239 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+import { initConfig, getConfig, requireApiKey, runWithConfig, tryGetConfig } from "../config.ts";
+
+describe("config", () => {
+  let originalApiKey: string | undefined;
+  let originalEndpoint: string | undefined;
+
+  beforeEach(() => {
+    originalApiKey = process.env.LANGWATCH_API_KEY;
+    originalEndpoint = process.env.LANGWATCH_ENDPOINT;
+    delete process.env.LANGWATCH_API_KEY;
+    delete process.env.LANGWATCH_ENDPOINT;
+  });
+
+  afterEach(() => {
+    if (originalApiKey !== undefined) {
+      process.env.LANGWATCH_API_KEY = originalApiKey;
+    } else {
+      delete process.env.LANGWATCH_API_KEY;
+    }
+    if (originalEndpoint !== undefined) {
+      process.env.LANGWATCH_ENDPOINT = originalEndpoint;
+    } else {
+      delete process.env.LANGWATCH_ENDPOINT;
+    }
+  });
+
+  describe("when CLI args are provided", () => {
+    it("uses CLI apiKey over env var", () => {
+      process.env.LANGWATCH_API_KEY = "env-key";
+      initConfig({ apiKey: "cli-key" });
+      expect(getConfig().apiKey).toBe("cli-key");
+    });
+
+    it("uses CLI endpoint over env var", () => {
+      process.env.LANGWATCH_ENDPOINT = "https://env.example.com";
+      initConfig({ endpoint: "https://cli.example.com" });
+      expect(getConfig().endpoint).toBe("https://cli.example.com");
+    });
+  });
+
+  describe("when CLI args are missing", () => {
+    it("falls back to LANGWATCH_API_KEY env var", () => {
+      process.env.LANGWATCH_API_KEY = "env-key";
+      initConfig({});
+      expect(getConfig().apiKey).toBe("env-key");
+    });
+
+    it("falls back to LANGWATCH_ENDPOINT env var", () => {
+      process.env.LANGWATCH_ENDPOINT = "https://env.example.com";
+      initConfig({});
+      expect(getConfig().endpoint).toBe("https://env.example.com");
+    });
+  });
+
+  describe("when the endpoint carries a trailing slash", () => {
+    it("strips it from a CLI endpoint", () => {
+      initConfig({ endpoint: "https://cli.example.com/" });
+      expect(getConfig().endpoint).toBe("https://cli.example.com");
+    });
+
+    it("trims whitespace around a CLI endpoint", () => {
+      initConfig({ endpoint: "  https://cli.example.com///  " });
+      expect(getConfig().endpoint).toBe("https://cli.example.com");
+    });
+
+    it("strips repeated slashes from the env var", () => {
+      process.env.LANGWATCH_ENDPOINT = "http://localhost:5560///";
+      initConfig({});
+      expect(getConfig().endpoint).toBe("http://localhost:5560");
+    });
+
+    it("keeps the built request path free of a double slash", () => {
+      initConfig({ endpoint: "https://app.langwatch.ai/" });
+      expect(`${getConfig().endpoint}/api/v1/bug-reports`).toBe(
+        "https://app.langwatch.ai/api/v1/bug-reports",
+      );
+    });
+  });
+
+  describe("when the endpoint is blank", () => {
+    it("falls back to the default rather than an empty base url", () => {
+      process.env.LANGWATCH_ENDPOINT = "   ";
+      initConfig({});
+      expect(getConfig().endpoint).toBe("https://app.langwatch.ai");
+    });
+  });
+
+  describe("when no args or env vars are provided", () => {
+    it("defaults endpoint to https://app.langwatch.ai", () => {
+      initConfig({});
+      expect(getConfig().endpoint).toBe("https://app.langwatch.ai");
+    });
+
+    it("leaves apiKey as undefined", () => {
+      initConfig({});
+      expect(getConfig().apiKey).toBeUndefined();
+    });
+  });
+
+  describe("requireApiKey()", () => {
+    it("returns the API key when it is set", () => {
+      initConfig({ apiKey: "test-key" });
+      expect(requireApiKey()).toBe("test-key");
+    });
+
+    it("throws when no API key is provided", () => {
+      initConfig({});
+      expect(() => requireApiKey()).toThrow(
+        "LANGWATCH_API_KEY is required. Set it via --apiKey flag or LANGWATCH_API_KEY environment variable.",
+      );
+    });
+  });
+
+  describe("getConfig()", () => {
+    it("throws when config has not been initialized", async () => {
+      // globalThis survives vi.resetModules(), so clear it explicitly
+      delete (globalThis as Record<string, unknown>).__langwatch_mcp_config;
+      delete (globalThis as Record<string, unknown>).__langwatch_mcp_config_storage;
+      vi.resetModules();
+      const freshConfig = await import("../config.ts");
+      expect(() => freshConfig.getConfig()).toThrow("Config not initialized");
+    });
+  });
+
+  describe("given a process that has not initialised the MCP configuration", () => {
+    beforeEach(() => {
+      // The state lives on globalThis, so it survives between tests and has to
+      // be cleared rather than re-imported.
+      delete (globalThis as Record<string, unknown>).__langwatch_mcp_config;
+      delete (globalThis as Record<string, unknown>).__langwatch_mcp_config_storage;
+    });
+
+    describe("when it asks whether one is there", () => {
+      /**
+       * @scenario "Asking whether the MCP configuration exists is not a failure"
+       * @scenario "Checking for a config before it exists logs nothing"
+       */
+      it("is told there is none, and nothing is printed", () => {
+        const console_error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+        expect(tryGetConfig()).toBeUndefined();
+        expect(console_error).not.toHaveBeenCalled();
+
+        console_error.mockRestore();
+      });
+    });
+
+    describe("when it demands the configuration rather than asking for it", () => {
+      /** @scenario "A caller that needs the MCP configuration is still refused loudly" */
+      it("is refused", () => {
+        const console_error = vi.spyOn(console, "error").mockImplementation(() => {});
+
+        expect(() => getConfig()).toThrow("Config not initialized");
+
+        console_error.mockRestore();
+      });
+    });
+  });
+
+  describe("given a process that has initialised the MCP configuration", () => {
+    describe("when it asks whether one is there", () => {
+      /** @scenario "The initialised configuration is what the asking caller gets" */
+      it("is handed the configuration it initialised", () => {
+        initConfig({ apiKey: "asked-key", endpoint: "https://asked.example.com" });
+
+        expect(tryGetConfig()).toEqual(getConfig());
+        expect(tryGetConfig()?.endpoint).toBe("https://asked.example.com");
+      });
+
+      /**
+       * @scenario "The initialised configuration is what the asking caller gets"
+       * @scenario "A config counts as present once initialized or scoped"
+       */
+      it("is handed the scoped configuration inside a scoped call", () => {
+        initConfig({ apiKey: "global-key", endpoint: "https://global.example.com" });
+
+        runWithConfig({ apiKey: "scoped-key", endpoint: "https://scoped.example.com" }, () => {
+          expect(tryGetConfig()?.apiKey).toBe("scoped-key");
+        });
+      });
+    });
+  });
+
+  describe("runWithConfig()", () => {
+    it("overrides global config within the callback", () => {
+      initConfig({ apiKey: "global-key" });
+
+      runWithConfig({ apiKey: "session-key", endpoint: "https://session.example.com" }, () => {
+        expect(getConfig().apiKey).toBe("session-key");
+        expect(getConfig().endpoint).toBe("https://session.example.com");
+      });
+    });
+
+    it("restores global config after the callback completes", () => {
+      initConfig({ apiKey: "global-key" });
+
+      runWithConfig({ apiKey: "session-key", endpoint: "https://session.example.com" }, () => {
+        // inside: session config
+      });
+
+      expect(getConfig().apiKey).toBe("global-key");
+    });
+
+    it("isolates concurrent async contexts", async () => {
+      initConfig({ apiKey: "global-key" });
+
+      const results: string[] = [];
+
+      await Promise.all([
+        runWithConfig({ apiKey: "key-a", endpoint: "https://a.example.com" }, async () => {
+          await new Promise((r) => setTimeout(r, 10));
+          results.push(requireApiKey());
+        }),
+        runWithConfig({ apiKey: "key-b", endpoint: "https://b.example.com" }, async () => {
+          await new Promise((r) => setTimeout(r, 5));
+          results.push(requireApiKey());
+        }),
+      ]);
+
+      expect(results).toContain("key-a");
+      expect(results).toContain("key-b");
+    });
+
+    it("returns the callback result", () => {
+      initConfig({});
+      const result = runWithConfig({ apiKey: "key", endpoint: "https://example.com" }, () => 42);
+      expect(result).toBe(42);
+    });
+
+    it("makes requireApiKey() use the scoped key", () => {
+      initConfig({});
+      runWithConfig({ apiKey: "scoped-key", endpoint: "https://example.com" }, () => {
+        expect(requireApiKey()).toBe("scoped-key");
+      });
+    });
+  });
+});

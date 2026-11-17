@@ -1,0 +1,239 @@
+Feature: AI Gateway Governance — Sessions and Devices Inventory
+  As an end user managing my own LangWatch credentials across machines
+  I want a single inventory of every active session and device-bound
+  credential I have — including web sign-ins, CLI device logins, and
+  ingestion keys minted from /me Trace Ingest — with a clear revoke
+  affordance and a label that tells me which laptop / process it belongs to
+  And as an org admin enforcing a maximum session lifetime
+  I want a per-organization `maxSessionDurationDays` policy that applies
+  uniformly to every credential type — short-lived web cookies, long-lived
+  CLI device tokens, and never-expiring ingestion keys — so compliance
+  with SOC2 / ISO27001 session-lifetime requirements is enforced at
+  infrastructure level, not relying on per-user discipline
+
+  Per gateway.md "sessions & devices":
+    Three credential classes share one inventory:
+      • web session — short-lived cookie + refresh
+      • CLI device session — `langwatch login --device` against ~/.langwatch
+      • ingestion key — `ik-lw-<...>` (write-only, ingest-only ApiKey) minted
+        by a CLI session or from /me Trace Ingest
+
+  Per ingestion-templates-catalog.feature + ingestion-key-lifecycle.feature:
+    Ingestion keys are TODAY surfaced ONLY at /me Trace Ingest tile-grid
+    (per-template). They MUST also appear in the unified devices inventory
+    on /me/configure so users can revoke + admins can apply
+    max-session-duration.
+
+  Background:
+    Given organization "acme" exists
+    And admin "carol@acme.com" has the `organization:manage` permission
+    And user "jane@acme.com" has personal project "personal-jane"
+    And jane has signed in on:
+      | session class    | label                       | last used   |
+      | web session      | "MacBook Pro — Chrome"      | 2 hours ago |
+      | CLI device       | "MacBook Pro — claude-code"  | 1 day ago   |
+      | ingestion key    | "claude_code template"       | 3 hours ago |
+      | ingestion key    | "cursor template"            | 12 days ago |
+
+  # ---------------------------------------------------------------------------
+  # User-facing inventory on the /me/configure devices tab
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @inventory @user-visibility
+  Scenario: User sees ALL credential classes in one list on the devices tab
+    When jane opens the devices tab on "/me/configure"
+    Then she sees a card-grid with exactly 4 cards:
+      | label                       | class            | revoke affordance |
+      | "MacBook Pro — Chrome"      | web              | "Revoke session"  |
+      | "MacBook Pro — claude-code" | cli              | "Revoke device"   |
+      | "claude_code template"      | ingest_key       | "Rotate / Revoke" |
+      | "cursor template"           | ingest_key       | "Rotate / Revoke" |
+    And each card displays: class icon + human-readable label + last-used
+        relative time + first-issued absolute time
+    And there is a "Revoke all sessions" button at the top of the page
+
+  @integration @sessions-and-devices @inventory @binding-tokens-included
+  Scenario: Ingestion keys appear on the devices tab alongside CLI sessions
+    Given jane's "MacBook Pro" CLI session minted an ingestion key for claude_code
+    And jane has an ingestion key for cursor that no live session minted
+    When jane opens the devices tab on "/me/configure"
+    Then the "MacBook Pro" card carries a row labelled "Ingestion key · claude_code"
+    And the cursor key is listed under a card titled "Other keys"
+    # The devices inventory is the authoritative single-pane-of-glass
+    # for every active credential. No credential type is invisible from this
+    # page (defense against losing track of long-lived keys).
+
+  @integration @sessions-and-devices @inventory
+  Scenario: Ingestion key card shows last used
+    Given jane's claude_code ingestion key was last used 2 hours ago
+    And her cursor ingestion key has never been used
+    When jane opens the devices tab on "/me/configure"
+    Then the claude_code row reads "Last used 2h ago"
+    And the cursor row reads "Last used Never"
+    And each row also carries the date the key was first issued
+
+  # ---------------------------------------------------------------------------
+  # Single-card revoke
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @revoke-single
+  Scenario Outline: User revokes a single credential card
+    Given jane has the credentials from Background
+    When she clicks "Revoke" on the "<class>" card with label "<label>"
+    Then the credential is invalidated — subsequent use returns 401
+    And a confirmation toast appears: "<class> revoked"
+    And an audit row "<audit kind>" is emitted
+
+    Examples:
+      | class      | label                       | audit kind                                      |
+      | web        | "MacBook Pro — Chrome"      | gateway.web_session.revoked                     |
+      | cli        | "MacBook Pro — claude-code" | gateway.cli_device.revoked                      |
+
+  @integration @sessions-and-devices @revoke-single
+  Scenario: User revokes a single ingestion key card
+    Given jane's "MacBook Pro" card carries a claude_code ingestion key row
+    When she clicks "Revoke" on that row and confirms
+    Then `ingestionKey.revoke` is called with that key's id
+    And both the session list and the ingestion key list are read again
+    And the other rows on the card stay listed
+
+  # ---------------------------------------------------------------------------
+  # Bulk revoke — security-relevant signal
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @revoke-all
+  Scenario: User revokes all sessions in one click (account-takeover recovery)
+    Given jane has 4 active credentials (per Background)
+    When she clicks "Revoke all sessions" and confirms the dialog
+    Then ALL 4 credentials are invalidated
+    And one audit row PER credential class is emitted (4 total)
+    And jane is signed out of the current web session and redirected to /auth/signin
+    # Account-takeover recovery primitive — rotates every key surface in one action.
+
+  # ---------------------------------------------------------------------------
+  # Org-level max-session-duration policy
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @max-duration @policy
+  Scenario: Admin sets org-level maxSessionDurationDays
+    Given the org's current `maxSessionDurationDays` is NULL (unlimited)
+    When carol navigates to /governance and sets `maxSessionDurationDays` to 30
+    Then `Organization.maxSessionDurationDays` is updated to 30
+    And an audit row `gateway.organization.max_session_duration_changed`
+        with payload { previousDays: null, newDays: 30, actorUserId: carol.id } is emitted
+
+  @bdd @sessions-and-devices @max-duration @enforcement-uniform
+  Scenario Outline: maxSessionDurationDays enforces ALL credential classes uniformly
+    Given the org's `maxSessionDurationDays` is 30
+    And jane has a "<class>" credential issued "<age>" ago
+    When she attempts to use it
+    Then the credential "<outcome>"
+
+    Examples:
+      | class      | age      | outcome                                                |
+      | web        | 25 days  | succeeds (within window)                               |
+      | web        | 31 days  | rejected with 401 + redirect to /auth/signin           |
+      | cli        | 28 days  | succeeds (within window)                               |
+      | cli        | 35 days  | rejected with 401 + CLI prompts re-login                |
+      | ingest_key | 29 days  | succeeds (within window)                                |
+      | ingest_key | 45 days  | rejected with 401 — tile shows "Key expired — rotate"   |
+
+  @bdd @sessions-and-devices @max-duration @policy-change-applies-going-forward
+  Scenario: Tightening maxSessionDurationDays revokes sessions older than the new cap
+    Given the org's `maxSessionDurationDays` was 90 and is being changed to 30
+    And jane has an ingestion key issued 60 days ago (was within old cap, exceeds new cap)
+    When carol commits the policy change to 30 days
+    Then jane's 60-day-old ingestion key is invalidated immediately
+        (next use returns 401 with "Key expired — rotate")
+    And an audit row `gateway.ingestion_key.expired_by_policy` is emitted
+        with payload { apiKeyId, previousMaxDays: 90, newMaxDays: 30 }
+    # Policy tightening MUST apply retroactively — that's the point of the
+    # policy. Loosening (e.g. 30 → 90) does NOT extend already-revoked keys.
+
+  # ---------------------------------------------------------------------------
+  # Admin oversight surface
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @admin-bird-eye
+  Scenario: Admin sees per-user session counts on the bird-eye dashboard
+    Given the org has 25 users with various session counts
+    When carol navigates to "/governance" and selects the "Sessions" widget
+    Then she sees an aggregate view: total active credentials by class +
+        a top-N list of users with the most active credentials
+    And clicking a user row drills into that user's devices tab
+        (via the existing admin-trace-access drill-in pattern, with the
+        same persistent banner indicating impersonation)
+
+  # ---------------------------------------------------------------------------
+  # Cross-org isolation
+  # ---------------------------------------------------------------------------
+
+  @bdd @sessions-and-devices @cross-org-isolation
+  Scenario: Org-level policies do NOT bleed across orgs
+    Given two orgs "acme" (maxSessionDurationDays=30) and "beta-corp" (maxSessionDurationDays=null)
+    And user "lisa@beta-corp.com" has a 60-day-old ingestion key under beta-corp
+    When the policy applies
+    Then lisa's beta-corp ingestion key stays valid (her org's policy is null)
+    And acme's policy does not affect any beta-corp credential
+
+  # ---------------------------------------------------------------------------
+  # No-leak invariant
+  # ---------------------------------------------------------------------------
+
+  @integration @sessions-and-devices @inventory @no-leak
+  Scenario: User sees only their own credentials on the devices tab (never other users')
+    Given jane has a CLI session with an ingestion key under it
+    And user "ben@acme.com" has a CLI session with an ingestion key of his own
+    When jane opens the devices tab on /me/configure
+    Then she sees only her own session, carrying her own login key id
+    And ben's session and key are NOT listed
+    # The devices tab is per-user; admin oversight is at /governance per the
+    # admin-bird-eye scenario. Cross-user leakage would be a P0.
+
+  # ---------------------------------------------------------------------------
+  # What a web session signed in WITH (D06 amendment)
+  # ---------------------------------------------------------------------------
+  #
+  # Additive: every scenario above is untouched. A web session now records
+  # which of the person's sign-in methods minted it and what that sign-in
+  # PROVED, so the inventory can say how each one got in rather than only
+  # that it exists.
+  #
+  # No interplay with `maxSessionDurationDays` to settle. That policy ends
+  # sessions by AGE; an organization's two-step requirement is a membership
+  # condition and ends none, ever - so the two never contend over the same
+  # session. Per-identifier revocation below is narrower than either: it ends
+  # the sessions one sign-in method minted and nothing else.
+  #
+  # Spec: specs/identity/mfa-and-session-shape.feature (D06).
+
+  @integration @sessions-and-devices @inventory @sign-in-method
+  Scenario: Each web session says how it signed in
+    Given jane signed in on one device with her password and on another with a passkey
+    When jane opens the devices tab on "/me/configure"
+    Then each web session names the method it signed in with
+    And each one says whether a second factor was proven at sign-in
+    And nothing on the card shows the wire vocabulary a method reference uses
+
+  @integration @sessions-and-devices @inventory @sign-in-method
+  Scenario: A session that recorded nothing reads as an ordinary sign-in
+    Given jane holds a web session minted before sessions recorded what they proved
+    When jane opens the devices tab on "/me/configure"
+    Then the session is listed like any other
+    And it reads as a normal sign-in rather than as a warning
+    And nothing offers to end it on those grounds
+
+  @unit @sessions-and-devices @revoke-single @per-identifier
+  Scenario: Ending the sessions one sign-in method minted leaves the others alone
+    Given jane holds web sessions minted by her password and by her identity provider
+    When the sessions minted by one of those methods are ended
+    Then only those sessions end
+    And the sessions minted by the other method keep working
+    And no CLI device session and no ingestion key is touched
+
+  @unit @sessions-and-devices @revoke-single @per-identifier
+  Scenario: Ending sessions for a sign-in method that is not yours ends nothing
+    Given jane asks to end the sessions of a sign-in method belonging to somebody else
+    When the request is handled
+    Then no session ends
+    And jane is told nothing about whose method it was

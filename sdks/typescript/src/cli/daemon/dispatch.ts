@@ -1,0 +1,134 @@
+/**
+ * The CLI's front door: every invocation lands here, deciding whether a warm
+ * daemon can serve the call. Falling back to in-process is the DEFAULT
+ * path, not an error path -- with no daemon it's exactly the pre-daemon code.
+ */
+
+import { runWithCliCredentialHolder } from "@/internal/credentialContext";
+
+import { execViaDaemon, requestStop } from "./client";
+import {
+  collectForwardedEnv,
+  evaluateEligibility,
+  isAutoSpawnEnabled,
+  isDaemonDisabledByConfig,
+  resolveColorLevel,
+  stdinCarriesData,
+} from "./eligibility";
+import { isDaemonSocketPathUsable, resolveBuildId, resolveIdentity } from "./identity";
+import { spawnDaemon } from "./spawn";
+import { recordMissAndDecideToSpawn } from "./spawn-hint";
+
+declare const __CLI_VERSION__: string;
+
+/**
+ * `DEBUG=langwatch:daemon` (or any DEBUG containing "langwatch") turns the
+ * fallback reasons into stderr lines. Off by default: a user who never asked
+ * for a daemon must never learn that one exists because it failed.
+ */
+function debugLog(message: string): void {
+  const debugFlag = process.env.DEBUG;
+  if (!debugFlag?.includes("langwatch")) return;
+  process.stderr.write(`langwatch:daemon ${message}\n`);
+}
+
+/**
+ * Run the CLI. Uses the daemon when it can, runs in-process when it cannot.
+ */
+export async function runCli(argv: string[]): Promise<void> {
+  const args = argv.slice(2);
+
+  const eligibility = evaluateEligibility({
+    args,
+    env: process.env,
+    daemonDisabledByConfig: isDaemonDisabledByConfig(process.env),
+    stdoutIsTty: Boolean(process.stdout.isTTY),
+    stderrIsTty: Boolean(process.stderr.isTTY),
+    stdinIsTty: Boolean(process.stdin.isTTY),
+    // The caller's fd 0 is the one stdio stream that carries DATA rather than a
+    // destination, and it is the one the daemon cannot be handed: it is spawned
+    // with `stdio: "ignore"`. See `stdinCarriesData`.
+    stdinCarriesData: stdinCarriesData(),
+    platform: process.platform,
+  });
+
+  if (!eligibility.eligible) {
+    debugLog(`in-process (${eligibility.reason})`);
+    await runInProcess(argv);
+    return;
+  }
+
+  const identity = resolveIdentity(process.env);
+  // The budget a DAEMON needs, not just this client's dial: a daemon binds a
+  // longer pid-scoped staging name first, so a shared path that fits while
+  // staging doesn't is one no daemon can ever start on.
+  if (!isDaemonSocketPathUsable(identity.socketPath)) {
+    debugLog("in-process (socket path too long for this platform)");
+    await runInProcess(argv);
+    return;
+  }
+
+  const env = collectForwardedEnv(process.env);
+  const outcome = await execViaDaemon({
+    socketPath: identity.socketPath,
+    fingerprint: identity.fingerprint,
+    cliVersion: __CLI_VERSION__,
+    build: resolveBuildId(__CLI_VERSION__, argv[1] ?? ""),
+    args,
+    cwd: process.cwd(),
+    env,
+    colorLevel: resolveColorLevel(env),
+    // Which of the two bin names (`lw`, `langwatch`) this caller typed. One
+    // daemon serves both, so without carrying it the help and every commander
+    // error would be titled with whichever bin happened to spawn the daemon.
+    bin: argv[1],
+  });
+
+  if (outcome.served) {
+    // Setting exitCode rather than calling process.exit() lets node flush
+    // stdout before it goes. process.exit() with a pipe still holding buffered
+    // writes truncates them — which would be a spectacular way to break
+    // `--format json` for the exact agents this feature exists to serve.
+    process.exitCode = outcome.exitCode;
+    // A daemon that took the command and then stopped answering would wedge
+    // the next caller in the same way, so it is asked to stop before this
+    // process leaves. The command is NOT re-run: the deadline has already
+    // spent most of the caller's own budget.
+    if (outcome.evict) await requestStop(identity.socketPath);
+    return;
+  }
+
+  debugLog(`in-process (${outcome.reason})`);
+
+  if (outcome.evict) {
+    // A daemon from another CLI version is answering on our socket. Ask it to
+    // go away; the next invocation will find an empty socket and spawn a
+    // correct one. We do not spawn a replacement here, because the old daemon
+    // may still be unlinking its socket and the two would race for the bind.
+    await requestStop(identity.socketPath);
+  } else if (isAutoSpawnEnabled(process.env)) {
+    if (argv[1]) {
+      if (recordMissAndDecideToSpawn(identity)) {
+        spawnDaemon({ cliPath: argv[1], env, identity });
+      }
+    }
+  }
+
+  await runInProcess(argv);
+}
+
+/**
+ * The pre-daemon code path, verbatim: builds the commander tree and parses.
+ * Dynamically imported so a daemon-served invocation never pays commander's
+ * ~80ms of this feature's ~165ms cold start.
+ */
+async function runInProcess(argv: string[]): Promise<void> {
+  const { buildProgram } = await import("../program.js");
+  // parseAsync + await: a rejected action promise must become this call's
+  // rejection — a clean exit — not an unhandled rejection with a raw stack.
+
+  // Wrapped in a credential holder so the resolved key lands in a
+  // request-scoped store rather than the global env, matching the daemon path;
+  // the "Cli" variant also marks it so requests carry the CLI surface header.
+  await runWithCliCredentialHolder({ fn: () => buildProgram().parseAsync(argv) });
+}

@@ -1,0 +1,259 @@
+Feature: Online-evaluator infinite-loop prevention
+  As a customer running online evaluators (monitors) on traces
+  I want evaluator-emitted telemetry to never re-trigger the same evaluator
+  So that a "run on every trace" monitor cannot recurse infinitely when the
+  evaluator implementation itself emits traces (e.g. nlpgo workflow runs).
+
+  # Why this exists — incident 2026-05-11
+  #
+  # An internal project had a monitor configured to run on EVERY trace
+  # (no preconditions). After migrating that project to nlpgo, the
+  # evaluator workflow started emitting its own traces, each of which
+  # the same monitor picked up. In ~90 min the loop produced ~500K
+  # event-sourcing groups, starving every other tenant.
+  #
+  # Design: a numeric "causality depth" counter that increments at every
+  # evaluator-workflow boundary. The subscriber refuses to dispatch when
+  # the inbound span carries depth >= 1.
+  #
+  # Single guarantee: nlpgo's BaggageAttributeProcessor stamps
+  # `langwatch.reserved.causality_depth = N+1` on EVERY span emitted
+  # during an evaluator run, via a context baggage entry that propagates
+  # automatically through child spans and goroutines. The TS subscriber
+  # then reads the inbound span's attribute and skips dispatch when
+  # depth >= 1.
+  #
+  # A fresh app-origin span (depth 0) arriving later on the same trace
+  # DOES dispatch normally — only eval-emitted spans are blocked.
+  #
+  # Origin is NOT hardcoded in the subscriber. It remains a
+  # user-configurable precondition matcher (default UI precondition
+  # `origin=application`, customer can remove). Depth is the sole
+  # hard signal.
+  #
+  # Counter `langwatch_evaluator_loop_blocked_total{reason}` so a
+  # healthy fleet sees this at ~zero.
+
+  Background:
+    Given the trace-processing pipeline is running
+    And the evaluationTrigger subscriber processes trace events
+
+  @integration @unit @loop-prevention @depth-direct
+  Scenario: Incoming span with causality_depth=1 does not trigger evaluations
+    Given a span_received event arrives with attribute "langwatch.reserved.causality_depth" = "1"
+    And the project has an enabled ON_MESSAGE monitor with no preconditions
+    When the evaluationTrigger subscriber fires for this event
+    Then no executeEvaluation command is dispatched
+    And the loop-blocked counter is incremented with reason="depth_direct"
+
+  @integration @unit @loop-prevention @depth-direct
+  Scenario: Incoming span with causality_depth=0 still triggers evaluations
+    Given a span_received event arrives with attribute "langwatch.reserved.causality_depth" = "0"
+    And the project has an enabled ON_MESSAGE monitor with no preconditions
+    When the evaluationTrigger subscriber fires for this event
+    Then one executeEvaluation command is dispatched per monitor
+
+  @integration @unit @loop-prevention @depth-missing
+  Scenario: Incoming span with no causality_depth attribute is treated as depth 0
+    Given a span_received event arrives with no "langwatch.reserved.causality_depth" attribute
+    And the project has an enabled ON_MESSAGE monitor with no preconditions
+    When the evaluationTrigger subscriber fires for this event
+    Then one executeEvaluation command is dispatched per monitor
+
+  @integration @loop-prevention @depth-direct
+  Scenario: Causality guard is per-span — fresh app activity still re-triggers
+    Given a span_received event arrives with depth=0 and the subscriber dispatches evaluation
+    And a second span_received event arrives on the same trace with depth=1
+    And the subscriber blocks dispatch for the depth=1 event
+    When a third span_received event arrives on the same trace with depth=0
+    Then the subscriber dispatches evaluation again for the third event
+    # The guard is per-span, not per-trace. New legitimate app activity on
+    # an already-evaluated trace must still trigger evaluation — only the
+    # evaluator's own emitted spans (depth>=1) are blocked.
+
+  @unit @loop-prevention @depth-direct
+  Scenario: Reserved causality_depth attribute passes through strip
+    Given recordSpan strips user-submitted langwatch.reserved.* attributes
+    When a span arrives carrying langwatch.reserved.causality_depth=1
+    Then the attribute survives stripping
+    And the emitted span_received event carries the depth attribute
+    # The original 2026-05-11 fix was silently disabled in production
+    # because recordSpan's strip nuked the very attribute the subscriber
+    # uses for loop detection. The fix adds a narrow passthrough
+    # allowlist; this scenario pins the attribute name as load-bearing.
+
+  @integration @unit @loop-prevention @kill-switch
+  Scenario: LANGWATCH_DISABLE_CAUSALITY_LOOP_GUARD bypasses depth check
+    Given the env var "LANGWATCH_DISABLE_CAUSALITY_LOOP_GUARD" is set to "1"
+    And a span_received event arrives with depth=1
+    When the evaluationTrigger subscriber fires
+    Then executeEvaluation IS dispatched (guard bypassed)
+    And a warning is logged that the guard is disabled
+
+  # ============================================================================
+  # Deferred-origin dispatch: the path with no span to inspect.
+  #
+  # A trace's origin is normally settled from the spans themselves, including
+  # non-root ones. When no span has carried an origin yet, the originGate
+  # subscriber schedules a deferred resolution and later emits origin_resolved.
+  # That event carries no span payload, so the per-span depth check cannot run,
+  # and dispatch used to proceed with no loop check at all. The accumulated
+  # trace state is the only evidence available on this path, so the evaluator
+  # depth is folded into it and the guard reads it from there.
+  #
+  # How often the deferred path is taken in practice is NOT established here.
+  # It requires a trace whose depth-bearing spans arrive before any span
+  # carrying an origin. That ordering is possible but has not been measured,
+  # so treat these scenarios as defining the behaviour of the path, not as
+  # evidence about how much traffic travels it.
+  # ============================================================================
+
+  @integration @unit @loop-prevention @depth-fold
+  Scenario: A trace already produced by the evaluator does not start another evaluation round
+    Given a trace that has been through the evaluator at least once
+    And the project has an enabled ON_MESSAGE monitor with no preconditions
+    When the trace's origin is settled after its spans have arrived
+    Then no further evaluation is started for that trace
+    And the loop-blocked counter is incremented with reason="depth_fold"
+
+  @unit @loop-prevention @depth-fold
+  Scenario: An ordinary trace still starts its evaluations when its origin settles late
+    Given a trace that has never been through the evaluator
+    And the project has an enabled ON_MESSAGE monitor with no preconditions
+    When the trace's origin is settled after its spans have arrived
+    Then one evaluation is started per monitor
+
+  @unit @loop-prevention @depth-fold
+  Scenario: A trace keeps the highest evaluator depth any of its spans carried
+    Given a trace carrying a mix of ordinary spans and evaluator-produced spans
+    When the spans arrive in either order
+    Then the trace counts as having been through the evaluator
+
+  @unit @loop-prevention @depth-fold @known-limitation
+  Scenario: A manual evaluation run marks the customer trace it ran against
+    Given a customer trace whose origin has not yet settled
+    And an operator starts a manual evaluation run against that trace
+    And the evaluator's own spans land on that same customer trace
+    When the trace's origin is settled afterwards
+    Then the trace counts as evaluator-produced rather than customer-produced
+    And no further evaluation is started for it
+    # Accepted tradeoff, not desired behaviour, and NOT introduced by the depth
+    # guard: the evaluator's spans carry an evaluation origin onto the customer
+    # trace, so the trace already resolves as evaluator-produced on its own.
+    # A monitor that filters on an application origin — the common setup —
+    # therefore already skips this trace. The guard only changes the outcome
+    # for a monitor with no origin filter at all. Blast radius is one trace
+    # missing one round of monitors, recoverable by re-running. The real fix
+    # is upstream: an evaluation run should not relabel the trace it is
+    # measuring. Applies to custom, workflow and code evaluators; built-in
+    # evaluators do not emit spans onto the customer trace.
+
+  # ============================================================================
+  # TS-side dispatch: traceparent + parent-span context propagation to nlpgo.
+  #
+  # The eval-execution service runs in TS. It calls nlpgoFetch to dispatch
+  # the eval workflow. For nlpgo's emitted spans to land as children of the
+  # parent trace (not as a separate orphan trace — the 2026-05-14 prod bug),
+  # nlpgoFetch must send a valid W3C `traceparent` header derived from the
+  # parent trace's root span.
+  # ============================================================================
+
+  @unit @loop-prevention @traceparent
+  Scenario: formatTraceparent builds a valid W3C traceparent header
+    Given traceId is a 32-hex string
+    And parentSpanId is a 16-hex string
+    When formatTraceparent is called
+    Then the result is "00-<traceId>-<parentSpanId>-01"
+
+  @unit @loop-prevention @traceparent
+  Scenario: formatTraceparent rejects malformed traceId
+    Given a non-32-hex traceId
+    When formatTraceparent is called
+    Then it throws (loud failure — silent broken header would orphan traces in prod)
+
+  @unit @loop-prevention @traceparent
+  Scenario: formatTraceparent rejects malformed parentSpanId
+    Given a non-16-hex parentSpanId
+    When formatTraceparent is called
+    Then it throws
+
+  @unit @loop-prevention @traceparent
+  Scenario: extractParentTraceForNlpgo returns context for valid OTel trace
+    Given the parent trace has a 32-hex trace_id and a 16-hex root span_id
+    When extractParentTraceForNlpgo runs
+    Then it returns the lowercased trace_id and root span_id
+
+  @unit @loop-prevention @traceparent
+  Scenario: extractParentTraceForNlpgo returns undefined for legacy trace_id shapes
+    Given the parent trace has a legacy trace_<nanoid> trace_id
+    When extractParentTraceForNlpgo runs
+    Then it returns undefined
+    # The dispatchers then ask nlpgo not to emit spans (see the next two
+    # scenarios) — better than synthesizing a parent_span_id that would
+    # render under a non-existent span in Studio's waterfall, and better
+    # than nlpgo minting a fresh trace id for a separate orphan trace.
+
+  @unit @loop-prevention @traceparent
+  Scenario: A code evaluator emits no spans when the target trace has no parent link
+    Given the target trace has no usable parent link
+    When the code evaluator is dispatched to nlpgo
+    Then the request asks nlpgo not to emit spans
+    # Without a parent link nlpgo cannot join the target trace: it would mint
+    # a fresh trace id and the evaluator's spans would form a separate
+    # evaluation-origin trace that flows back through the trace pipeline.
+
+  @unit @loop-prevention @traceparent
+  Scenario: An evaluator workflow emits no spans when the target trace has no parent link
+    Given the target trace has no usable parent link
+    When the evaluator workflow is dispatched to nlpgo
+    Then the request asks nlpgo not to emit spans
+
+  # ============================================================================
+  # nlpgo-side guarantees (Go tests live in services/nlpgo/...)
+  # ============================================================================
+
+  @go @nlpgo @propagation
+  Scenario: nlpgo handler extracts traceparent header and continues parent trace
+    Given a POST to /go/studio/execute_sync with header "traceparent: 00-<traceId>-<spanId>-01"
+    When nlpgo creates its root studio span
+    Then the studio span shares trace_id with the parent
+    And the studio span's parent_span_id equals the header's span_id
+
+  @go @nlpgo @propagation
+  Scenario: nlpgo suppresses every span of a request marked do_not_trace
+    Given a request marked do_not_trace
+    When nlpgo starts its studio span and the engine starts a node span from that context
+    Then no span is exported, with or without an inbound traceparent
+    # Two layers of defense: (1) a context suppression marker
+    # (WithTraceSuppressed) checked by SuppressAwareSampler — works
+    # regardless of the configured sampler; (2) an unsampled parent
+    # context for defense-in-depth under parent-based samplers.
+
+  @go @nlpgo @propagation
+  Scenario: nlpgo suppresses spans under non-parent-based samplers
+    Given a request marked do_not_trace
+    And the tracer provider uses a non-parent-based sampler (always_on or traceidratio)
+    When nlpgo starts its studio span and the engine starts a node span from that context
+    Then no span is exported
+    # The context suppression marker (SuppressAwareSampler) takes
+    # precedence over the configured sampler, so suppression holds even
+    # when always_on or bare traceidratio would otherwise sample.
+
+  @go @nlpgo @depth-increment
+  Scenario: nlpgo handler increments causality_depth on its root span
+    Given a POST to /go/studio/execute_sync with header "X-LangWatch-Causality-Depth: 0"
+    When nlpgo creates its root studio span
+    Then the root span attribute "langwatch.reserved.causality_depth" equals "1"
+
+  @go @nlpgo @span-processor
+  Scenario: Every span emitted during an nlpgo evaluator run carries causality_depth via SpanProcessor
+    Given a POST to /go/studio/execute_sync with header "X-LangWatch-Causality-Depth: 0"
+    When nlpgo runs the evaluator workflow producing multiple child and grandchild spans
+    Then every emitted span (root, child, grandchild) carries attribute "langwatch.reserved.causality_depth" = "1"
+
+  @go @nlpgo @outbound
+  Scenario: Outbound HTTP from nlpgo evaluator block carries traceparent + baggage + depth header
+    Given an nlpgo evaluator block makes an outbound HTTP call
+    Then the outbound request carries header "traceparent"
+    And carries header "baggage" containing "langwatch.reserved.causality_depth"
+    And carries header "X-LangWatch-Causality-Depth" with the current depth

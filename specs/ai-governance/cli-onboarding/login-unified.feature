@@ -1,0 +1,500 @@
+Feature: Unified `langwatch login` UX — endpoint + auth-mode + storage discipline
+  As a developer onboarding to LangWatch (cloud or self-hosted, agentic or human)
+  I want one canonical `langwatch login` command that asks me what I'm trying to
+  do when I don't know, and gets out of the way when I pass flags
+  So that I don't need to learn three different login flows or remember which
+  env-var goes where, and so that self-hosted users hit a working CLI on their
+  first try.
+
+  Pairs with:
+    - specs/ai-governance/cli-wrappers/wrap-login-routing.feature  (auto-login on wrap)
+    - specs/ai-governance/cli-wrappers/request-increase.feature    (budget-increase flow)
+    - .monitor-logs/lane-s-cli-login-audit.md                      (industry scan + decisions)
+    - .monitor-logs/lane-a-persona-home-content-proposal.md        (related persona-home work)
+
+  Background:
+    Given the user has the `langwatch` CLI installed (via `npm i -g langwatch` or `npx langwatch`)
+    And the user is in a terminal session with no existing GovernanceConfig
+      and no `LANGWATCH_API_KEY` in their `.env`
+    And `LANGWATCH_ENDPOINT` is unset in the environment
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Endpoint resolution — single 4-source resolver
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @endpoint @resolver
+  Scenario: `--endpoint` flag wins over env var
+    Given `LANGWATCH_ENDPOINT=https://env.example.com` is exported
+    And the persisted config has `control_plane_url = https://config.example.com`
+    When the user runs `langwatch login --endpoint https://flag.example.com --device`
+    Then the device-flow targets `https://flag.example.com`
+    And on completion the persisted config records `control_plane_url = https://flag.example.com`
+
+  @bdd @cli @endpoint @resolver
+  Scenario: env var wins over persisted config when no flag is passed
+    Given `LANGWATCH_ENDPOINT=https://env.example.com` is exported
+    And the persisted config has `control_plane_url = https://config.example.com`
+    When the user runs any CLI command that needs the control plane
+      (e.g. `langwatch whoami`, `langwatch status`, `langwatch claude`)
+    Then the resolved endpoint is `https://env.example.com`
+    And NOT `https://config.example.com`
+
+  @bdd @cli @endpoint @resolver
+  Scenario: persisted config wins over default when no flag and no env
+    Given `LANGWATCH_ENDPOINT` is unset
+    And the persisted config has `control_plane_url = https://config.example.com`
+    When the user runs any CLI command that needs the control plane
+    Then the resolved endpoint is `https://config.example.com`
+    And NOT the hardcoded default `https://app.langwatch.ai`
+
+  @bdd @cli @endpoint @resolver
+  Scenario: hardcoded default is the last fallback
+    Given no flag, no env, no persisted config
+    When the user runs any CLI command that needs the control plane
+    Then the resolved endpoint is `https://app.langwatch.ai`
+
+  @bdd @cli @endpoint @resolver @regression
+  Scenario: every CLI command resolves the endpoint via the same single function
+    Given the codebase ships exactly ONE function `resolveControlPlaneEndpoint(opts: { flag?: string })`
+      that implements the 4-source priority order
+    When grepping for `LANGWATCH_ENDPOINT` env reads outside that function
+    Then no other read-site exists (drift regression)
+    And the previously-drifted callers (`status.ts`, `endpoint.ts:getEndpoint`,
+      `governance/config.ts:defaults`) all delegate to the single resolver
+
+  @bdd @cli @endpoint @cleanup
+  Scenario: undocumented `LANGWATCH_URL` legacy alias is dropped — `LANGWATCH_ENDPOINT` is the only env name
+    Given the codebase previously had ONE site
+      (`sdks/typescript/src/cli/utils/governance/config.ts:defaults`)
+      that read `LANGWATCH_URL` as a fallback for `LANGWATCH_ENDPOINT`
+    And the alias was never documented in README, .env.example, docs, or CLI --help
+    When grepping for `LANGWATCH_URL` across the codebase
+    Then there are zero references (the alias is removed entirely, no compat shim)
+    And `LANGWATCH_ENDPOINT` is the single canonical env name
+    And the cleanup is documented in CHANGELOG.md as a non-breaking change
+      (the alias was undocumented, so removal does not break any documented contract)
+
+  # ─────────────────────────────────────────────────────────────────────
+  # `langwatch config` — explicit persistence command
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @config @set
+  Scenario: `langwatch config set endpoint` persists to the user-global config
+    Given no persisted config exists
+    When the user runs `langwatch config set endpoint https://lw.acme.internal`
+    Then `~/.langwatch/config.json` is created with `control_plane_url = https://lw.acme.internal`
+    And subsequent CLI invocations resolve the endpoint to `https://lw.acme.internal`
+      (without an explicit flag or env var)
+
+  @bdd @cli @config @set @validation
+  Scenario: `langwatch config set endpoint` rejects malformed URLs
+    When the user runs `langwatch config set endpoint not-a-url`
+    Then the command exits 1 with stderr "endpoint must be an absolute URL with http(s) scheme"
+    And the persisted config is NOT touched
+
+  @bdd @cli @config @get
+  Scenario: `langwatch config get` reads a single value
+    Given the persisted config has `control_plane_url = https://lw.acme.internal`
+    When the user runs `langwatch config get endpoint`
+    Then stdout is exactly `https://lw.acme.internal\n`
+
+  @bdd @cli @config @list
+  Scenario: `langwatch config list` shows current resolved values + their sources
+    Given `LANGWATCH_ENDPOINT=https://env.example.com` is exported
+    And the persisted config has `control_plane_url = https://config.example.com`
+    When the user runs `langwatch config list`
+    Then stdout includes `endpoint = https://env.example.com  (from LANGWATCH_ENDPOINT env)`
+    And stdout includes a "config file: ~/.langwatch/config.json" footer
+    And stdout includes `gateway_url = …` (current gateway URL + source)
+    And no secret values (access_token, refresh_token, vk secret) are printed
+
+  # ─────────────────────────────────────────────────────────────────────
+  # `langwatch login` — unified interactive default
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @login @interactive @gh-style @agent-aware
+  Scenario: `langwatch login` (no flags, TTY) prompts for endpoint + auth mode with always-on agent-hint banner
+    Given the user is in an interactive terminal (`process.stdin.isTTY === true`)
+    When the user runs `langwatch login` with no flags
+    Then the CLI renders a top banner BEFORE the first prompt, always visible,
+      not optional:
+      "Running interactively. To skip these prompts (CI / agents that already have a credential):
+         --device         AI tools / SSO (claude, codex, gemini, opencode)
+         --project        project SDK key into .env via browser (SDK, evals, prompts)
+         --api-key <K>    project SDK key you already have, into .env
+         --token <T>      pre-minted device session
+         --endpoint <U>   self-hosted instance URL"
+    And the CLI prompts, with LangWatch Cloud as the default (option 1) because most
+      first-time logins target the SaaS:
+      "Where do you want to log in?
+        1) LangWatch Cloud (app.langwatch.ai)
+        2) Self-hosted instance (custom URL)"
+    And on selecting (1) the CLI ALWAYS targets `https://app.langwatch.ai`, even if a
+      local endpoint was previously persisted or `LANGWATCH_ENDPOINT` is exported
+    And on selecting (2) the CLI prompts for the URL and validates http(s) scheme
+    And the CLI then prompts, with AI tools as the default (option 1) since a
+      human running this interactively most likely wants to track their own
+      coding-assistant usage:
+      "How do you want to use it?
+        1) AI tools / agentic flows  (claude, codex, cursor, gemini, opencode)   - device-flow SSO
+        2) Project / SDK API key     (langwatch eval, sync, prompts, SDK)        - API key into .env
+        3) Both"
+    And on selecting (1) it runs the device-flow → `~/.langwatch/config.json`
+    And on selecting (2) it runs the project API-key device-code flow → `$CWD/.env`
+    And on selecting (3) it runs both flows in sequence
+
+  @bdd @cli @login @endpoint @cloud-repoint @regression
+  Scenario: picking LangWatch Cloud repoints away from a previously-local endpoint
+    Given the user has `control_plane_url = http://localhost:5560` persisted
+      (or `LANGWATCH_ENDPOINT=http://localhost:5560` exported) from local dev
+    And the user is in an interactive terminal
+    When the user runs `langwatch login` and selects "LangWatch Cloud"
+    Then the persisted config records `control_plane_url = https://app.langwatch.ai`
+    And the chosen auth flow (device session or project key) targets
+      `https://app.langwatch.ai`, NOT `http://localhost:5560`
+    # Rationale: choosing "Cloud" was a no-op that left the stale local
+    # control_plane_url in place, so the device flow dialled localhost:5560 and
+    # failed with ECONNREFUSED. "Cloud" must always repoint to app.langwatch.ai.
+
+  @bdd @cli @login @endpoint @context-aware
+  Scenario: the Where picker reorders when a non-cloud endpoint is already configured
+    Given the user already has a resolved endpoint that is NOT `https://app.langwatch.ai`
+      (e.g. `http://localhost:5560` from `LANGWATCH_ENDPOINT` or persisted config)
+    And the user is in an interactive terminal
+    When the user runs `langwatch login` with no flags
+    Then the "Where do you want to log in?" picker lists, in this order with the
+      current endpoint pre-selected (default):
+      "1) Self-hosted instance (http://localhost:5560)   ← current, default
+       2) Self-hosted instance (different endpoint)
+       3) LangWatch Cloud (app.langwatch.ai)"
+    And selecting (1) keeps `control_plane_url = http://localhost:5560`
+    And selecting (2) prompts for a new URL (validated http(s)) and persists it
+    And selecting (3) repoints `control_plane_url` to `https://app.langwatch.ai`
+    # Cloud stays the priority default for fresh installs; only when the user
+    # already has a custom endpoint do we default to keeping it (and still let
+    # them switch endpoint or jump to Cloud).
+
+  @bdd @cli @login @project @flag
+  Scenario: `langwatch login --project` forces project login, symmetric to `--device`
+    Given the user is in an interactive terminal
+    When the user runs `langwatch login --project`
+    Then the CLI runs the project API-key device-code flow directly → `$CWD/.env`
+    And it does NOT start the AI-tools / device-session flow
+    And no "Where do you want to log in?" or "How do you want to use it?" prompt fires
+    And the endpoint resolves via the 4-source resolver (default → app.langwatch.ai)
+
+  @bdd @cli @login @project @non-tty
+  Scenario: `--project` is the implicit default in a non-TTY context
+    Given the user is in a non-interactive context (CI, agent stdin, piped)
+    When the user runs `langwatch login` with no flags
+    Then the behavior is identical to `langwatch login --project`
+    And the CLI prints that project login is the default and names BOTH escape
+      hatches: `--device` for AI tools and `--project` to force project login
+
+  @bdd @cli @login @project @non-tty @headless @integration
+  Scenario: headless `langwatch login --project` fails fast instead of waiting on a browser
+    Given the user is in a non-interactive context (no TTY on stdin, e.g. an agent in a VM)
+    When the user runs `langwatch login --project` with no project slug
+    Then the CLI does NOT start the browser device-code poll
+    And it exits 1 promptly (no multi-minute wait)
+    And stderr names every non-interactive path forward:
+      `langwatch login --project <slug>` (uses the existing device login),
+      `langwatch login --api-key <key>`, and exporting LANGWATCH_API_KEY
+    # Rationale: the browser poll waited up to 10 minutes for an approval that
+    # can never come in a headless VM, so agents got stuck with no way to
+    # switch projects non-interactively (field report).
+
+  @bdd @cli @login @project @slug @integration
+  Scenario: `--project <slug>` without a device session fails with actionable guidance
+    Given no device session exists in ~/.langwatch/config.json
+    When the user runs `langwatch login --project some-slug`
+    Then the CLI exits 1 without a browser
+    And stderr says a device login is needed first (`langwatch login` in a browser-able
+      terminal) or to use `--api-key <key>` instead
+
+  # The key `--project` writes does project work beyond tracing: versioning prompts,
+  # reading datasets, running evaluations and simulations (founder, 2026-10-02).
+  @bdd @cli @login @project @slug @unit
+  Scenario: `langwatch login --project <slug>` writes a full-access key
+    Given a device session and a project the person manages
+    When the user runs `langwatch login --project <slug>`
+    Then the CLI forks a session bound to that project and mints the person's own key
+      with every permission there, through `POST /api/v1/api-keys/full-access`
+    And it ends the forked session and writes the key to `$CWD/.env`
+    And it prints "API key for project <name> saved to .env"
+
+  @bdd @cli @login @project @slug @unit
+  Scenario: A person who cannot manage the project gets an ingestion key and is told so
+    Given a device session and a project the person can send traces to but not manage
+    When the user runs `langwatch login --project <slug>`
+    Then the full key is refused and the CLI mints the ingestion key with the same session
+    And it prints that the key only sends traces, and how to get one that does more
+
+  @bdd @cli @login @project @unit
+  Scenario: The browser project pick writes the same full-access key
+    Given the user picked a project on the /cli/auth page in an interactive project login
+    When the CLI receives the project-bound session
+    Then it mints the full-access key with it, or the ingestion key for a person who
+      cannot manage the project, and ends the session
+
+  @bdd @cli @login @agent-aware @fake-tty
+  Scenario: agent-hint banner is shown EVEN when stdin reports as TTY (fake-TTY agents)
+    Given the agent harness exposes a fake PTY where `process.stdin.isTTY === true`
+      but no human is present at the keyboard
+    When the agent invokes `langwatch login` with no flags expecting non-blocking behavior
+    Then the agent-hint banner is the FIRST output stream the agent sees
+    And the banner explicitly names `--device`, `--project`, `--api-key`, `--token`, `--endpoint`
+      so the agent can self-correct by re-invoking with the right flag
+    And the human-facing prompt is rendered AFTER the banner so a real human still
+      sees it correctly
+
+  @bdd @cli @login @non-tty
+  Scenario: `langwatch login` (no flags, NON-TTY) defaults to project login, never AI-tools
+    Given the user is in a non-interactive context (CI, agent stdin, piped)
+    When the user runs `langwatch login` with no flags
+    Then the CLI does NOT start the AI-tools / device-session flow
+    And the CLI defaults to PROJECT login semantics: it prints that project login is
+      the default, so evaluations, prompts and the SDK target a real project, not a
+      personal one, then fails fast with the headless guidance (see the headless
+      scenario above) instead of blocking on a browser approval that cannot happen
+    And it prints that `--device` is required to log in to AI tools (claude, codex, …)
+    # Rationale: a customer's coding agent ran `langwatch login` non-interactively while
+    # setting up experiments; the old behavior funnelled it into a personal device-session
+    # and evaluations silently landed on a personal project. Defaulting to project login
+    # closes that at the source.
+
+  @bdd @cli @login @endpoint
+  Scenario: `langwatch login --endpoint <url>` skips the cloud-vs-self-hosted prompt
+    Given the user is in an interactive terminal
+    When the user runs `langwatch login --endpoint https://lw.acme.internal`
+    Then the CLI does NOT prompt "Where do you want to log in?"
+    And the auth-mode prompt still fires (device vs api-key vs both)
+    And the resolved endpoint for both flows is `https://lw.acme.internal`
+    And the persisted config (and/or .env) records the endpoint after success
+
+  # `~/.langwatch/config.json` is one file for the whole machine. A login
+  # against a local dev instance repoints it for every other shell, so the next
+  # `langwatch ingest context` and every wrapped tool follow a port that is only
+  # up while that dev server runs. The CLI says so once and continues; a shell
+  # that already exports LANGWATCH_CLI_CONFIG has its own config file and hears
+  # nothing.
+
+  @unit @cli @login @endpoint @local-instance
+  Scenario: Logging in against a local instance says the machine's global config now points there
+    When the user logs in with `--endpoint http://localhost:5580`
+    Then the CLI warns that the machine's global config now points at a local instance
+    And the warning names LANGWATCH_CLI_CONFIG, CLAUDE_CONFIG_DIR and CODEX_HOME as the way to isolate a QA shell
+    And the login continues
+
+  @unit @cli @login @endpoint @local-instance
+  Scenario: A login shell that already relocated the CLI config hears nothing
+    Given LANGWATCH_CLI_CONFIG points at a scratch config file
+    When the user logs in with `--endpoint http://localhost:5580`
+    Then the CLI says nothing about the machine's global config
+
+  @unit @cli @login @endpoint @local-instance
+  Scenario: A self-hosted endpoint on another host is not a local instance
+    When the user logs in with `--endpoint https://lw.acme.internal`
+    Then the CLI says nothing about the machine's global config
+
+  @bdd @cli @login @device-skip
+  Scenario: `langwatch login --device` skips both prompts (existing behavior preserved)
+    Given the user is in an interactive terminal
+    When the user runs `langwatch login --device`
+    Then the CLI runs the device-flow directly with no prompts
+    And the endpoint resolves via the 4-source resolver (default → app.langwatch.ai)
+    And persistence behavior matches the existing `--device` flow
+
+  @bdd @cli @login @api-key-skip
+  Scenario: `langwatch login --api-key <key>` skips both prompts (existing behavior preserved)
+    When the user runs `langwatch login --api-key sk_test_xxx`
+    Then the CLI writes `LANGWATCH_API_KEY=sk_test_xxx` to `$CWD/.env`
+    And no interactive prompt fires
+    And no device flow runs
+
+  # ─────────────────────────────────────────────────────────────────────
+  # No-paste convergence: both modes deliver the credential over the
+  # device-code poll
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @login @no-paste @api-key
+  Scenario: Interactive login (project mode) delivers the project API key straight to the CLI, no copy-paste
+    Given the user is in an interactive terminal and selected
+      "Project / SDK API key" in the unified prompt
+    When the CLI calls `POST /api/auth/cli/device-code` with body
+      `{ credential_type: "project_api_key" }`
+    And the user clicks "Send API key" on the /cli/auth page
+      after picking a project
+    Then the server records the picked `project_id` on the device-code
+      record + stamps the picked project's existing `Project.apiKey`
+    And the CLI's `POST /api/auth/cli/exchange` poll returns:
+      | field    | value                                              |
+      | kind     | "api_key"                                          |
+      | api_key  | the project's apiKey verbatim (sk-lw-…)            |
+      | project  | { id, slug, name } of the picked project           |
+    And the CLI writes `LANGWATCH_API_KEY=<api_key>` to `$CWD/.env`
+    And the CLI writes `LANGWATCH_ENDPOINT=<endpoint>` to `$CWD/.env`
+      when the response includes a non-default endpoint
+    And the user is NEVER prompted to copy + paste the key
+
+  @bdd @cli @login @no-paste @device-session
+  Scenario: Interactive login (AI tools mode) mints device session, no copy-paste
+    Given the user is in an interactive terminal and selected
+      "AI tools / agentic flows" in the unified prompt
+    When the CLI calls `POST /api/auth/cli/device-code` with body
+      `{ credential_type: "device_session" }`
+    And the user clicks "Approve" on the /cli/auth page
+    Then the CLI's `POST /api/auth/cli/exchange` poll returns:
+      | field         | value                                       |
+      | kind          | "device_session"                            |
+      | access_token  | OAuth bearer                                |
+      | refresh_token | refresh token                               |
+      | user / org    | identity payload                            |
+    And the CLI persists the session to `~/.langwatch/config.json`
+    And the user is NEVER prompted to copy + paste anything
+
+  @bdd @cli @login @back-compat
+  Scenario: Older servers without `kind` field still work (back-compat)
+    Given the user runs `langwatch login --device` against a pre-f9fcc3927 server
+    When the server's `POST /api/auth/cli/exchange` response omits `kind`
+    Then the CLI normalises the response to `{ kind: "device_session", ... }`
+      so callers can always switch on the discriminated union
+    And the persistence path is unchanged from prior versions
+
+  @bdd @cli @login @token
+  Scenario: `langwatch login --token <token>` non-interactively imports a pre-minted device session
+    Given the user has minted an access token in the dashboard "API Keys" surface
+    When the user runs `langwatch login --token <opaque-token>`
+    Then the token is written to `~/.langwatch/config.json:access_token`
+    And no browser opens
+    And no prompt fires
+    And subsequent `langwatch claude` etc. uses that token to mint a personal VK
+
+  @bdd @cli @login @combinable-flags
+  Scenario: `--endpoint` + `--device` combine cleanly
+    When the user runs `langwatch login --endpoint https://lw.acme.internal --device`
+    Then the device-flow targets `https://lw.acme.internal`
+    And `~/.langwatch/config.json:control_plane_url` is `https://lw.acme.internal`
+    And no prompts fire (both axes have explicit values)
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Storage discipline — project vs user-global is honest
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @storage
+  Scenario: API-key flow writes ONLY to project `.env`, not to user-global config
+    When the user runs `langwatch login --api-key sk_test_xxx`
+    Then `$CWD/.env` contains `LANGWATCH_API_KEY=sk_test_xxx`
+    And `~/.langwatch/config.json` is NOT modified or created
+    And `~/.langwatch/config.json` access_token (if previously set) is NOT touched
+
+  @bdd @cli @storage
+  Scenario: device-flow writes ONLY to user-global config, not to project `.env`
+    When the user runs `langwatch login --device` and completes the flow
+    Then `~/.langwatch/config.json` contains the access_token + refresh_token
+    And `$CWD/.env` is NOT modified or created
+    And the existing `LANGWATCH_API_KEY` in `.env` (if any) is NOT touched
+
+  @bdd @cli @storage
+  Scenario: both-flow runs both paths and writes to both stores
+    Given the user picks "Both" in the unified-interactive flow
+    When both flows complete successfully
+    Then `~/.langwatch/config.json` contains the device-session
+    And `$CWD/.env` contains the project API key
+    And neither store leaks into the other
+
+  # ─────────────────────────────────────────────────────────────────────
+  # `langwatch logout` — symmetric to login (existing behavior preserved)
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @logout @existing
+  Scenario: `langwatch logout` clears the device session, not the project key
+    Given the user has both a device session AND a project API key
+    When the user runs `langwatch logout`
+    Then `~/.langwatch/config.json` is removed (or access_token cleared)
+    And `$CWD/.env`'s `LANGWATCH_API_KEY` is NOT touched
+
+  # ─────────────────────────────────────────────────────────────────────
+  # The authorize screen's own states, written down when the page moved
+  # out of `[gone]`. The wire underneath them — the three routes and
+  # their bodies — is unchanged, because the published CLI polls the other
+  # side of it.
+  # ─────────────────────────────────────────────────────────────────────
+
+  @bdd @cli @login @integration
+  Scenario: an unauthenticated reader is bounced through sign-in with their code
+    Given a browser opened by `langwatch login` with no session
+    When the authorize page loads
+    Then it sends the reader to sign-in with the device code in the callback URL
+    And it looks up nothing until they are signed in
+
+  @bdd @cli @login @integration
+  Scenario: a reader whose session is still arriving is not bounced
+    Given the session answer has not arrived yet
+    When the authorize page renders
+    Then it waits rather than redirecting
+    And a signed-in reader never round-trips through sign-in for a frame
+
+  @bdd @cli @login @integration
+  Scenario: a reader who signed up mid-login round-trips through onboarding
+    Given a reader who has just signed up and belongs to no organization
+    When the authorize page loads
+    Then it sends them to onboarding with a return address carrying their code
+    So the CLI's poll can still succeed when they come back
+
+  @bdd @cli @login @integration
+  Scenario: an unrecognised code explains itself
+    Given a device code nothing recognises
+    When the authorize page looks it up
+    Then it names the code and says it may have expired or already been used
+
+  @bdd @cli @login @integration
+  Scenario: an expired code sends the reader back to their terminal
+    Given a device code past its deadline
+    When the authorize page looks it up
+    Then it says the code expired and to run `langwatch login` again
+    And it does not read as a generic failure
+
+  @bdd @cli @login @integration
+  Scenario: a refused approval says why
+    Given an approval the endpoint refuses
+    When the refusal arrives
+    Then the page shows the message the endpoint sent
+
+  @bdd @cli @login @integration
+  Scenario: denying the code rejects the CLI session
+    Given a pending device code
+    When the reader denies it
+    Then the CLI session is rejected
+    And the reader is told so even when the call could not be made
+
+  @bdd @cli @login @integration
+  Scenario: the CLI stamps itself as the acquisition source
+    Given a browser opened by `langwatch login`
+    When the authorize page loads
+    Then the CLI is recorded as the lead source
+    And a reader who originally arrived through a campaign keeps their real source
+  # A login overwrites the session on this machine in place. Logging in as a
+  # second account left every command answering from the first account's
+  # organization with nothing on screen saying the account had changed, and a
+  # CLI sat on a throwaway test organization for a morning because of it.
+  @unit
+  Scenario: Logging in as another organization says whose login it replaced
+    Given the machine holds a device session for one organization
+    When the user completes a login for a different organization
+    Then the output names the account and organization being signed out
+    And names the account and organization every command now runs as
+
+  @unit
+  Scenario: an organization with no name is named by its id
+    Given a stored session whose organization was recorded with neither a name
+      nor a slug
+    When the user completes a login for a different organization
+    Then the notice names that organization by its id
+    And neither side of the sentence reads as an empty identity
+
+  @unit
+  Scenario: Logging in again as the same organization says nothing extra
+    Given the machine holds a device session for one organization
+    When the user completes a login for that same organization
+    Then no replacement notice is printed

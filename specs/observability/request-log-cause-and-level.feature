@@ -1,0 +1,201 @@
+Feature: Request log level and where the cause is attached
+
+  Every request that fails leaves one record, and that record answers two
+  questions independently: how bad was it, and what went wrong. The level
+  answers the first. The field the cause is attached to must not quietly answer
+  it a second time, differently.
+
+  A handled failure attributed to the customer - over quota, malformed payload,
+  not found - is expected traffic. It is watched by rate, not woken up for. So
+  it is logged below error, and the record must not then carry a key called
+  `error`, which is the loudest possible claim that it failed.
+
+  The catch is that moving the cause is not free. pino applies serializers by
+  exact property name and warns about nothing when a key has none: an `Error`
+  has no enumerable own properties, so an unserialised one is written as `{}`
+  and the message and stack - the only reasons a cause is logged at all - are
+  gone. The record still looks well-formed. This is a real regression that
+  shipped in this branch and was caught in review, which is why the last two
+  scenarios read the emitted line rather than the object handed to the logger.
+
+  Background:
+    Given a request that failed
+
+  # ---------------------------------------------------------------------------
+  # The level
+  # ---------------------------------------------------------------------------
+
+  # ---------------------------------------------------------------------------
+  # The logger name
+  #
+  # The request-failure alerts ("CLI / SDK Request Failures", "Dashboard Request
+  # Failures") filter on logger_name="langwatch:api:hono". Naming the logger per
+  # family made every one of them blind. The family is a field, not the name.
+  # ---------------------------------------------------------------------------
+
+  @unit @regression
+  Scenario: Every API family's request record is written under one logger name
+    Given a request answered by a REST family with its own namespace
+    When its request record is written
+    Then the record's logger is "langwatch:api:hono"
+    And the family is carried as a field on the record
+
+  # The tRPC and SSE lanes wrote no access record at all, so a dashboard 5xx was
+  # invisible to the request-failure alerts.
+
+  @unit @regression
+  Scenario: A dashboard tRPC request writes the same access record as a REST request
+    Given a tRPC procedure that answers successfully
+    When the dashboard calls it
+    Then one access record is written under "langwatch:api:hono" with the method, path, status and duration
+    And the record's family is "trpc"
+
+  @unit @regression
+  Scenario: A tRPC failure with a handled cause is logged by its fault
+    Given a tRPC procedure that fails with a handled platform error
+    When the dashboard calls it
+    Then the access record carries the handled code and fault
+    And it does not say the request failed without a cause attached
+
+  # A client that gave up mid-upload made the body read throw, which answered
+  # 500 and logged "error handling request" at error: hundreds a day, none ours.
+
+  @unit @regression
+  Scenario: A request whose body stopped arriving is the sender's 400, not a 500
+    Given a route that reads the whole request body
+    When the client's upload breaks off before the body is complete
+    Then the answer is 400 request_body_unreadable, attributed to the customer
+    And the same holds for a body measured against the ingestion size cap
+
+  @unit @regression
+  Scenario: A handled customer failure is logged below error
+    When the failure is attributed to the customer
+    Then the first record for its family, code and status in a minute is logged at warning level
+    And the repeats in that minute are logged at debug
+    And the handled code and fault are carried on the record
+
+  @unit @regression
+  Scenario: A platform fault is logged at error
+    When the failure is attributed to the platform
+    Then the record is logged at error level
+
+  # ---------------------------------------------------------------------------
+  # A failure with nothing attached
+  #
+  # A route can answer 5xx without an error ever reaching the middleware —
+  # returning the response rather than throwing. The record is then logged at
+  # error level, because the status says so, while the message still reads
+  # `request handled` and no cause is attached to it. It is indistinguishable
+  # from a success except by reading the status field.
+  #
+  # That is not hypothetical. In one hour on 2026-08-13 production logged
+  # 12,367 such records, every one of them a 500, and between them they said
+  # nothing at all about what had failed. A record that cannot be told apart
+  # from a healthy one is worse than no record: it is found only by whoever
+  # already suspected it was there.
+  # ---------------------------------------------------------------------------
+
+  @unit @regression
+  Scenario: A server error with no cause attached says so
+    When the response is a server error and no cause reached the logger
+    Then the record does not claim the request was handled
+    And the record states that no cause was attached
+    And the record is logged at error level
+
+  @unit @regression
+  Scenario: A successful request is still reported as handled
+    When the response succeeds
+    Then the record reports the request as handled
+
+  # ---------------------------------------------------------------------------
+  # Where the cause goes
+  # ---------------------------------------------------------------------------
+
+  @unit @regression
+  Scenario: A record below error level does not carry a field named error
+    When the record is logged below error level
+    Then the cause is attached under the request-cause field
+    And no field named "error" is emitted
+
+  @unit @regression
+  Scenario: A record at error level keeps its cause on the error field
+    When the record is logged at error level
+    Then the cause is attached under "error"
+    And the request-cause field is not emitted
+
+  @unit @regression
+  Scenario: The error type stays groupable after the cause is re-keyed
+    When the record is logged below error level
+    Then the type of the failure is stated on the record in its own right
+
+  # ---------------------------------------------------------------------------
+  # What the emitted line actually contains
+  #
+  # Asserting on the object handed to the logger passes whether or not a
+  # serializer is registered, so these read the written line.
+  # ---------------------------------------------------------------------------
+
+  @unit @regression
+  Scenario: A re-keyed cause is still serialised
+    When the record is logged below error level
+    Then the emitted line carries the failure's message
+    And the emitted line carries the failure's stack
+
+  @unit @regression
+  Scenario: A cause on the error field is serialised as it always was
+    When the record is logged at error level
+    Then the emitted line carries the failure's message
+    And the emitted line carries the failure's stack
+
+  # ---------------------------------------------------------------------------
+  # The cause stays small
+  #
+  # Issue #8483. Loki accepts at most 128 structured-metadata keys per record,
+  # and every nested key of a logged cause becomes one. A validation error with
+  # a list of issues, or a database error with metadata, pushed records past 250
+  # keys, and Loki dropped them whole - the failure vanished exactly when it was
+  # widest. The cause is therefore a bounded summary, never the error object.
+  # ---------------------------------------------------------------------------
+
+  @unit @regression
+  Scenario: A wide failure is logged as a bounded summary
+    When a failure carrying many fields is logged at warning or error level
+    Then the emitted record has fewer than 20 keys once flattened
+    And the cause carries only its type, message, code and stack
+
+  @unit @regression
+  Scenario: Error records carry no superjson metadata
+    When any failure is logged
+    Then no field named "_superjson" is emitted
+
+  @unit @regression
+  Scenario: A thrown string is logged as its message
+    When a string is thrown
+    Then the cause has type "string" and the string as its message
+
+  @unit @regression
+  Scenario: An error-like object keeps its message and code
+    When an object with a message and a code is thrown
+    Then the cause keeps that message and code
+
+  @unit @regression
+  Scenario: A thrown plain object is described without its contents
+    When a plain object without a message is thrown
+    Then the cause states only how many keys the object has
+    And neither its keys nor its values are emitted
+
+  @unit @regression
+  Scenario: Long messages and stacks are cut with a marker
+    When a message longer than the cap is thrown
+    Then the cause stays within the cap
+    And it ends with a truncation marker
+
+  @unit @regression
+  Scenario: A value that cannot be described still produces a record
+    When a circular object with a throwing toString is thrown
+    Then a record is still emitted
+
+  @unit @regression
+  Scenario: Credentials in a failed Redis command never reach the summary
+    When a failed AUTH command error is logged
+    Then the emitted line does not contain the password

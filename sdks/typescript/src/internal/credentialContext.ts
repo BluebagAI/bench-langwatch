@@ -1,0 +1,161 @@
+/**
+ * Request-scoped resolved credentials: the CLI daemon serves concurrent
+ * requests from one process, so a resolved key in `process.env` would leak
+ * across requests -- this holder makes that structurally impossible.
+ */
+
+import { AsyncLocalStorage } from "node:async_hooks";
+
+interface CredentialHolder {
+  apiKey?: string;
+  projectId?: string;
+  requestedProject?: string;
+  runsOutsideProject?: boolean;
+  warnedProjectEnvIgnored?: boolean;
+  /**
+   * Set to "cli" at the CLI's request boundaries (runWithCliCredentialHolder,
+   * below). A plain SDK embed never sets this, so its holder — scoped or
+   * fallback — always reads undefined here.
+   */
+  surface?: "cli";
+}
+
+const storage = new AsyncLocalStorage<CredentialHolder>();
+
+/**
+ * Process-local fallback for callers not wrapped in a holder scope: a plain
+ * SDK embed, or a cold-CLI path that skipped the wrapper. Never used inside
+ * the daemon, where every request runs in its own holder.
+ */
+const fallbackHolder: CredentialHolder = {};
+
+function currentHolder(): CredentialHolder {
+  return storage.getStore() ?? fallbackHolder;
+}
+
+/**
+ * Run `fn` inside a fresh, empty credential holder. Called once at each request
+ * boundary (in-process dispatch, and per daemon request). The resolver fills
+ * the holder later; everything the request constructs afterward reads it.
+ */
+export function runWithCredentialHolder<T>(fn: () => T): T {
+  return storage.run({}, fn);
+}
+
+/**
+ * `runWithCredentialHolder` that marks the holder as a CLI request, so the shared
+ * request-header builders attach `x-langwatch-surface: cli` (cli/daemon/dispatch.ts,
+ * cli/daemon/execution.ts). Spec: specs/observability/traffic-attribution.feature
+ */
+export function runWithCliCredentialHolder<T>({ fn }: { fn: () => T }): T {
+  return runWithCredentialHolder(() => {
+    setScopedSurface({ surface: "cli" });
+    return fn();
+  });
+}
+
+/**
+ * Publish the resolved API key for the current request into its holder. No
+ * process-global state is touched, so concurrent requests never collide.
+ */
+export function setResolvedApiKey(apiKey: string): void {
+  currentHolder().apiKey = apiKey;
+}
+
+/**
+ * The API key resolved for the current request, or undefined when nothing has
+ * resolved in this context. Client factories fall back to the environment
+ * then, exactly as a plain SDK embed does.
+ */
+export function scopedApiKey(): string | undefined {
+  return currentHolder().apiKey;
+}
+
+/**
+ * Publishes the project the current request targets. A user-scoped API key
+ * carries no project identity, so the resolver decides which project the
+ * request names, and every client built afterwards reads it from here.
+ */
+export function setResolvedProjectId(projectId: string | undefined): void {
+  currentHolder().projectId = projectId;
+}
+
+/**
+ * The project id resolved for the current request, or undefined when nothing
+ * has resolved in this context. Client factories fall back to
+ * `LANGWATCH_PROJECT_ID` then, exactly as a plain SDK embed does.
+ */
+export function scopedProjectId(): string | undefined {
+  return currentHolder().projectId;
+}
+
+/**
+ * Publish the project the command line named (as typed) before any credential resolves. Set from
+ * `preAction` so commands inherit `--project`; the resolver reads it with `requestedProject()`.
+ */
+export function setRequestedProject(selector: string | undefined): void {
+  currentHolder().requestedProject = selector;
+}
+
+/**
+ * The project selector the command line asked for in this request, or
+ * undefined when it named none. Unresolved on purpose: the resolver decides
+ * what a selector means, and it is the only thing that can.
+ */
+export function requestedProject(): string | undefined {
+  return currentHolder().requestedProject;
+}
+
+/**
+ * Publish whether the command about to run answers outside any project (machine-local or
+ * organization-scoped), so nothing tells its user which project it reads.
+ */
+export function setRunsOutsideProject(outsideProject: boolean): void {
+  currentHolder().runsOutsideProject = outsideProject;
+}
+
+/** Whether the current request's command answers outside any project; false when nothing said. */
+export function runsOutsideProject(): boolean {
+  return currentHolder().runsOutsideProject === true;
+}
+
+/**
+ * Take the once-per-request right to warn that `LANGWATCH_PROJECT_ID` was ignored. Request-scoped
+ * because the daemon serves many requests from one process; a module flag would warn only the
+ * first.
+ */
+export function claimProjectEnvIgnoredWarning(): boolean {
+  const holder = currentHolder();
+  if (holder.warnedProjectEnvIgnored) return false;
+  holder.warnedProjectEnvIgnored = true;
+  return true;
+}
+
+/**
+ * Mark the current request's holder as a CLI request. Read by
+ * the shared request-header builders when attaching the surface header.
+ */
+export function setScopedSurface({ surface }: { surface: "cli" }): void {
+  currentHolder().surface = surface;
+}
+
+/**
+ * The surface recorded for the current request, or undefined outside a CLI
+ * request boundary (a plain SDK embed, or a request scope that never called
+ * `runWithCliCredentialHolder`).
+ */
+export function scopedSurface(): "cli" | undefined {
+  return currentHolder().surface;
+}
+
+/**
+ * Clear the process-local fallback holder. Test-only: a unit test that sets a
+ * key outside any scope would otherwise leak it into the next test.
+ */
+export function resetFallbackCredentialHolder(): void {
+  fallbackHolder.apiKey = undefined;
+  fallbackHolder.projectId = undefined;
+  fallbackHolder.requestedProject = undefined;
+  fallbackHolder.warnedProjectEnvIgnored = undefined;
+  fallbackHolder.surface = undefined;
+}

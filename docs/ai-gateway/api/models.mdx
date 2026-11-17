@@ -1,0 +1,85 @@
+---
+title: GET /v1/models
+description: List the models a virtual key can access through the LangWatch AI Gateway.
+sidebarTitle: Models
+---
+
+## Request
+
+```bash
+curl https://gateway.langwatch.ai/v1/models \
+  -H "Authorization: Bearer $LANGWATCH_VIRTUAL_KEY"
+```
+
+A valid virtual key is the only requirement. The list is what that key can dispatch, so two keys in the same project can return different lists.
+
+## Response
+
+OpenAI's own `list` shape:
+
+```json
+{
+  "object": "list",
+  "data": [
+    { "id": "claude-sonnet-4-5", "object": "model", "created": 0, "owned_by": "anthropic" },
+    { "id": "complex", "object": "model", "created": 0, "owned_by": "anthropic" },
+    { "id": "europe/gpt-6-luna", "object": "model", "created": 0, "owned_by": "openai" },
+    { "id": "gpt-6-luna", "object": "model", "created": 0, "owned_by": "openai" }
+  ]
+}
+```
+
+Entries are sorted by `id` and deduplicated. `data` is always an array, empty rather than null when the key reaches no models.
+
+| Field      | Value                                                                                                                                                                   |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`       | The exact string to send as `model`.                                                                                                                                    |
+| `object`   | Always `model`.                                                                                                                                                         |
+| `created`  | Always `0`. A gateway model list has no creation date to report.                                                                                                        |
+| `owned_by` | The provider family that serves the model: `openai`, `anthropic`, `azure`, `bedrock`, `vertex`, `gemini`, and the rest. `langwatch` when the entry carries no provider. |
+
+## What the list holds
+
+Three sources, filtered to what the key can actually call:
+
+1. **Model aliases** on the key, under the alias name. An alias whose target the key cannot dispatch to is left out.
+2. **Allowlist entries**, when the key sets `models_allowed`. An allowlist of literal model ids is authoritative on its own, so no provider catalog is queried. A wildcard entry such as `claude-haiku-*` is a pattern rather than a model name, so it is left out of the list, and an allowlist that holds one runs discovery to get the concrete ids behind the pattern.
+3. **Discovered models** from every credential the key can reach, read from each provider's own catalog.
+
+Every candidate is then dropped when the key's allowlist or its policy rules refuse it, and when the key holds no credential for the provider that would serve it. A listed model is one a request for it can reach.
+
+### Model tiers
+
+When the key runs on a routing policy, the reserved tier names `complex`, `reasoning` and `fast` are in the list. A tier is an alias the policy sets, and it falls through to the policy's default model when the policy names no target for it. A tier with no target and no default model is not listed.
+
+### Providers with an instance handle
+
+A model from a provider that has an [instance handle](/ai-gateway/model-naming#instance-handles) is listed under the handle-qualified id, for example `europe/gpt-6-luna`. That id is the only name that reaches that provider when the key holds two of the same family. `owned_by` stays the provider family, because that is what a model picker groups by.
+
+## Incomplete discovery
+
+A provider the key can dispatch to can contribute no models to the catalog. The response then carries `X-Langwatch-Models-Discovery-Incomplete` with one `provider:reason` token per gap, comma separated:
+
+```http
+X-Langwatch-Models-Discovery-Incomplete: bedrock:not-enumerable,openai:probe-failed
+```
+
+| Reason           | Meaning                                                                                                                                                                  |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `not-enumerable` | The provider has no catalog endpoint for this credential shape, and no deployment mapping to read model names from.                                                      |
+| `probe-failed`   | The provider has a catalog endpoint and this round's probe did not deliver: the endpoint was down or slow, the key was rejected, or the endpoint policy refused the URL. |
+
+The header is absent when the list is complete, and when the key sets a literal allowlist, since no catalog is read then.
+
+## Errors
+
+| Code                   | Status | Cause                                            |
+| ---------------------- | ------ | ------------------------------------------------ |
+| `invalid_api_key`      | 401    | The presented credential matches no virtual key. |
+| `virtual_key_revoked`  | 403    | The key was revoked.                             |
+| `virtual_key_disabled` | 403    | The key was disabled.                            |
+| `virtual_key_expired`  | 403    | The key's expiration date has passed.            |
+
+The full table is on [Errors](/ai-gateway/api/errors).
+
+**Also check:** [Model naming](/ai-gateway/model-naming), [Model aliases](/ai-gateway/model-aliases), [Routing policies](/ai-gateway/governance/routing-policies).

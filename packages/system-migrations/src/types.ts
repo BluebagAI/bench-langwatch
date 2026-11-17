@@ -1,0 +1,115 @@
+import { type Instant, Temporal } from "@langwatch/time";
+
+/**
+ * The per-tenant migration state: `finalized` is a one-way latch consumers
+ * key legacy-path removal on. Blanking a finalized row does NOT roll it
+ * back — re-proving just re-finalizes it; only `rolled_back` pins it on legacy.
+ */
+export const TENANT_MIGRATION_STATUSES = [
+  "migrated",
+  "finalized",
+  "parked",
+  "rolled_back",
+] as const;
+
+export type TenantMigrationStatus = (typeof TENANT_MIGRATION_STATUSES)[number];
+
+/**
+ * Why a tenant is held: its own proof disagreed, work it queued has not drained, or it waits on a
+ * person (the user proving the account, an operator lifting a pin): expected, never a failure.
+ */
+export const HELD_REASONS = ["proof", "pending", "person"] as const;
+
+export type HeldReason = (typeof HELD_REASONS)[number];
+
+/**
+ * The two terminal states the runner never re-runs: `finalized`, the one-way
+ * latch, and `rolled_back`, the operator's pin. One predicate so no harness
+ * composing a pass drifts onto a different skip rule.
+ */
+export function isTerminalTenantStatus(status: TenantMigrationStatus | undefined): boolean {
+  return status === "finalized" || status === "rolled_back";
+}
+
+/**
+ * The same two statuses as a LIST, for a `status = ANY(...)` SQL narrowing.
+ * Derived from `isTerminalTenantStatus`, not written out again.
+ */
+export const TERMINAL_TENANT_STATUSES: readonly TenantMigrationStatus[] =
+  TENANT_MIGRATION_STATUSES.filter(isTerminalTenantStatus);
+
+export type TenantMigrationRecord = {
+  migrationName: string;
+  tenantId: string;
+  status: TenantMigrationStatus;
+  /** The migration's own evidence: parity diffs for a held tenant, the
+   *  error for a parked one, counts for a finalized one. Shape is owned by
+   *  the migration that wrote it. */
+  report: unknown;
+  /** Set only while held (`migrated`): why it is held. */
+  heldReason?: HeldReason;
+  /** Set only while held: when it became held, kept across re-proofs. */
+  heldSince?: Instant;
+};
+
+/**
+ * A tenant held until a person acts: no pass can move it, so its step counts it settled, as a
+ * `migratedIsSteady` step's `migrated` (dev/docs/ARCHITECTURE.md, "No stuck states").
+ */
+export function isWaitingOnPerson(
+  record: Pick<TenantMigrationRecord, "status" | "heldReason">,
+): boolean {
+  return record.status === "migrated" && record.heldReason === "person";
+}
+
+/** Held longer than this reads as failed. A chosen value, pending Alex's ruling. */
+export const HELD_FAILED_AFTER = Temporal.Duration.from({ hours: 24 });
+
+/** Failed is worked out on read, never stored: held, and held too long; a person's hold never. */
+export function isHeldTenantFailed({
+  record,
+  now,
+}: {
+  record: TenantMigrationRecord;
+  now: Instant;
+}): boolean {
+  if (record.status !== "migrated" || !record.heldSince || isWaitingOnPerson(record)) return false;
+  return Temporal.Instant.compare(record.heldSince.add(HELD_FAILED_AFTER), now) < 0;
+}
+
+/**
+ * What one pass over one tenant concluded. `migrated` is the held state: the
+ * tenant stays on its legacy path until a later pass's proof passes. Reason
+ * defaults to `proof`; work queued but not yet drained says `pending`; `person` waits on one.
+ */
+export type TenantMigrationOutcome =
+  | { status: "finalized"; report?: unknown }
+  | { status: "migrated"; report: unknown; heldReason?: HeldReason }
+  | { status: "parked"; report: unknown };
+
+export type MigrationPassSummary = {
+  tenantsSeen: number;
+  finalized: number;
+  held: number;
+  parked: number;
+  /** Outside the cohort, or an operator's mid-pass pin discarded the
+   *  outcome. Never "already done" - that is `alreadyFinalized` /
+   *  `alreadyRolledBack`. */
+  skipped: number;
+  /** Finalized BEFORE this pass ever touched the tenant. Split from
+   *  `skipped` so a targeted run over tenants that are all already done
+   *  reads as done, not as "nothing was in the cohort". */
+  alreadyFinalized: number;
+  /** Rolled back (the operator's pin) BEFORE this pass ever touched the
+   *  tenant. Kept apart from `alreadyFinalized` so an organization whose
+   *  members were rolled back never reads as a successful finalization. */
+  alreadyRolledBack: number;
+  /** Claimed by another process's pass, so left to that process. */
+  claimed: number;
+  /**
+   * State TRANSITIONS this pass made — the ONLY field that means the fleet
+   * moved. `held`/`parked` re-count every pass forever, so reading `held > 0`
+   * as progress loops forever. Zero here honestly means nothing changed, and won't.
+   */
+  advanced: number;
+};

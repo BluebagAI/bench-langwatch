@@ -1,0 +1,83 @@
+---
+title: Model Aliases
+description: Map the model name a client sends to the model the gateway serves, without a client change.
+sidebarTitle: Model Aliases
+---
+
+A model alias is an entry in a routing policy that maps a name to a model. The client sends the name in `model`, and the gateway serves the model the entry points at. Every virtual key that uses the policy gets the same mapping.
+
+For example, this policy sends `gpt-4o` to Azure and gives the Anthropic model a short name:
+
+```json
+{
+  "modelAliases": {
+    "gpt-4o": "azure/my-eastus-deployment",
+    "claude": "anthropic/claude-haiku-4-5-20251001",
+    "coding-small": "openai/gpt-6-luna"
+  }
+}
+```
+
+<Info>
+  The three tier names `complex`, `reasoning` and `fast` are alias entries too, with one extra rule:
+  a tier with no target falls back to the policy's default model. See [Routing
+  policies](/ai-gateway/governance/routing-policies#model-tiers).
+</Info>
+
+## When to use an alias
+
+- **Hide provider names from client code.** An OpenAI SDK codebase does not need to know an Azure deployment name or a dated Anthropic model version. Change the deployment or pin a new version in the policy, and no client changes.
+- **Move traffic between providers.** Point `claude` at `bedrock/us.anthropic.claude-haiku-4-5-20251001` during an Anthropic outage, or to compare cost. Point it back in one edit.
+- **Retire a model name.** Map an old name to its replacement so callers that still send it keep working.
+
+A project with one provider and one model does not need an alias. Send the provider's own model name.
+
+## Edit aliases
+
+Open **AI Gateway → Routing Policies**, select a policy and edit **Model name mapping**. The left field is the name the client sends, the right field is the model the gateway serves instead.
+
+Write the target as a full model id, for example `openai/gpt-6-luna`. The target can use any form from [Model Naming](/ai-gateway/model-naming): a provider family, an instance handle, or a bare model id.
+
+The same fields are `modelAliases` on `trpc.routingPolicy.create` and `trpc.routingPolicy.update`. See [Model name mapping](/ai-gateway/governance/routing-policies#model-name-mapping).
+
+## How a request resolves
+
+1. The gateway compares the whole `model` string with the alias names. The match is exact, so an alias named `gpt-4o` does not match `openai/gpt-4o`. A name that contains a `/` can be an alias too.
+2. When a name matches, the target replaces it. The target is read with the same rules as a request, so `europe/claude-sonnet-5` pins the instance with the handle `europe` and `stealth/ox-alpha` reaches the custom provider that declares it.
+3. When no name matches, the gateway reads the string as a model name. See [Model Naming](/ai-gateway/model-naming).
+
+An explicit `provider/model` string that is not an alias name goes to that provider directly. This lets you keep `openai/gpt-4o` for tests while the alias `gpt-4o` sends production traffic to Azure.
+
+## Aliases and allowlists
+
+An alias cannot reach a model the key may not use. `models_allowed` and the model rules in [Policy Rules](/ai-gateway/policy-rules) judge the model the alias resolves to, never the name the client sent.
+
+The allowlist accepts both spellings of the resolved model. `gpt-6-luna` and `openai/gpt-6-luna` allow the same model, so write the form your team reads.
+
+A request through an alias whose target is outside `models_allowed` is refused with `400 model_not_allowed`. The message names the resolved model and the alias, so you can see which side to correct:
+
+```json
+{
+  "error": {
+    "code": "model_not_allowed",
+    "message": "model not allowed: o3 (named \"big-model\" by this key)"
+  }
+}
+```
+
+## Aliases in `GET /v1/models`
+
+`GET /v1/models` lists every alias whose target the key can reach, under the alias name. A client that reads the model list, for example a coding agent or a model picker, sees `coding-small` next to the provider model names.
+
+An alias whose target is not reachable from the key is not listed, because a request for it would be refused.
+
+**Also check:** [API: `GET /v1/models`](/ai-gateway/api/models) for the response shape.
+
+## Trace attributes
+
+Two attributes on the gateway span tell you which name the client sent and which model served it:
+
+- `gen_ai.request.model`: the model the gateway sent to the provider, after the alias was applied.
+- `langwatch.requested_model`: the name the client sent. Present only when it differs from the model that was served, so it is the mark of a request that went through an alias or a tier.
+
+Filter Trace Explorer on `langwatch.requested_model` to find the traffic still sending an old name.

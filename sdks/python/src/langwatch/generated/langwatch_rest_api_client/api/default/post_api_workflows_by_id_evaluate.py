@@ -1,0 +1,211 @@
+from typing import Any, cast
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.post_api_workflows_by_id_evaluate_body import PostApiWorkflowsByIdEvaluateBody
+from ...models.post_api_workflows_by_id_evaluate_response_200 import PostApiWorkflowsByIdEvaluateResponse200
+from ...types import UNSET, Response, Unset, safe_http_status
+
+
+def _get_kwargs(
+    id: str,
+    *,
+    body: PostApiWorkflowsByIdEvaluateBody | Unset = UNSET,
+) -> dict[str, Any]:
+    headers: dict[str, Any] = {}
+
+    _kwargs: dict[str, Any] = {
+        "method": "post",
+        "url": "/api/v1/workflows/{id}/evaluate".format(
+            id=quote(str(id), safe=""),
+        ),
+    }
+
+    if not isinstance(body, Unset):
+        _kwargs["json"] = body.to_dict()
+
+    headers["Content-Type"] = "application/json"
+
+    _kwargs["headers"] = headers
+    return _kwargs
+
+
+def _parse_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Any | PostApiWorkflowsByIdEvaluateResponse200 | None:
+    if response.status_code == 200:
+        response_200 = PostApiWorkflowsByIdEvaluateResponse200.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 400:
+        response_400 = cast(Any, None)
+        return response_400
+
+    if response.status_code == 403:
+        response_403 = cast(Any, None)
+        return response_403
+
+    if response.status_code == 404:
+        response_404 = cast(Any, None)
+        return response_404
+
+    if response.status_code == 422:
+        response_422 = cast(Any, None)
+        return response_422
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(
+    *, client: AuthenticatedClient | Client, response: httpx.Response
+) -> Response[Any | PostApiWorkflowsByIdEvaluateResponse200]:
+    # LangWatch override: use safe_http_status to tolerate non-IANA status codes
+    # (Cloudflare 520-527, AWS WAF 561, etc). Upstream still crashes here.
+    # Tracked upstream: https://github.com/openapi-generators/openapi-python-client/pull/1407
+    return Response(
+        status_code=safe_http_status(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    id: str,
+    *,
+    client: AuthenticatedClient,
+    body: PostApiWorkflowsByIdEvaluateBody | Unset = UNSET,
+) -> Response[Any | PostApiWorkflowsByIdEvaluateResponse200]:
+    """Trigger an evaluation run of a workflow's committed version through the evaluations pipeline.
+    Evaluate the workflow's attached dataset, inline data, or a platform dataset id; parameters bind as
+    constant entry inputs on every row. A saved dataset is read at `dataset_version` when given, else
+    its current content is saved as a new version. Returns a run id and a results URL to poll or open in
+    the browser.
+
+    Args:
+        id (str):
+        body (PostApiWorkflowsByIdEvaluateBody | Unset):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | PostApiWorkflowsByIdEvaluateResponse200]
+    """
+
+    kwargs = _get_kwargs(
+        id=id,
+        body=body,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    id: str,
+    *,
+    client: AuthenticatedClient,
+    body: PostApiWorkflowsByIdEvaluateBody | Unset = UNSET,
+) -> Any | PostApiWorkflowsByIdEvaluateResponse200 | None:
+    """Trigger an evaluation run of a workflow's committed version through the evaluations pipeline.
+    Evaluate the workflow's attached dataset, inline data, or a platform dataset id; parameters bind as
+    constant entry inputs on every row. A saved dataset is read at `dataset_version` when given, else
+    its current content is saved as a new version. Returns a run id and a results URL to poll or open in
+    the browser.
+
+    Args:
+        id (str):
+        body (PostApiWorkflowsByIdEvaluateBody | Unset):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | PostApiWorkflowsByIdEvaluateResponse200
+    """
+
+    return sync_detailed(
+        id=id,
+        client=client,
+        body=body,
+    ).parsed
+
+
+async def asyncio_detailed(
+    id: str,
+    *,
+    client: AuthenticatedClient,
+    body: PostApiWorkflowsByIdEvaluateBody | Unset = UNSET,
+) -> Response[Any | PostApiWorkflowsByIdEvaluateResponse200]:
+    """Trigger an evaluation run of a workflow's committed version through the evaluations pipeline.
+    Evaluate the workflow's attached dataset, inline data, or a platform dataset id; parameters bind as
+    constant entry inputs on every row. A saved dataset is read at `dataset_version` when given, else
+    its current content is saved as a new version. Returns a run id and a results URL to poll or open in
+    the browser.
+
+    Args:
+        id (str):
+        body (PostApiWorkflowsByIdEvaluateBody | Unset):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | PostApiWorkflowsByIdEvaluateResponse200]
+    """
+
+    kwargs = _get_kwargs(
+        id=id,
+        body=body,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    id: str,
+    *,
+    client: AuthenticatedClient,
+    body: PostApiWorkflowsByIdEvaluateBody | Unset = UNSET,
+) -> Any | PostApiWorkflowsByIdEvaluateResponse200 | None:
+    """Trigger an evaluation run of a workflow's committed version through the evaluations pipeline.
+    Evaluate the workflow's attached dataset, inline data, or a platform dataset id; parameters bind as
+    constant entry inputs on every row. A saved dataset is read at `dataset_version` when given, else
+    its current content is saved as a new version. Returns a run id and a results URL to poll or open in
+    the browser.
+
+    Args:
+        id (str):
+        body (PostApiWorkflowsByIdEvaluateBody | Unset):
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | PostApiWorkflowsByIdEvaluateResponse200
+    """
+
+    return (
+        await asyncio_detailed(
+            id=id,
+            client=client,
+            body=body,
+        )
+    ).parsed

@@ -1,0 +1,143 @@
+import { defineConfig } from "tsup";
+
+import packageJson from "./package.json";
+
+// The handled-error package is a source-only workspace devDependency, inlined
+// because the published tarball could never resolve it. Covers every subpath.
+
+// zod is bundled, not external -- load-bearing, not a size tradeoff. The SDK
+// validates responses with zod 4 APIs (`.loose()`, `z.core`); left external, a
+// consumer's incompatible zod version dies with `z.object(...).loose is not a
+// function` at first import.
+
+// Safe because zod never crosses the public API as a VALUE: every schema is
+// internal to validation, so no caller-owned schema needs an instanceof
+// against the SDK's copy.
+const noExternal = [/^@langwatch\/(langy|handled-error)(\/|$)/, /^zod(\/|$)/];
+
+// Used only under src/cli, so they are devDependencies bundled into the CLI.
+const cliOnlyPackages = [/^(chalk|ora|prompts|commander|js-yaml|dotenv|jsonc-parser)(\/|$)/];
+
+// tsconfig.json is a solution container (no files of its own), so the build reads the
+// package's check config, which carries the same compiler options (ADR-150, 2026-10-10).
+const tsconfig = "tsconfig.app.json";
+
+// `__CLI_VERSION__` is a bare identifier in src/cli/program.ts.
+const define = {
+  __CLI_VERSION__: JSON.stringify(packageJson.version),
+};
+
+export default defineConfig([
+  {
+    // Library entries -- the published SDK surface (`langwatch`,
+    // `langwatch/observability`, ...). Dual format + dts, as before.
+
+    // NOTE: no `clean` here -- these configs build CONCURRENTLY and would
+    // race; the `build` script rm -rf's dist before invoking tsup instead.
+    entry: [
+      "src/index.ts",
+      "src/observability-sdk/index.ts",
+      // Constants only -- attribute names, values and event names. Its own
+      // entry so a browser can import the vocabulary without the Node SDK
+      // behind `./observability`, which drags in grpc, ffmpeg and `open`.
+      "src/observability-sdk/semconv/index.ts",
+      "src/observability-sdk/setup/node/index.ts",
+      "src/observability-sdk/instrumentation/langchain/index.ts",
+    ],
+    splitting: true,
+    clean: false,
+    format: ["cjs", "esm"],
+    dts: true,
+    // ESM keeps import.meta (every ESM loader has it) while the rest stays
+    // es2017; the Node setup resolves its optional peers from that URL.
+    esbuildOptions(options, { format }) {
+      const url = format === "esm" ? "import.meta.url" : "undefined";
+      options.define = { ...options.define, __ESM_MODULE_URL__: url };
+      if (format === "esm") options.supported = { ...options.supported, "import-meta": true };
+    },
+    sourcemap: true,
+    noExternal,
+    define,
+    tsconfig,
+  },
+  {
+    // `langwatch/agent` -- Node only, built as a SEPARATE config: it loads
+    // the optional `ws` package via `createRequire(__filename)` so a runtime
+    // without it degrades to one message instead of failing at import. Its
+    // ESM shim needs `import.meta`/`node:url`, kept out of shared chunks so
+    // browser-capable observability entries never import it.
+
+    // Object-form entry pins the output path, like the CLI entry below: a
+    // plain string entry would take src/agent as the outbase and emit
+    // dist/index.js over the library's main entry.
+    entry: { "agent/index": "src/agent/index.ts" },
+    splitting: false,
+    clean: false,
+    format: ["cjs", "esm"],
+    platform: "node",
+    target: "es2020",
+    shims: true,
+    dts: true,
+    sourcemap: true,
+    noExternal,
+    define,
+    tsconfig,
+  },
+  {
+    // CLI entry -- only ever RUN as CJS, never imported as a library, so the
+    // ESM copy, dts and sourcemaps were pure tarball weight. Built as a
+    // SEPARATE config: a CJS-only entry must not share chunks with
+    // dual-format library entries (an ESM-only chunk would break `require`).
+
+    // `splitting: false` inlines the lazy command chunks into the single
+    // file -- dynamic `import()` keeps its lazy semantics (esbuild wraps it
+    // in promises), keeping command modules and the js-yaml load off cold-start.
+
+    // Object-form entry pins the output path: a single string entry would
+    // take src/cli as the outbase and emit dist/index.js, clobbering the
+    // library's main entry.
+
+    // The bundle emits as cli/bundle.js; `onSuccess` writes the real
+    // cli/index.js as a tiny stub enabling Node's compile cache BEFORE the
+    // 600KB bundle is parsed. Enabling it from inside the bundle comes too
+    // late -- V8 compiles the entry file before its first statement runs --
+    // so the stub stays belt and braces for the Bun binary too.
+    entry: { "cli/bundle": "src/cli/index.ts" },
+    splitting: false,
+    clean: false,
+    format: ["cjs"],
+    minify: true,
+    dts: false,
+    // Minified WITHOUT a sourcemap: a bare stack trace is unresolvable even
+    // for us, so the map is generated but excluded from the tarball
+    // (`!dist/cli/*.map`), keeping the npm weight win; Node only reads maps
+    // under `--enable-source-maps`, so this costs nothing at runtime.
+
+    // To decode a trace from a released version: check out that tag, run
+    // `pnpm build`, and use the local dist/cli/bundle.js.map -- esbuild
+    // output is deterministic, so it matches what shipped.
+    sourcemap: true,
+    // `@opentelemetry/api` is a peer of the library, so tsup would leave it
+    // external; `npx langwatch` has no host app to supply it.
+    noExternal: [...noExternal, ...cliOnlyPackages, /^@opentelemetry\/api(\/|$)/],
+    define,
+    tsconfig,
+    onSuccess: async () => {
+      const { chmodSync, writeFileSync } = await import("node:fs");
+      const stub = `#!/usr/bin/env node
+// Generated by tsup.config.ts (onSuccess). Enables the V8 compile cache
+// before the bundle below is parsed — see src/cli/compileCache.ts — then
+// hands over. Keep this file tiny: anything added here is paid at boot.
+"use strict";
+try {
+  require("node:module").enableCompileCache?.();
+} catch {
+  // A compile cache is an optimisation, never a reason to fail a boot.
+}
+require("./bundle.js");
+`;
+      writeFileSync("dist/cli/index.js", stub);
+      chmodSync("dist/cli/index.js", 0o755);
+    },
+  },
+]);

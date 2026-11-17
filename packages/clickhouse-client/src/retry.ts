@@ -1,0 +1,216 @@
+/**
+ * Retrying a statement that failed for a reason worth trying again. Composes
+ * ./resilience.ts so this and the outer job queue can't drift on "transient",
+ * and runs inside the query client's limiter so a retry keeps its slot.
+ */
+
+import type { AbortSignalLike, QueryRequest } from "./query.ts";
+import {
+  isServerTimeout,
+  isTransientClickHouseError,
+  jitteredBackoffMs,
+  quietly,
+  retryNoticeLevel,
+} from "./resilience.ts";
+
+export interface RetryNotice {
+  /**
+   * Absent when the policy ran without one — `run(task)` is a supported form.
+   * Optional rather than cast away: a callback reading tenant/table off this
+   * would otherwise throw into the guard, silencing retry telemetry.
+   */
+  request?: QueryRequest | undefined;
+  /** Zero-based. */
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  error: unknown;
+  /** `warn` for the first attempt, `debug` after: one failure, one warning. */
+  level: "warn" | "debug";
+}
+
+export interface RetryOptions {
+  /** Total attempts including the first. */
+  maxAttempts?: number | undefined;
+  baseDelayMs?: number | undefined;
+  maxDelayMs?: number | undefined;
+  /** Owned by the caller so this cannot drift from the queue's classifier. */
+  transientMessageFragments?: readonly string[] | undefined;
+  /** Injectable for deterministic tests. */
+  sleep?: ((ms: number) => Promise<void>) | undefined;
+  random?: (() => number) | undefined;
+  onRetry?: ((notice: RetryNotice) => void) | undefined;
+}
+
+const DEFAULT_MAX_ATTEMPTS = 5;
+const DEFAULT_BASE_DELAY_MS = 500;
+const DEFAULT_MAX_DELAY_MS = 30_000;
+
+/**
+ * Reached through `globalThis` so the package needs neither the Node nor the
+ * DOM lib to build. Every host that can run a query has a timer.
+ */
+const realSleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    globalThis.setTimeout(resolve, ms);
+  });
+
+/** What {@link runWithRetry} reports on each retry. No request: it is generic. */
+export interface RetryAttemptNotice {
+  /** Zero-based. */
+  attempt: number;
+  maxAttempts: number;
+  delayMs: number;
+  error: unknown;
+  /** `warn` for the first attempt, `debug` after: one failure, one warning. */
+  level: "warn" | "debug";
+}
+
+export interface RunWithRetryOptions extends Omit<
+  RetryOptions,
+  "onRetry" | "transientMessageFragments"
+> {
+  transientMessageFragments?: readonly string[] | undefined;
+  onRetry?: ((notice: RetryAttemptNotice) => void) | undefined;
+  /** Stop retrying once this reports true. Nobody is waiting any more. */
+  isAborted?: (() => boolean) | undefined;
+}
+
+/**
+ * Retry any operation under this package's policy. Lives here, not in the
+ * client class, so callers off the ClickHouseQueryClient port
+ * (`VendorClientResilience`, other host retries) share one implementation.
+ */
+export async function runWithRetry<T>(
+  fn: () => Promise<T>,
+  {
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    baseDelayMs = DEFAULT_BASE_DELAY_MS,
+    maxDelayMs = DEFAULT_MAX_DELAY_MS,
+    transientMessageFragments,
+    sleep = realSleep,
+    random,
+    onRetry,
+    isAborted,
+  }: RunWithRetryOptions = {},
+): Promise<T> {
+  // Without this, `maxAttempts: 0` never enters the loop and throws the
+  // uninitialised `lastError` - an `undefined` with no message and no stack,
+  // which every instanceof-based handler upstream misses.
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError("maxAttempts must be a positive integer");
+  }
+
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+
+      const isLastAttempt = attempt === maxAttempts - 1;
+      const transient = isTransientClickHouseError({
+        error,
+        transientMessageFragments,
+      });
+      // An aborted caller is not waiting for the answer any more, so spending
+      // the rest of the budget only adds load.
+      if (!transient || isLastAttempt || isAborted?.() === true) {
+        throw error;
+      }
+
+      const delayMs = jitteredBackoffMs({
+        attempt,
+        baseDelayMs,
+        maxDelayMs,
+        ...(random === undefined ? {} : { random }),
+      });
+      // Guarded because `onRetry` is host code running inside the catch: an
+      // exception from it would replace `error`, so the caller learns a
+      // logging failure instead of the real one. Observability must not change what it observes.
+      quietly(() =>
+        onRetry?.({
+          attempt,
+          maxAttempts,
+          delayMs,
+          error,
+          level: retryNoticeLevel(attempt),
+        }),
+      );
+
+      await sleep(delayMs);
+
+      // Checked again after the wait, not only before it. A backoff can be
+      // tens of seconds, and a caller that gave up during it is not waiting for
+      // the answer any more, so another attempt is pure load.
+      if (isAborted?.() === true) throw error;
+    }
+  }
+
+  throw lastError;
+}
+
+/** Carries a failure past the retry loop: not an Error, so never classified transient. */
+class FinalFailure {
+  constructor(readonly failure: unknown) {}
+}
+
+/**
+ * A configured retry policy, reusable across statements. Holds its options
+ * once instead of threading them through every call, so the client holds
+ * one policy rather than rebuilding the argument object per query.
+ */
+export class RetryPolicy {
+  private readonly onRetry: ((notice: RetryNotice) => void) | undefined;
+  private readonly options: Omit<RetryOptions, "onRetry">;
+
+  constructor({ onRetry, ...options }: RetryOptions = {}) {
+    this.onRetry = onRetry;
+    this.options = options;
+  }
+
+  /**
+   * Runs `task`, retrying transient failures until the budget is spent.
+   * `request` is optional and only decorates the retry notice — a caller
+   * retrying something that isn't a statement still gets the same backoff.
+   */
+  async run<T>(
+    task: () => Promise<T>,
+    {
+      signal,
+      request,
+    }: { signal?: AbortSignalLike | undefined; request?: QueryRequest | undefined } = {},
+  ): Promise<T> {
+    const onRetry = this.onRetry;
+    // Falls back to the request's own signal. A caller that passes a request
+    // carrying a signal and no explicit `signal` means for it to be honoured;
+    // reading only the explicit one would silently retry work nobody is
+    // waiting for, which is the exact failure this option exists to prevent.
+    const abortSignal = signal ?? request?.signal;
+    // A statement that opted out of retrying its timeout answers with it at once.
+    const attempt =
+      request?.retryOnTimeout === false
+        ? async () => {
+            try {
+              return await task();
+            } catch (error) {
+              throw isServerTimeout(error) ? new FinalFailure(error) : error;
+            }
+          }
+        : task;
+    try {
+      return await runWithRetry(attempt, {
+        ...this.options,
+        isAborted: () => abortSignal?.aborted === true,
+        ...(onRetry === undefined
+          ? {}
+          : {
+              onRetry: (notice: Omit<RetryNotice, "request">) => onRetry({ ...notice, request }),
+            }),
+      });
+    } catch (error) {
+      throw error instanceof FinalFailure ? error.failure : error;
+    }
+  }
+}

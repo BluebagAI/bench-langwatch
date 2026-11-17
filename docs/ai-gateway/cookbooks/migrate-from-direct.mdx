@@ -1,0 +1,103 @@
+---
+title: Migrate from direct provider calls
+description: Move an application that calls OpenAI, Anthropic or Google directly onto the LangWatch AI Gateway by changing the base URL and the key, then add budgets and routing without touching the code again.
+sidebarTitle: Migrate from direct
+---
+
+## What changes
+
+The code change is two settings per client: the base URL and the API key. The provider keys move out of your application and into LangWatch, and each application gets a virtual key.
+
+<CodeGroup>
+
+```typescript Before
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+```
+
+```typescript After
+const openai = new OpenAI({
+  baseURL: "https://gateway.langwatch.ai/v1",
+  apiKey: process.env.LANGWATCH_VIRTUAL_KEY,
+});
+const anthropic = new Anthropic({
+  baseURL: "https://gateway.langwatch.ai",
+  apiKey: process.env.LANGWATCH_VIRTUAL_KEY,
+});
+```
+
+</CodeGroup>
+
+## 1. Add the provider credentials
+
+Open **Settings > Model Providers** and add a row per provider your application calls, with the same key it uses today. See [Providers](/ai-gateway/providers/overview).
+
+## 2. Create a virtual key
+
+Open **AI Gateway > Virtual Keys**, click **New virtual key**, name it after the application, keep **Ownership** on the project you want the traces in, and set a budget if you want one now. Copy the secret into your secret manager.
+
+From the CLI:
+
+```bash
+langwatch vk create \
+  --name acme-support-agent \
+  --scope project:<project_id> \
+  --budget-limit 200 --budget-window month --budget-breach block \
+  -f json | jq -r '.secret'
+```
+
+See [Virtual keys](/ai-gateway/virtual-keys).
+
+## 3. Change the base URL and the key
+
+| SDK          | Base URL                          |
+| ------------ | --------------------------------- |
+| OpenAI       | `https://gateway.langwatch.ai/v1` |
+| Anthropic    | `https://gateway.langwatch.ai`    |
+| Google GenAI | `https://gateway.langwatch.ai`    |
+
+Prefix the model with the provider: `gpt-6-luna` becomes `openai/gpt-6-luna`. A bare `gpt-6-luna`, `claude-*` or `gemini-*` name still resolves when the key reaches that provider, so this step can wait. See [Model naming](/ai-gateway/model-naming).
+
+Per SDK and framework: [Python](/ai-gateway/sdks/python), [TypeScript](/ai-gateway/sdks/typescript).
+
+## 4. Verify
+
+Send one request and read the response headers. `X-LangWatch-Gateway-Request-Id` is present on every response that went through the gateway.
+
+```bash
+curl -si https://gateway.langwatch.ai/v1/chat/completions \
+  -H "Authorization: Bearer $LANGWATCH_VIRTUAL_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai/gpt-6-luna", "messages": [{"role": "user", "content": "ping"}]}' \
+  | grep -i x-langwatch
+```
+
+Open **Trace Explorer** in the key's project: the request is there with its model, tokens and cost. Open **AI Gateway > Usage**: the spend is on the key.
+
+## 5. Add what the code could not do
+
+Each of these is a setting on the key or the project, with no change in application code.
+
+| Need                                                   | Where                                                                                                                    |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| A spend cap per application, team, project or end user | [Budgets](/ai-gateway/budgets)                                                                                           |
+| Requests per minute and per day on a key               | [Rate limits](/ai-gateway/rate-limits)                                                                                   |
+| Fall over to a second provider when the first fails    | [Routing policies](/ai-gateway/governance/routing-policies) and [Fallback chains](/ai-gateway/providers/fallback-chains) |
+| Run an evaluator on the request or the response        | [Guardrails](/ai-gateway/guardrails)                                                                                     |
+| Bill your own customers per request                    | [Billing and spend events](/ai-gateway/billing-events)                                                                   |
+
+## 6. Remove the provider keys from the application
+
+Once every deployment runs on the virtual key, delete the provider key from the application's secrets. The gateway keeps using the key stored on the provider row. If you rotate the provider key at the provider, update the row under **Settings > Model Providers**. Until you do, the gateway sends the old key, and the provider rejects it with `401 provider_credential_rejected`.
+
+## What to expect in error handling
+
+| Status and code                                                          | When                                                                                                                                                     |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `402 budget_exceeded`                                                    | A `block` budget on the key, the project, the team, the organization, the person or the end user is at its limit. `error.meta.budget_scope` names which. |
+| `400 model_not_allowed`                                                  | The model is outside the key's **Provider access** selection or its routing policy.                                                                      |
+| `429 rate_limited`                                                       | The key's RPM or RPD is exhausted.                                                                                                                       |
+| `403 virtual_key_disabled`, `virtual_key_expired`, `virtual_key_revoked` | The key was disabled, expired or revoked.                                                                                                                |
+| `401 provider_credential_rejected`                                       | The provider refused the stored credential.                                                                                                              |
+
+A provider error is forwarded with the provider's status, and `X-LangWatch-Provider` names the provider. When a routing policy tried more than one provider, `X-LangWatch-Fallback-Count` says how many. See [Errors](/ai-gateway/api/errors).

@@ -1,0 +1,205 @@
+@unit
+Feature: Dataset management in evaluations workbench
+  As a user configuring an evaluation
+  I want to manage multiple datasets in the workbench
+  So that I can easily switch between different test data sources
+
+  Background:
+    Given I render the EvaluationsV3 spreadsheet table
+    And the default "Test Data" inline dataset is available
+
+  # ============================================================================
+  # Dataset tabs display
+  # ============================================================================
+
+  @unimplemented
+  Scenario: View dataset header with label
+    Then I see the "Datasets" label with a database icon in the header
+    And I see the "Test Data" tab
+    And I see a "+" button to add more datasets
+    And I see an edit button for the current dataset
+
+  # Icon-only header controls were hard to find. Header controls now pair the
+  # icon with a text label. See dev/docs/best_practices/icon-button-labels.md.
+  Scenario: Dataset header add and edit controls show text labels
+    Then the add-dataset control reads "Add" next to its icon
+    And the edit-columns control reads "Edit columns" next to its icon
+
+  @unimplemented
+  Scenario: Dataset tab shows database icon indicator
+    Given I have both inline and saved datasets in the workbench
+    Then saved dataset tabs show a blue database icon
+    And inline dataset tabs show a default colored database icon
+
+  @unimplemented
+  Scenario: Active tab shows dropdown, inactive does not
+    Given I have datasets "Test Data" and "Other Dataset" in the workbench
+    And "Test Data" is the active dataset
+    Then the active "Test Data" tab shows a dropdown arrow
+    And the "Other Dataset" tab has no dropdown arrow
+
+  # ============================================================================
+  # Add dataset menu
+  # ============================================================================
+  @unimplemented
+  Scenario: Select existing dataset opens drawer
+    When I click the "+" button in the dataset header
+    And I select "Select existing dataset" from the dropdown
+    Then a drawer opens with title "Choose Dataset"
+    And I see a search input to filter datasets
+    And I see a list of datasets with entry count, column count, and last edit date
+
+  @unimplemented
+  Scenario: Add existing dataset to workbench
+    Given the "Choose Dataset" drawer is open
+    When I click on dataset "Production Samples"
+    Then the drawer closes
+    And "Production Samples" tab appears in the dataset header
+    And "Production Samples" becomes the active dataset
+    And the dataset columns are loaded into the workbench
+
+  @unimplemented
+  Scenario: Upload CSV opens existing modal
+    When I click the "+" button in the dataset header
+    And I select "Upload CSV" from the dropdown
+    Then the existing Upload CSV modal opens
+    And after uploading, the dataset is saved to the database
+    And the saved dataset is added to the workbench
+
+  # ============================================================================
+  # Active dataset dropdown menu
+  # ============================================================================
+  @unimplemented
+  Scenario: Active tab dropdown hides remove for single dataset
+    Given I only have "Test Data" in the workbench
+    When I click on the active "Test Data" tab dropdown
+    Then I do NOT see "Remove from workbench" option
+
+  # The active tab's menu is where per-dataset actions live. Before it
+  # offered only save and remove, so pointing the workbench at a different
+  # existing dataset hid behind the Add button's menu.
+  @unit
+  Scenario: Switching to another dataset from the active dataset's menu
+    Given the workbench shows its active dataset tab
+    When I open that tab's dropdown menu
+    Then the menu offers "Switch Dataset"
+    And choosing it opens the dataset picker
+
+  # ============================================================================
+  # Save as dataset
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Save inline dataset opens AddOrEditDatasetDrawer
+    Given "Test Data" has been modified with custom rows
+    When I click on the active "Test Data" tab dropdown
+    And I select "Save as dataset"
+    Then the AddOrEditDatasetDrawer opens with current data pre-filled
+    And I can edit the dataset name
+    And I can review columns and data
+
+  @unimplemented
+  Scenario: After saving, tab references saved dataset
+    Given I am saving "Test Data" via AddOrEditDatasetDrawer
+    When the save completes successfully
+    Then the "Test Data" tab is replaced with a reference to the saved dataset
+    And the tab shows a blue database icon indicating saved type
+
+  # ============================================================================
+  # Edit dataset
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Edit dataset button opens panel
+    When I click the edit button in the dataset header
+    Then a translucent panel opens on the right side
+    And I can edit the dataset name
+    And I can add, remove, or rename columns
+    And changes are applied to the current active dataset
+
+  @unimplemented
+  Scenario: Toggle column visibility in edit panel
+    When I click the edit button in the dataset header
+    Then each column row shows an eye icon button
+    When I click the eye icon for column "metadata"
+    Then the "metadata" column is hidden from the table
+    And the eye icon changes to indicate hidden state
+
+  @unimplemented
+  Scenario: Column visibility is UI-only state
+    Given the "metadata" column is hidden via the eye toggle
+    When I save the dataset
+    Then the column visibility state is NOT saved to the dataset
+    And the column visibility persists only in the evaluation UI state
+
+  @unimplemented
+  Scenario: Show hidden column again
+    Given the "metadata" column is hidden
+    When I click the edit button in the dataset header
+    And I click the eye icon for column "metadata"
+    Then the "metadata" column reappears in the table
+
+  # ============================================================================
+  # Execution with active dataset
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Active dataset used for execution
+    Given I have datasets "Test Data" and "Production Samples" in the workbench
+    And "Production Samples" is the active dataset
+    When I run the evaluation
+    Then the evaluation runs against "Production Samples" data
+    And results are displayed for "Production Samples" rows
+
+  # ============================================================================
+  # Mapping integration
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Cleanup mappings when removing dataset
+    Given agent "GPT-4o" has input mapping from "External Dataset" column "question"
+    When I remove "External Dataset" from the workbench
+    Then the mapping from "External Dataset.question" is removed
+
+  @unimplemented
+  Scenario: Mappings show dataset source in agent config
+    Given I have multiple datasets in the workbench
+    When I open the agent configuration panel
+    Then the mapping dropdown shows columns grouped by dataset
+    And the active dataset group is marked as "(active)"
+
+  # ==========================================================================
+  # Large saved datasets
+  # ==========================================================================
+
+  # The grid loads a saved dataset up to the size one response carries. A larger
+  # dataset shows its first rows and says so; a run reads the dataset on the
+  # server by its id, so it covers every row whatever the grid loaded.
+
+  @integration
+  Scenario: A saved dataset larger than the grid loads says how many rows are shown
+    Given a saved dataset of 10,000 rows of which the grid loaded the first 1,200
+    When I open the workbench with that dataset active
+    Then I see a notice saying 1,200 of 10,000 rows are shown
+    And the notice says a run still covers all 10,000 rows
+
+  @integration
+  Scenario: A saved dataset the grid loads in full shows no rows notice
+    Given a saved dataset the grid loaded every row of
+    When I open the workbench with that dataset active
+    Then I see no notice about rows not shown
+
+  @unit
+  Scenario: The grid remembers that a saved dataset read left rows out
+    Given a read of a saved dataset that reports it was cut short
+    When the grid stores the rows it loaded
+    Then it keeps how many rows were loaded and how many the dataset holds
+    And that count is never saved with the experiment
+
+  @unit
+  Scenario: A run on a saved dataset names the dataset and sends none of the grid's rows
+    Given a workbench whose active dataset is saved and only partly loaded in the grid
+    When I run the evaluation
+    Then the request names the saved dataset by its id
+    And the request carries none of the rows the grid loaded
+

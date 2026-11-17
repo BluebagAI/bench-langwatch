@@ -1,0 +1,244 @@
+{{- if .Values.backup.enabled }}
+{{- $fullname := include "clickhouse-serverless.fullname" . }}
+{{- if include "clickhouse-serverless.backupCronJobs" . }}
+---
+# Full backup — scripts are baked into the Docker image at /scripts/
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-backup-full
+  labels:
+    {{- include "clickhouse-serverless.selectorLabels" . | nindent 4 }}
+    {{- include "clickhouse-serverless.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.full.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 28800
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "clickhouse-serverless.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-full
+        spec:
+          restartPolicy: Never
+          # Same ServiceAccount as the StatefulSets: these Jobs are configured
+          # by the chart's serviceAccount.* block, so they must not silently
+          # fall through to the namespace default SA (which would miss an IRSA
+          # annotation the backup path needs to reach S3).
+          serviceAccountName: {{ include "clickhouse-serverless.serviceAccountName" . }}
+          # Backup jobs never call the Kubernetes API.
+          automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ .Values.scratch.tmpSizeLimit }}
+          containers:
+            - name: full-backup
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/scripts/backup-data.sh"]
+              securityContext:
+                runAsUser: 101
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              env:
+                - name: CLICKHOUSE_HOST
+                  value: "{{ $fullname }}-0.{{ $fullname }}-headless"
+                - name: CLICKHOUSE_USER
+                  value: {{ .Values.backup.user | quote }}
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "clickhouse-serverless.secretName" . }}
+                      key: {{ include "clickhouse-serverless.secretKey" . }}
+                - name: BACKUP_MODE
+                  value: "full"
+                - name: BACKUP_DATABASE
+                  value: {{ .Values.backup.database | quote }}
+                - name: STALE_BACKUP_HOURS
+                  value: {{ .Values.backup.staleHours | quote }}
+                - name: BACKUP_RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+                # The chain limit follows the full cadence (ADR-199).
+                - name: BACKUP_FULL_SCHEDULE
+                  value: {{ .Values.backup.full.schedule | quote }}
+---
+# Incremental backup
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-backup-incremental
+  labels:
+    {{- include "clickhouse-serverless.selectorLabels" . | nindent 4 }}
+    {{- include "clickhouse-serverless.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.backup.incremental.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 3600
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "clickhouse-serverless.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: backup-incremental
+        spec:
+          restartPolicy: Never
+          # Same ServiceAccount as the StatefulSets: these Jobs are configured
+          # by the chart's serviceAccount.* block, so they must not silently
+          # fall through to the namespace default SA (which would miss an IRSA
+          # annotation the backup path needs to reach S3).
+          serviceAccountName: {{ include "clickhouse-serverless.serviceAccountName" . }}
+          # Backup jobs never call the Kubernetes API.
+          automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ .Values.scratch.tmpSizeLimit }}
+          containers:
+            - name: incremental-backup
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/scripts/backup-data.sh"]
+              securityContext:
+                runAsUser: 101
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              env:
+                - name: CLICKHOUSE_HOST
+                  value: "{{ $fullname }}-0.{{ $fullname }}-headless"
+                - name: CLICKHOUSE_USER
+                  value: {{ .Values.backup.user | quote }}
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "clickhouse-serverless.secretName" . }}
+                      key: {{ include "clickhouse-serverless.secretKey" . }}
+                - name: BACKUP_MODE
+                  value: "incremental"
+                - name: BACKUP_DATABASE
+                  value: {{ .Values.backup.database | quote }}
+                - name: STALE_BACKUP_HOURS
+                  value: {{ .Values.backup.staleHours | quote }}
+                - name: BACKUP_RETENTION_DAYS
+                  value: {{ .Values.backup.retentionDays | quote }}
+                # The chain limit follows the full cadence (ADR-199).
+                - name: BACKUP_FULL_SCHEDULE
+                  value: {{ .Values.backup.full.schedule | quote }}
+{{- end }}
+{{- /* Dynamic-only has no password a Job could hold: restore with
+       kubectl exec into the access container (ADR-199). */}}
+{{- if not (include "clickhouse-serverless.dynamicOnly" .) }}
+---
+# Restore template, in every mode (suspended — manual trigger only)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $fullname }}-restore-template
+  labels:
+    {{- include "clickhouse-serverless.selectorLabels" . | nindent 4 }}
+    {{- include "clickhouse-serverless.labels" . | nindent 4 }}
+spec:
+  schedule: "0 0 30 2 *"
+  suspend: true
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 28800
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "clickhouse-serverless.selectorLabels" . | nindent 12 }}
+            app.kubernetes.io/component: restore-data
+        spec:
+          restartPolicy: Never
+          # Same ServiceAccount as the StatefulSets: these Jobs are configured
+          # by the chart's serviceAccount.* block, so they must not silently
+          # fall through to the namespace default SA (which would miss an IRSA
+          # annotation the backup path needs to reach S3).
+          serviceAccountName: {{ include "clickhouse-serverless.serviceAccountName" . }}
+          # Backup jobs never call the Kubernetes API.
+          automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+          securityContext:
+            runAsNonRoot: true
+            fsGroup: 101
+            seccompProfile:
+              type: RuntimeDefault
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: {{ .Values.scratch.tmpSizeLimit }}
+          containers:
+            - name: restore-data
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command: ["/scripts/restore-data.sh"]
+              securityContext:
+                runAsUser: 101
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                {{- toYaml .Values.backup.resources | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              env:
+                - name: CLICKHOUSE_HOST
+                  value: "{{ $fullname }}-0.{{ $fullname }}-headless"
+                - name: CLICKHOUSE_USER
+                  value: {{ .Values.backup.user | quote }}
+                - name: CLICKHOUSE_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      {{- if and (include "clickhouse-serverless.backupSidecar" .) .Values.backup.passwordSecret.name }}
+                      name: {{ .Values.backup.passwordSecret.name }}
+                      key: {{ .Values.backup.passwordSecret.key | default "password" }}
+                      {{- else }}
+                      name: {{ include "clickhouse-serverless.secretName" . }}
+                      key: {{ include "clickhouse-serverless.secretKey" . }}
+                      {{- end }}
+                - name: BACKUP_DATABASE
+                  value: {{ .Values.backup.database | quote }}
+                - name: BACKUP_NAME
+                  value: ""
+                - name: CONFIRM_RESTORE
+                  value: "no"
+{{- end }}
+{{- end }}

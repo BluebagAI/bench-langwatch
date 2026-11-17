@@ -1,0 +1,155 @@
+services:
+  # No migrate step: the workers run `pnpm task upgrade` until the ledger is
+  # current while the app holds (specs/upgrade/entry-points.feature).
+  app:
+    image: langwatch/langwatch:latest
+    environment:
+      DATABASE_URL: postgresql://prisma:prisma@postgres:5432/mydb?schema=mydb
+      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:-langwatch}@clickhouse:8123/langwatch
+      # This compose stack runs a plain ClickHouse with no backups, so
+      # system.backup_log does not exist here. Backup-status collection is on by
+      # default (an unset flag must not disarm the alerts that read those gauges
+      # in deployments that do have backups), so opt out explicitly rather than
+      # failing the query on every stats tick.
+      CLICKHOUSE_BACKUP_METRICS_ENABLED: "false"
+      REDIS_URL: redis://redis:6379
+      LANGWATCH_NLP_SERVICE: http://langwatch_nlp:5561
+      LANGEVALS_ENDPOINT: http://langevals:5562
+      LANGWATCH_ENDPOINT: http://app:5560
+      INSTALL_METHOD: docker
+      NODE_ENV: production
+    env_file:
+      - path: .env
+        required: false
+      - path: platform/app/.env
+        required: false
+    pull_policy: always
+    ports:
+      - "5560:5560"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  workers:
+    image: langwatch/langwatch:latest
+    command: ["pnpm", "run", "start"]
+    working_dir: /app/apps/worker
+    environment:
+      DATABASE_URL: postgresql://prisma:prisma@postgres:5432/mydb?schema=mydb
+      CLICKHOUSE_URL: http://default:${CLICKHOUSE_PASSWORD:-langwatch}@clickhouse:8123/langwatch
+      # This compose stack runs a plain ClickHouse with no backups, so
+      # system.backup_log does not exist here. Backup-status collection is on by
+      # default (an unset flag must not disarm the alerts that read those gauges
+      # in deployments that do have backups), so opt out explicitly rather than
+      # failing the query on every stats tick.
+      CLICKHOUSE_BACKUP_METRICS_ENABLED: "false"
+      REDIS_URL: redis://redis:6379
+      LANGWATCH_NLP_SERVICE: http://langwatch_nlp:5561
+      LANGEVALS_ENDPOINT: http://langevals:5562
+      LANGWATCH_ENDPOINT: http://app:5560
+      NODE_ENV: production
+    env_file:
+      - path: .env
+        required: false
+      - path: platform/app/.env
+        required: false
+    pull_policy: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: always
+
+  # nlpgo — the Go NLP engine, the `nlpgo` command of langwatch/langwatch_nlp
+  # (the nlp target of Dockerfile.go-services). It binds SERVER_ADDR, :5561, and reads
+  # LANGWATCH_ENDPOINT for evaluator + agent-workflow callbacks.
+  langwatch_nlp:
+    image: langwatch/langwatch_nlp:latest
+    command: [nlpgo]
+    env_file:
+      - path: .env
+        required: false
+      - path: platform/app/.env
+        required: false
+    # No host port - accessed via docker network as "langwatch_nlp:5561".
+    # The app and workers dial it there, so nothing needed the host binding,
+    # and this engine runs workflow nodes for whichever project the request
+    # body names.
+    restart: always
+    pull_policy: always
+    environment:
+      - LANGWATCH_ENDPOINT=http://app:5560
+      - SERVER_ADDR=:5561
+
+  langevals:
+    image: langwatch/langevals:latest
+    ports:
+      - "5562:5562"
+    restart: always
+    pull_policy: always
+    environment:
+      - DISABLE_EVALUATORS_PRELOAD=true
+
+  postgres:
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: prisma
+      POSTGRES_PASSWORD: prisma
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prisma -d mydb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: langwatch/clickhouse-serverless:0.4.0
+    environment:
+      # Set CLICKHOUSE_PASSWORD in .env (openssl rand -hex 24; URL-safe, it is
+      # part of CLICKHOUSE_URL above). The `langwatch` fallback keeps existing
+      # installs starting; the server warns at boot and the next major drops it.
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-langwatch}
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "1.0"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: always
+
+volumes:
+  db-data:
+  redis-data:
+  clickhouse-data:

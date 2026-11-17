@@ -1,0 +1,83 @@
+import chalk from "chalk";
+
+import { resolveControlPlaneUrl } from "@/cli/utils/governance/resolveEndpoint";
+import { scopedApiKey } from "@/internal/credentialContext";
+
+import { resolveCredentials } from "../../utils/apiKey.ts";
+import { failSpinnerFromResponse } from "../../utils/failFromResponse.ts";
+import type { CommandResult } from "../../utils/output.ts";
+import { createSpinner } from "../../utils/spinner.ts";
+import { failSpinner } from "../../utils/spinnerError.ts";
+import { findMonitor } from "./findMonitor";
+
+/**
+ * Returns the monitor rather than printing it: the output port renders it in
+ * whatever format the caller asked for (utils/output.ts).
+ */
+export const getMonitorCommand = async (idOrSlugOrName: string): Promise<CommandResult | void> => {
+  await resolveCredentials();
+
+  const apiKey = scopedApiKey() ?? process.env.LANGWATCH_API_KEY ?? "";
+  const endpoint = resolveControlPlaneUrl();
+
+  const spinner = createSpinner(`Fetching monitor "${idOrSlugOrName}"...`).start();
+
+  let monitor: {
+    id: string;
+    name: string;
+    slug: string;
+    checkType: string;
+    enabled: boolean;
+    executionMode: string;
+    sample: number;
+    level: string;
+    evaluatorId: string | null;
+    preconditions: unknown;
+    createdAt: string;
+    platformUrl?: string;
+  };
+  try {
+    const found = await findMonitor<typeof monitor>({
+      endpoint,
+      apiKey,
+      reference: idOrSlugOrName,
+    });
+    if ("failed" in found) {
+      await failSpinnerFromResponse({ spinner, response: found.failed, action: "fetch monitor" });
+      process.exit(1);
+    }
+    monitor = found.monitor;
+
+    spinner.succeed(`Monitor "${monitor.name}"`);
+  } catch (error) {
+    // No explicit `format`: see traces/search.ts — the preAction hook covers
+    // every spelling; the `-f` commander default must not override it.
+    failSpinner({ spinner, error, action: "fetch monitor" });
+    process.exit(1);
+  }
+
+  return {
+    data: monitor,
+    table: () => {
+      console.log();
+      console.log(`  ${chalk.gray("ID:")}        ${chalk.green(monitor.id)}`);
+      console.log(`  ${chalk.gray("Name:")}      ${chalk.cyan(monitor.name)}`);
+      console.log(`  ${chalk.gray("Slug:")}      ${monitor.slug}`);
+      console.log(`  ${chalk.gray("Type:")}      ${monitor.checkType}`);
+      console.log(
+        `  ${chalk.gray("Status:")}    ${monitor.enabled ? chalk.green("enabled") : chalk.gray("disabled")}`,
+      );
+      console.log(`  ${chalk.gray("Mode:")}      ${monitor.executionMode}`);
+      console.log(`  ${chalk.gray("Sample:")}    ${Math.round(monitor.sample * 100)}%`);
+      console.log(`  ${chalk.gray("Level:")}     ${monitor.level}`);
+      if (monitor.evaluatorId) {
+        console.log(`  ${chalk.gray("Evaluator:")} ${monitor.evaluatorId}`);
+      }
+      console.log(`  ${chalk.gray("Created:")}   ${new Date(monitor.createdAt).toLocaleString()}`);
+      if (monitor.platformUrl) {
+        console.log(`  ${chalk.bold("View:")}     ${chalk.underline(monitor.platformUrl)}`);
+      }
+      console.log();
+    },
+  };
+};

@@ -1,0 +1,237 @@
+Feature: Service orchestration after pre-deps are installed
+  As a user who just ran `npx @langwatch/server`
+  I want every LangWatch service started, healthy, and pointing at fresh credentials
+  So that I can hit http://localhost:5560 and start using the product
+
+  See _shared/contract.md §4–§8 for paths, ports, secrets, supervision rules.
+
+  Background:
+    Given pre-dependencies (uv, postgres, redis, clickhouse, ai-gateway) are installed under "~/.langwatch/bin/"
+    And every port in the services-tier (5560..5563) and infra-tier (6560..6563) is free
+
+  # =========================================================================
+  # .env scaffolding
+  # =========================================================================
+
+  Scenario: First run generates a fresh .env with random secrets
+    Given "~/.langwatch/.env" does not exist
+    When the CLI calls `runtime.scaffoldEnv(ctx)`
+    Then "~/.langwatch/.env" exists with mode 0600
+    And it contains a "NEXTAUTH_SECRET" value of 44 base64 chars
+    And it contains a "CREDENTIALS_SECRET" value of 64 hex chars
+    And it contains a "LW_GATEWAY_INTERNAL_SECRET" value of 64 hex chars
+    And it contains a "LW_GATEWAY_JWT_SECRET" value of 64 hex chars
+    And it contains a "LW_VIRTUAL_KEY_PEPPER" value of 64 hex chars
+    And it contains a "API_TOKEN_JWT_SECRET" value of 64 hex chars
+    And it contains "BASE_HOST=http://localhost:5560"
+    And it contains "PORT=5560"
+    And it contains "DATABASE_URL=postgresql://langwatch@localhost:6560/langwatch_db?schema=langwatch_db&connection_limit=5"
+    And it contains "CLICKHOUSE_URL=http://localhost:6562/langwatch"
+    And it contains "REDIS_URL=redis://localhost:6561/0"
+
+  Scenario: Re-running preserves existing secrets
+    Given "~/.langwatch/.env" exists with "NEXTAUTH_SECRET=existing_value_xyz"
+    When the CLI calls `runtime.scaffoldEnv(ctx)`
+    Then the call returns { written: false, path: "~/.langwatch/.env" }
+    And "~/.langwatch/.env" still contains "NEXTAUTH_SECRET=existing_value_xyz"
+    And no secret is regenerated
+
+  Scenario: User-provided OPENAI_API_KEY is propagated, not persisted
+    Given the user has "OPENAI_API_KEY=sk-real-key-123" in their shell env
+    When the CLI starts services
+    Then the langwatch_nlp child process has "OPENAI_API_KEY=sk-real-key-123" in its env
+    But "~/.langwatch/.env" contains an empty "OPENAI_API_KEY=" line, not the user's value
+
+  Scenario: Generated secrets are unique per install
+    Given two separate machines each run `npx @langwatch/server` for the first time
+    Then their "CREDENTIALS_SECRET" values differ
+    And their "LW_GATEWAY_INTERNAL_SECRET" values differ
+
+  # =========================================================================
+  # Service startup and health (the start order is 09-prebuilt-app.feature, "Starting")
+  # =========================================================================
+
+  @unit
+  Scenario: The backend runs the api and the worker as one process
+    When the CLI starts "langwatch"
+    Then it spawns apps/backend once, the api and the worker in one Node process, and no "workers" process
+    And the api listens on the internal backend port and the worker's health door on its own port slot
+    And "langwatch" is reported healthy once "/api/health" answers on the internal backend port
+    And when "/api/health" never answers, the backend is stopped and `runtime.startAll` fails
+
+  @unit
+  Scenario: The backend leaves migrations to the worker's upgrade
+    When the CLI starts "langwatch"
+    Then the backend's environment does not set SKIP_LWQL_PROVISION
+
+  @unit
+  Scenario: nlpgo and the ai-gateway run as one Go process when the binary has combined mode
+    Given the installed monobinary offers `service combined`
+    When the CLI starts the Go services
+    Then it spawns one "go" process running "combined nlpgo aigateway"
+    And nlpgo and the ai-gateway each listen on their own port, both pointed back at the app
+    And the Go services are reported healthy once both "/healthz" doors answer
+
+  @unit
+  Scenario: An older monobinary still gets nlpgo and the ai-gateway as two processes
+    Given the installed monobinary predates combined mode
+    When the CLI starts the Go services
+    Then nlpgo and the ai-gateway start as two processes, as before
+
+  @unit
+  Scenario: The ai-gateway sees the same environment as the other app-tier services
+    Given the user's shell carries "OPENAI_API_KEY"
+    When the CLI calls `runtime.startAll(ctx)`
+    Then "ai-gateway" receives the same environment as "langwatch"
+
+  # =========================================================================
+  # Logs + event stream
+  # =========================================================================
+
+  Scenario: Every service log lands in ~/.langwatch/logs and via the event stream
+    When services run for 30 seconds
+    Then "~/.langwatch/logs/postgres.log" is being written to
+    And "~/.langwatch/logs/langwatch.log" is being written to
+    And `runtime.events(ctx)` emits "log" events with "service" ∈ {postgres, redis, clickhouse, go, langevals, langwatch}
+    And the CLI renders each log line to TTY with a stable prefix+color (langwatch=green, go=cyan, langevals=magenta, gateway=yellow, the stores dim)
+
+  Scenario: A service that crashes after being healthy is restarted with backoff
+    Given all services are running
+    And "workers" already reported healthy
+    When the "workers" process is killed with exit code 137 under memory pressure
+    Then the supervisor schedules a restart instead of giving up
+    And `runtime.events(ctx)` emits { type: "restarting", service: "workers", code: 137, attempt: 1 }
+    And the CLI prints "workers exited (code 137), restarting in 1s (attempt 1/3)"
+    And no "crashed" event is emitted for that exit
+    And after the backoff delay a fresh "workers" process is spawned with a new pidfile
+    And the BullMQ queues get their consumer back without a manual restart
+
+  Scenario: Repeated crashes back off and the budget is bounded
+    Given "workers" already reported healthy
+    When its process dies again right after each restart
+    Then the supervisor waits 1s before attempt 1, 5s before attempt 2, and 15s before attempt 3
+    And no further restart is attempted after attempt 3
+
+  Scenario: Staying up repays the restart budget
+    Given "workers" was restarted after a crash
+    When the new process stays up for the steady-state window
+    Then the restart counter resets
+    And a later crash is retried from attempt 1 again
+
+  Scenario: A crashed service with no restart budget left emits "crashed" and the CLI tears down
+    Given all services are running
+    And "redis" has used up its restart budget
+    When "redis" exits with code 137 once more
+    Then `runtime.events(ctx)` emits { type: "crashed", service: "redis", code: 137 }
+    And the CLI prints "redis crashed (exit 137), see ~/.langwatch/logs/redis.log"
+    And the CLI calls `runtime.stopAll(handles)` to bring down everything else
+    And the CLI exits with code 1
+
+  Scenario: A service that dies during initial boot is not restarted
+    Given "clickhouse" never reported healthy
+    When its process exits during boot
+    Then no restart is attempted
+    And `runtime.events(ctx)` emits { type: "crashed", service: "clickhouse" }
+    And the boot fails fast naming the service, as before
+
+  Scenario: A service failing its health probe takes the already-started ones down with it
+    Given the app tier starts several services at once
+    When one of them never reports healthy
+    But its siblings started fine
+    Then the boot fails naming the unhealthy service
+    And every sibling that did start is stopped, none is left running
+    # A leaked sibling squats its port, so the NEXT run auto-shifts to a new
+    # slot and boots services the .env's URLs don't point at.
+
+  Scenario: Ctrl+C cleanly stops every service
+    Given all services are running
+    When the user sends SIGINT to the CLI process
+    Then `runtime.stopAll(handles)` is invoked
+    And every handle's `stop()` is called in reverse start order
+    And services that don't exit within 10 seconds receive SIGKILL
+    And "~/.langwatch/run/<service>.pid" files are removed
+    And the CLI exits with code 0
+
+  # =========================================================================
+  # Port-conflict handoff (smith handles detection; this verifies the runner honors it)
+  # =========================================================================
+
+  Scenario: Runner honors a shifted port-base passed by the predep installer
+    Given another process is already listening on 5560
+    And the predep installer resolves "port-base=5570" (services tier 5570..5577, infra tier 6570..6573)
+    When `runtime.startAll(ctx)` runs
+    Then "BASE_HOST" in the running app's env is "http://localhost:5570"
+    And the CLI's door binds 5570 and the backend binds its internal port 5576
+    And nlpgo binds 5571, langevals 5572, ai-gateway 5573
+    And postgres binds 6570, redis 6571, clickhouse-http 6572, clickhouse-native 6573
+    And the browser auto-open targets "http://localhost:5570"
+
+  Scenario: Explicit --port flag wins over auto-shift
+    When the user runs `npx @langwatch/server --port 6660`
+    Then port-base is 6660
+    And no auto-shift occurs even if 6660 is in use (instead, the CLI errors loudly)
+
+  Scenario: A run that lands on a different port slot updates the install's URLs
+    Given an install whose .env was scaffolded on the 5560 slot
+    And a stray process now holds one port of that slot
+    When the next run auto-shifts to 5570
+    Then the .env's service URLs point at the 5570 slot
+    And the CLI says which keys it updated
+    And the app reaches the data stores this run actually started
+
+  Scenario: A URL the user pointed elsewhere survives every port shift
+    Given the user replaced BASE_HOST with a LAN hostname in the .env
+    When a later run auto-shifts to a different port slot
+    Then BASE_HOST still carries the user's hostname
+    And only values still in their scaffolded localhost shape were updated
+
+  # =========================================================================
+  # Browser auto-open
+  # =========================================================================
+
+  Scenario Outline: Auto-open uses platform-correct command
+    Given the OS is "<os>"
+    When all services are healthy
+    Then the CLI executes "<open-cmd> http://localhost:5560"
+
+    Examples:
+      | os    | open-cmd  |
+      | macos | open      |
+      | linux | xdg-open  |
+
+  Scenario: --no-open suppresses the browser
+    When the user runs `npx @langwatch/server --no-open`
+    Then no browser is launched
+    And once the backend is healthy the CLI prints "langwatch is running at http://localhost:5560"
+
+  Scenario: CI env auto-suppresses the browser
+    Given the env var "CI=true" is set
+    When all services are healthy
+    Then no browser is launched
+
+  # =========================================================================
+  # LangEvals' uv environment (prepared while the rest of the stack starts)
+  # =========================================================================
+
+  @unit
+  Scenario: LangEvals' environment is reused while nothing it depends on changed
+    Given LangEvals' environment was built for the current lockfile and evaluator toggles
+    When the CLI starts again
+    Then "uv sync" is not run again
+
+  @unit
+  Scenario: A changed evaluator toggle rebuilds LangEvals' environment
+    Given LangEvals' environment was built without the PII detection evaluator
+    When the user turns that evaluator on and starts again
+    Then "uv sync" runs again with the PII detection extra
+
+  # =========================================================================
+  # Re-entrancy guard
+  # =========================================================================
+
+  Scenario: Second concurrent invocation refuses to start
+    Given a `npx @langwatch/server` is already running with pid 5555
+    And "~/.langwatch/run/langwatch.pid" contains "5555"
+    When a second `npx @langwatch/server` is invoked
+    Then it prints "LangWatch is already running (pid 5555). Stop it with Ctrl+C in that terminal, or run `npx @langwatch/server doctor` to inspect."
+    And it exits with code 1

@@ -1,0 +1,84 @@
+# size-dev.yaml — Local development / small team. Chart-managed deps.
+#
+# Workers enabled, reasonable resources for a laptop or small cloud instance.
+#
+# Usage:
+#   helm install lw . \
+#     -f examples/overlays/size-dev.yaml \
+#     -f examples/overlays/access-nodeport.yaml \
+#     --set autogen.enabled=true
+
+app:
+  replicaCount: 1
+  resources:
+    requests: { cpu: 250m, memory: 1Gi }
+    limits: { cpu: 1, memory: 3Gi }
+
+workers:
+  enabled: true
+  replicaCount: 1
+  # Same image as the app: needs ~2Gi to cold-load via tsx without OOM-restarts.
+  resources:
+    requests: { cpu: 250m, memory: 768Mi }
+    limits: { cpu: 1, memory: 2Gi }
+
+langwatch_nlp:
+  replicaCount: 1
+  resources:
+    requests: { cpu: 100m, memory: 512Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+
+langevals:
+  replicaCount: 1
+  # One worker holding every local model needs ~2.6Gi. The limit is a ceiling,
+  # not a reservation, so it costs nothing until an evaluator loads a model.
+  resources:
+    requests: { cpu: 100m, memory: 768Mi }
+    limits: { cpu: 500m, memory: 4Gi }
+  extraEnvs:
+    - { name: DISABLE_EVALUATORS_PRELOAD, value: "true" }
+
+clickhouse:
+  chartManaged: true
+  replicas: 1
+  # 2Gi handles light dev ingest. Memory scales with ingest burst size and
+  # background merges, so raise clickhouse.memory if you replay real volume.
+  memory: 2Gi
+  cpu: 1
+  storage:
+    size: 5Gi
+
+postgresql:
+  chartManaged: true
+  auth:
+    database: "langwatch"
+  primary:
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 512Mi }
+
+redis:
+  chartManaged: true
+  master:
+    persistence:
+      size: 1Gi
+    resources:
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 250m, memory: 256Mi }
+
+prometheus:
+  chartManaged: true
+  server:
+    replicaCount: 1
+    retention: 7d
+    persistentVolume:
+      enabled: true
+      size: 2Gi
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 250m, memory: 512Mi }
+
+cronjobs:
+  enabled: false

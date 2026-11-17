@@ -1,0 +1,42 @@
+**/node_modules
+**/.next
+**/.next-saas
+.ipynb_checkpoints
+.pytest_cache
+.venv
+*.generated.*
+!services/langevals/ts-integration/evaluators.generated.ts
+.DS_Store
+.github
+.env
+**/.env
+# Every dotenv sibling, not just `.env` itself. A dev machine can hold any
+# number of them (`.env.local`, an `.env.portless` an older haven left behind),
+# and a copy inside the build context would bake a dev stack's values —
+# retention default, admin password, access tokens — into the image and let them
+# win over whatever the deployment configured.
+.env.*
+**/.env.*
+# `.env.example` is tracked documentation with no secrets in it.
+!.env.example
+!**/.env.example
+**/.venv
+
+dist
+# Host-built binaries (.bin/<name>/<name>). A macOS build of haven or the langy
+# worker is both useless in a Linux image and tens of megabytes of build
+# context; the image builds its own with an explicit --outfile.
+.bin
+sdks/python/dist
+sdks/python/.ipynb_checkpoints
+sdks/python/.pytest_cache
+sdks/python/.chainlit
+sdks/python/.files
+sdks/python/examples
+# Local worktrees and agent scratch: never build context.
+.worktrees
+.claude
+
+# Nx cache and workspace data are machine-local
+.nx
+**/.nx

@@ -1,0 +1,73 @@
+---
+title: Third-Party Integrations
+description: "Configure email, analytics, and external services for LangWatch"
+---
+
+LangWatch integrates with several third-party services for notifications, storage, and evaluation capabilities.
+
+## Email
+
+Email carries alert notifications, scheduled reports, team invitations, usage warnings and password reset links. LangWatch sends through SMTP, AWS SES, SendGrid or Resend.
+
+See [Email](/self-hosting/configuration/email) for choosing a gateway, the settings each one takes, and sending through an outbound proxy.
+
+## Usage Analytics
+
+LangWatch collects anonymous usage analytics by default to help improve the product. No trace data or PII is collected.
+
+### Disable Telemetry
+
+```yaml
+app:
+  telemetry:
+    usage:
+      enabled: false
+```
+
+Or via environment variable:
+
+| Variable              | Description                                        |
+| --------------------- | -------------------------------------------------- |
+| `DISABLE_USAGE_STATS` | Set to `true` to disable anonymous usage analytics |
+
+## LLM Providers for Evaluations
+
+LangWatch evaluators use external LLM providers for model-based evaluations (LLM-as-a-Judge, safety checks, etc.). Configure these if you want to use built-in evaluators.
+
+### Azure OpenAI
+
+Configure Azure OpenAI for evaluators in **Settings > Model Providers**. The Helm chart has no value for it.
+
+### Google Cloud DLP
+
+Used for PII redaction of incoming traces.
+
+```yaml
+app:
+  evaluators:
+    google:
+      enabled: true
+      credentials:
+        secretKeyRef: { name: langwatch-evaluators, key: googleCredentials }
+```
+
+| Variable                         | Description                                                                                                                                                                      |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GOOGLE_APPLICATION_CREDENTIALS` | The contents of a Google service account JSON key (the JSON itself, not a file path), with a `project_id`. Set on the app and workers when `app.evaluators.google.enabled` is on |
+
+<Note>
+  You don't need to configure evaluator providers to use LangWatch. They're only required if you
+  want to use built-in evaluators that rely on specific LLM providers. You can always configure your
+  own LLM provider API keys in the LangWatch UI for evaluations.
+</Note>
+
+## Slack
+
+LangWatch can send notifications to Slack channels via webhooks for alerts and automations. This is configured in the LangWatch UI under **Automations**, not via environment variables.
+
+## S3, Object Storage
+
+Used for dataset storage and ClickHouse cold storage/backups. See:
+
+- [Backups](/self-hosting/configuration/backups) for ClickHouse cold storage and backup configuration
+- [Environment Variables](/self-hosting/configuration/environment-variables#object-storage-s3) for S3 configuration reference

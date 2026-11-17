@@ -1,0 +1,75 @@
+import chalk from "chalk";
+
+import { WebhooksApiService } from "@/client-sdk/services/webhooks/webhooks-api.service";
+
+import { checkOrgApiKey } from "../../utils/apiKey";
+import { formatTable } from "../../utils/formatting";
+import type { CommandResult } from "../../utils/output";
+import { createSpinner } from "../../utils/spinner";
+import { failSpinner } from "../../utils/spinnerError";
+
+/**
+ * The most recent delivery attempts for one endpoint, one page at a time.
+ * The log has no bound worth printing, so `--limit` is the page size and
+ * `--cursor` walks backwards instead of the command collecting it all.
+ */
+export const webhookDeliveriesCommand = async (
+  id: string,
+  options: { cursor?: string; limit?: string },
+): Promise<CommandResult | void> => {
+  const apiKey = checkOrgApiKey();
+  const service = new WebhooksApiService({ apiKey });
+  const spinner = createSpinner("Fetching delivery log...").start();
+  try {
+    const page = await service.deliveriesPage(id, {
+      cursor: options.cursor,
+      limit: options.limit !== undefined ? Number(options.limit) : undefined,
+    });
+    const deliveries = page.data;
+    spinner.succeed(
+      `${deliveries.length} attempt${deliveries.length !== 1 ? "s" : ""}${page.next_cursor ? " (more available)" : ""}`,
+    );
+    return {
+      data: page,
+      table: () => {
+        if (deliveries.length === 0) {
+          console.log();
+          console.log(chalk.gray("No deliveries recorded yet."));
+          return;
+        }
+        console.log();
+        formatTable({
+          data: deliveries.map((d) => ({
+            "Fired at": new Date(d.fired_at).toLocaleString(),
+            Attempt: String(d.attempt),
+            Events: String(d.event_count),
+            Outcome: deliveryOutcome(d.outcome),
+            Status: d.response_status !== null ? String(d.response_status) : chalk.gray("-"),
+            "Latency ms": d.latency_ms !== null ? String(d.latency_ms) : chalk.gray("-"),
+            Error: deliveryError(d.error),
+          })),
+          headers: ["Fired at", "Attempt", "Events", "Outcome", "Status", "Latency ms", "Error"],
+        });
+        if (page.next_cursor) {
+          console.log();
+          console.log(chalk.gray(`Next page: --cursor '${page.next_cursor}'`));
+        }
+        console.log();
+      },
+    };
+  } catch (error) {
+    failSpinner({ spinner, error, action: "fetch webhook deliveries" });
+    process.exit(1);
+  }
+};
+
+function deliveryOutcome(outcome: string): string {
+  if (outcome === "success") return chalk.green(outcome);
+  if (outcome === "retryable") return chalk.yellow(outcome);
+  return chalk.red(outcome);
+}
+
+function deliveryError(error: string | null): string {
+  if (!error) return "";
+  return error.length > 40 ? `${error.slice(0, 37)}...` : error;
+}

@@ -1,0 +1,64 @@
+import chalk from "chalk";
+
+import { ScenariosApiService } from "@/client-sdk/services/scenarios";
+import type { ScenarioResponse } from "@/client-sdk/services/scenarios";
+
+import { resolveCredentials } from "../../utils/apiKey";
+import type { CommandResult } from "../../utils/output";
+import { createSpinner } from "../../utils/spinner";
+import { failSpinner } from "../../utils/spinnerError";
+import { resolveScenarioOrExit } from "./resolveScenario";
+
+const formatScenarioDetails = (scenario: ScenarioResponse): void => {
+  console.log();
+  console.log(chalk.bold.cyan(scenario.name));
+  console.log(chalk.gray("─".repeat(40)));
+
+  console.log(`  ${chalk.gray("ID:")}        ${scenario.id}`);
+
+  if (scenario.labels.length > 0) {
+    console.log(
+      `  ${chalk.gray("Labels:")}    ${scenario.labels.map((l) => chalk.yellow(l)).join(", ")}`,
+    );
+  }
+
+  console.log();
+  console.log(chalk.bold("  Situation:"));
+  console.log(`    ${scenario.situation}`);
+
+  if (scenario.criteria.length > 0) {
+    console.log();
+    console.log(chalk.bold("  Criteria:"));
+    scenario.criteria.forEach((criterion) => {
+      console.log(`    ${chalk.green("•")} ${criterion}`);
+    });
+  }
+
+  if (scenario.platformUrl) {
+    console.log(`  ${chalk.bold("View:")}  ${chalk.underline(scenario.platformUrl)}`);
+  }
+
+  console.log();
+};
+
+/** Reads one scenario, named by its id or by its name. */
+export const getScenarioCommand = async (reference: string): Promise<CommandResult | void> => {
+  await resolveCredentials();
+
+  const service = new ScenariosApiService();
+  const spinner = createSpinner(`Fetching scenario "${reference}"...`).start();
+
+  try {
+    const scenario = await resolveScenarioOrExit({ reference, service });
+    spinner.succeed(`Found scenario "${scenario.name}"`);
+    return {
+      data: scenario,
+      table: () => {
+        formatScenarioDetails(scenario);
+      },
+    };
+  } catch (error) {
+    failSpinner({ spinner, error, action: "fetch scenario" });
+    process.exit(1);
+  }
+};

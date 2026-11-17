@@ -1,0 +1,94 @@
+Feature: Reduced server memory footprint
+  As a developer running LangWatch locally
+  I want every server process to load only the modules it actually needs
+  So that a laptop juggling several worktrees isn't holding megabytes of
+     browser UI, cloud SDKs and unused instrumentation it will never call
+
+  # Profiling on 2026-07-21 (Node 24, tsx runtime) measured what a server
+  # process actually resident holds. Three things dominated and none of them
+  # were load-bearing: the entire browser UI stack, the Google DLP cloud SDK,
+  # and the ~41-package OTel auto-instrumentation bundle. Each is addressed
+  # below.
+  #
+  # The process TOPOLOGY — one Node process or two — is a separate concern,
+  # specified in specs/setup/dev-process-topology.feature and decided in
+  # dev/docs/adr/004-docker-dev-environment.md. This feature is about what a
+  # process loads, not how many of them run.
+
+  # Two heavy, rarely-needed dependencies are kept out of the boot graph by
+  # config, not loaded eagerly. @google-cloud/dlp (generated protos via
+  # google-gax/grpc — one of the largest single deps) only loads when a
+  # google_dlp PII check actually runs, and never when opted out. The OTel
+  # instrumentation packages only load when observability is configured, and
+  # then only the handful we actually use (not the ~41-package auto bundle).
+
+  @unit
+  Scenario: Google DLP loads its cloud SDK only when enabled and used
+    Given a project with no google_dlp PII check running
+    When the server boots
+    Then the @google-cloud/dlp SDK is not loaded in the process
+    When LANGWATCH_DISABLE_GOOGLE_DLP is set and a google_dlp check is requested
+    Then the check is refused and the SDK is still never loaded
+
+  # Locally, DLP is off unless a developer deliberately turns it back on: no local
+  # workflow should ship trace text to Google, and the opt-out also keeps the SDK
+  # out of the process. It stays a default, not a lock — haven emits nothing when
+  # the developer opts back in, leaving .env to govern.
+  @unit
+  Scenario: Local dev opts out of Google DLP by default
+    Given a developer starts a stack with haven
+    When a google_dlp PII check is requested
+    Then the check is refused, so no trace text leaves for Google
+    And the @google-cloud/dlp SDK never loads, even with credentials present
+    When the developer opts back in to running DLP locally
+    Then their own configuration governs the check again
+
+  @unimplemented
+  Scenario: OTel instrumentation loads only when observability is configured
+    Given neither an OTLP endpoint nor a LangWatch API key is set
+    When the server or workers boot
+    Then no OpenTelemetry instrumentation package is loaded
+    When an OTLP endpoint is configured
+    Then only the aws-sdk, openai, pino, runtime-node, and ioredis instrumentations load
+    And no instrumentation for frameworks the server doesn't run (express, koa, pg, grpc) is loaded
+    And ioredis statements are still truncated to command plus first key, requiring a parent span
+
+  # Every backend process was also holding the entire browser UI stack. A single
+  # import edge caused it: `evaluations-legacy.ts` pulled a display-name constant
+  # out of a React component, and that one edge dragged in Chakra UI, Ark UI,
+  # Emotion, react-dom and react-router — ~1,320 modules of browser-only code
+  # resident in the API, worker, and ingestion processes alike. Constants shared
+  # by the API and the UI belong beside the evaluator catalog both already
+  # import, not inside a component.
+
+  @unimplemented
+  Scenario: The backend never loads the browser UI stack
+    Given the server boots its app-layer, API router, and tRPC root
+    When the loaded module graph is inspected
+    Then no Chakra UI, Ark UI, Emotion, react-dom or react-router module is resident
+    And evaluator display names still resolve for legacy evaluation responses
+
+  # The guard walks from the API and worker entrypoints, every composition
+  # module they wire, and every server package's sources. It lives in
+  # packages/architecture-enforcer/tests/frontend-boundary.unit.test.ts — the
+  # platform application that used to host it is gone, and the boundary it
+  # describes outlived it.
+  @unit
+  Scenario: Server code cannot reach browser-only UI, even transitively
+    Given a module a backend process loads at boot
+    When it imports a UI toolkit, or a component that imports one
+    Then the boundary guard fails and names the offending import chain
+    But a type-only import of a component's types is allowed, since types are erased
+    And the mail package may use React, since its templates are React-rendered
+
+  # A separate refusal from the one above, and a stricter one. A module in a
+  # browser package that looks framework-free today acquires a React edge the
+  # next time somebody edits it, and nothing in that review would say a backend
+  # process is downstream. So the tree is the boundary, not the toolkit.
+  @unit
+  Scenario: Backend code never imports a module out of a browser package
+    Given a browser package built for the UI
+    When backend code imports one of its modules for a value
+    Then the boundary guard fails and names the chain to that module
+    And it refuses even when the module imports no browser toolkit itself
+    But naming one of its types stays allowed, since types are erased

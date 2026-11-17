@@ -1,0 +1,146 @@
+---
+title: Scaling
+description: Replicas, autoscaling, resource sizing and per-pod caches for the LangWatch AI Gateway.
+sidebarTitle: Scaling
+---
+
+The gateway holds no shared state, so you scale it by adding replicas. Every pod can serve every virtual key, and there is no sticky-session requirement. Request time is dominated by the provider round trip; the gateway's own work before dispatch takes microseconds.
+
+Each pod caches the virtual keys it has resolved in its own memory. Pods never share that cache, and none of them warms it on boot.
+
+## Replicas
+
+The chart runs two replicas by default and keeps one available during a voluntary disruption:
+
+```yaml
+gateway:
+  replicaCount: 2
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+```
+
+Run three replicas in production. Three tolerates one pod leaving in a rolling deploy plus one node drain, and still serves. Raise `minAvailable` to 2 alongside it if you want the same margin during a node pool rotation.
+
+The Deployment rolls with `maxSurge: 1` and `maxUnavailable: 0`, so a rollout adds a pod before it takes one away.
+
+## Autoscaling
+
+The chart ships a Horizontal Pod Autoscaler on CPU, plus an optional custom metric:
+
+```yaml
+gateway:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    customMetrics:
+      - type: Pods
+        pods:
+          metric:
+            name: lw_gateway_rps
+          target:
+            type: AverageValue
+            averageValue: "150"
+    behavior: {}
+```
+
+Start with CPU alone. It needs no Prometheus and it cannot create a loop between the metrics pipeline and the autoscaler.
+
+Add `lw_gateway_rps` only when you run prometheus-adapter and it scrapes the gateway's metrics listener (port `9464`, bearer `METRICS_API_KEY`). Without the adapter the HPA ignores that line. `kubectl describe hpa langwatch-gateway` reports the metric as not active when the adapter is missing.
+
+Use `behavior` for scale-up and scale-down stabilization when the traffic shape needs it. It is passed to the HPA as written.
+
+<Note>
+  Every replica polls the control plane's change feed on its own, so the poll rate against the
+  control plane grows with the replica count. Watch the control plane once you pass a few dozen
+  replicas.
+</Note>
+
+## Topology spread
+
+Spread the replicas across zones through the chart's `affinity` value, or by setting `topologySpreadConstraints` on the Deployment with a values override:
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: langwatch-gateway
+```
+
+Three replicas across three zones survive a zone outage. Six replicas keep two per zone.
+
+## Resource sizing
+
+Chart defaults:
+
+```yaml
+gateway:
+  resources:
+    requests:
+      cpu: 200m
+      memory: 256Mi
+    limits:
+      cpu: 1
+      memory: 512Mi
+```
+
+The key cache holds up to 10,000 resolved keys per pod, which is a small share of that memory. The rest is the Go runtime plus the request bodies in flight, so raise the memory limit when your callers send large payloads rather than when your key count grows.
+
+Keep the CPU limit well above the request. Each open stream holds a goroutine, so a tight limit stretches tail latency under streaming load. The default ratio of `200m` to `1` is a good starting point.
+
+The spend spool writes to the pod's `/tmp` emptyDir, sized by `scratchSizeLimit` (default `1Gi`) and capped at 64 MiB by the gateway itself.
+
+## Cache sizes
+
+The key cache is fixed at 10,000 entries per pod and is not configurable. Past that the least recently used key is evicted and its next request costs one round trip to the control plane.
+
+What you can tune is how long a cached key survives without the control plane, and how often its configuration is re-read:
+
+| Variable                                   | Default | Effect                                                                      |
+| ------------------------------------------ | ------- | --------------------------------------------------------------------------- |
+| `LW_GATEWAY_AUTH_CACHE_CONFIG_TTL_SECONDS` | `60`    | Age at which a cached key's configuration is re-fetched in the background   |
+| `LW_GATEWAY_AUTH_CACHE_SOFT_BUMP_SECONDS`  | `300`   | Extension granted per failed refresh while the control plane is unreachable |
+| `LW_GATEWAY_AUTH_CACHE_HARD_GRACE_SECONDS` | `21600` | Cap on serving a key past its token expiry                                  |
+
+Add them to the pod yourself; the chart does not render them. See [Config](/ai-gateway/self-hosting/config#auth-cache).
+
+Watch the hit rate to tell whether the cache is doing its job:
+
+```promql
+sum(rate(gateway_auth_cache_hits_total{tier="l1"}[5m]))
+  / sum(rate(gateway_auth_cache_lookups_total[5m]))
+```
+
+A sustained drop means every miss is paying for a control-plane round trip. Deploy churn and key counts above the cache size are the two causes.
+
+## Cold pods
+
+A new pod resolves each virtual key from the control plane the first time it sees that key. Expect one extra round trip per key after a scale-up and after every rolling deploy. There is no boot-time warm-up to wait for, which is why `/startupz` reports ready before the first request arrives.
+
+## Blue-green and canary
+
+Every pod signs and verifies with the same `LW_GATEWAY_JWT_SECRET`, so a token minted for one pod verifies on all of them. That makes a second colour straightforward:
+
+1. Deploy the new release with its own Service, behind a fraction of the load balancer's traffic.
+2. Check `/readyz` and send one completion with a test virtual key.
+3. Shift the load balancer weights.
+4. Drain the old colour.
+
+Roll the same `LW_GATEWAY_JWT_SECRET` and `LW_GATEWAY_INTERNAL_SECRET` onto both colours. To change the JWT secret itself, use the dual-secret procedure on [Helm chart](/ai-gateway/self-hosting/helm#rotate-the-jwt-secret-without-downtime).
+
+## Regional placement
+
+Put the gateway in the region that holds your control plane, so a cache miss pays a short round trip, and close to the provider endpoints you call most.
+
+For several regions, run an independent fleet per region with its own autoscaler. The gateway keeps no cross-region state, and the control plane is the source of truth for all of them.
+
+## See also
+
+- [Health checks](/ai-gateway/self-hosting/health-checks): probe behaviour and the drain sequence.
+- [Config](/ai-gateway/self-hosting/config): every environment variable and its default.
+- [Troubleshooting](/ai-gateway/troubleshooting): 502s during a rollout, cold-pod latency, cache staleness.

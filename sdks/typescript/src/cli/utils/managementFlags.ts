@@ -1,0 +1,323 @@
+/**
+ * The flag grammar the management commands share: one colon-separated shape per concept,
+ * repeated per flag, since a single `--flag value` can't carry a resource+action permission
+ * or a role+scope binding. Every parser refuses a malformed value by naming the expected shape.
+ */
+import {
+  MANAGEMENT_ROLES,
+  MANAGEMENT_SCOPE_TYPES,
+  ORGANIZATION_ROLES,
+  type ManagementBindingInput,
+  type ManagementRole,
+  type ManagementScopeType,
+  type OrganizationRole,
+} from "@/client-sdk/services/_shared/management-types";
+import {
+  GRANT_SCOPE_TYPES,
+  GRANT_STATUSES,
+  type GrantPrincipalType,
+  type GrantScopeType,
+  type GrantStatus,
+  type ListGrantsOptions,
+} from "@/client-sdk/services/grants/grants-api.service";
+import type { ListRoleBindingsOptions } from "@/client-sdk/services/role-bindings/role-bindings-api.service";
+
+/** A flag value the CLI refuses before it ever reaches the platform. */
+export class ManagementFlagError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ManagementFlagError";
+  }
+}
+
+/** The tail of every "Expected one of ..." refusal. */
+export const oneOf = (values: readonly string[]): string => values.join(", ");
+
+/**
+ * A non-negative integer flag, refused by name rather than sent as NaN.
+ * Matched as plain decimal digits, not `Number` (reads "" as 0, "0x10" as
+ * 16). Past 2^53 a decimal string can round wrong, so `isSafeInteger` guards too.
+ */
+export const parseCount = ({ value, flag }: { value: string; flag: string }): number => {
+  const trimmed = value.trim();
+  const count = Number(trimmed);
+  if (!/^\d+$/.test(trimmed)) {
+    throw new ManagementFlagError(`Invalid ${flag} "${value}". Expected a whole number.`);
+  }
+  if (!Number.isSafeInteger(count)) {
+    throw new ManagementFlagError(`Invalid ${flag} "${value}". Expected a whole number.`);
+  }
+  return count;
+};
+
+/**
+ * `resource:action`, repeated. The set keeps the order the flags were given so
+ * a caller can read their own command back off the request, and a repeated
+ * pair collapses rather than being sent twice.
+ */
+export const parsePermissionFlags = (values: string[] = []): string[] => {
+  const permissions: string[] = [];
+  for (const value of values) {
+    const parts = value.split(":");
+    if (parts.length !== 2) {
+      throw new ManagementFlagError(
+        `Invalid permission "${value}". Expected resource:action, for example project:view.`,
+      );
+    }
+    if (!parts[0]?.trim()) {
+      throw new ManagementFlagError(
+        `Invalid permission "${value}". Expected resource:action, for example project:view.`,
+      );
+    }
+    if (!parts[1]?.trim()) {
+      throw new ManagementFlagError(
+        `Invalid permission "${value}". Expected resource:action, for example project:view.`,
+      );
+    }
+    const permission = `${parts[0].trim()}:${parts[1].trim()}`;
+    if (!permissions.includes(permission)) permissions.push(permission);
+  }
+  return permissions;
+};
+
+/**
+ * A role read out of a compound value, where `source` names which of the
+ * several roles one command can carry was the wrong one.
+ */
+export const parseRoleIn = ({
+  value,
+  source,
+}: {
+  value: string;
+  source: string;
+}): ManagementRole => {
+  const role = value.trim().toUpperCase();
+  if (!(MANAGEMENT_ROLES as readonly string[]).includes(role)) {
+    throw new ManagementFlagError(
+      `Invalid role "${value}" in ${source}. Expected one of ${oneOf(MANAGEMENT_ROLES)}.`,
+    );
+  }
+  return role as ManagementRole;
+};
+
+const assertScopeType = ({
+  value,
+  source,
+}: {
+  value: string;
+  source: string;
+}): ManagementScopeType => {
+  const scopeType = value.trim().toUpperCase();
+  if (!(MANAGEMENT_SCOPE_TYPES as readonly string[]).includes(scopeType)) {
+    throw new ManagementFlagError(
+      `Invalid scope type "${value}" in ${source}. Expected one of ${oneOf(MANAGEMENT_SCOPE_TYPES)}.`,
+    );
+  }
+  return scopeType as ManagementScopeType;
+};
+
+/** The organization role a member or an invite holds. */
+export const parseOrganizationRole = (value: string): OrganizationRole => {
+  const role = value.trim().toUpperCase();
+  if (!(ORGANIZATION_ROLES as readonly string[]).includes(role)) {
+    throw new ManagementFlagError(
+      `Invalid organization role "${value}". Expected one of ${oneOf(ORGANIZATION_ROLES)}.`,
+    );
+  }
+  return role as OrganizationRole;
+};
+
+/** A role a binding grants, given on its own flag. */
+export const parseRole = (value: string): ManagementRole =>
+  parseRoleIn({ value, source: "--role" });
+
+/** A scope type given on its own flag. */
+export const parseScopeType = (value: string): ManagementScopeType =>
+  assertScopeType({ value, source: "--scope-type" });
+
+/**
+ * `role:scopeType:scopeId`, repeated: what an API key may do, and where.
+ * Scope ids never contain a colon, so the three parts are unambiguous.
+ */
+export const parseBindingFlags = (values: string[] = []): ManagementBindingInput[] =>
+  values.map((value) => {
+    const parts = value.split(":");
+    if (parts.length !== 3) {
+      throw new ManagementFlagError(
+        `Invalid binding "${value}". Expected role:scopeType:scopeId, for example ADMIN:PROJECT:project_abc.`,
+      );
+    }
+    let hasEmptyPart = false;
+    for (const part of parts) {
+      if (!part.trim()) {
+        hasEmptyPart = true;
+        break;
+      }
+    }
+    if (hasEmptyPart) {
+      throw new ManagementFlagError(
+        `Invalid binding "${value}". Expected role:scopeType:scopeId, for example ADMIN:PROJECT:project_abc.`,
+      );
+    }
+    return {
+      role: parseRoleIn({ value: parts[0]!, source: `binding "${value}"` }),
+      scopeType: assertScopeType({
+        value: parts[1]!,
+        source: `binding "${value}"`,
+      }),
+      scopeId: parts[2]!.trim(),
+    };
+  });
+
+export interface RoleBindingFilterFlags {
+  principalType?: string;
+  principalId?: string;
+  scopeType?: string;
+  scopeId?: string;
+  offset?: string;
+  limit?: string;
+}
+
+/** The principal kinds `role-bindings list` and `create` accept. */
+export const ROLE_BINDING_PRINCIPAL_FLAGS = ["user", "group", "api-key"] as const;
+
+export type RoleBindingPrincipalFlag = (typeof ROLE_BINDING_PRINCIPAL_FLAGS)[number];
+
+/** The request field a principal type names. */
+const PRINCIPAL_FIELD = {
+  user: "userId",
+  group: "groupId",
+  "api-key": "apiKeyId",
+} as const satisfies Record<RoleBindingPrincipalFlag, string>;
+
+export const parsePrincipalType = (value: string): RoleBindingPrincipalFlag => {
+  const principalType = value.trim().toLowerCase();
+  if (!(ROLE_BINDING_PRINCIPAL_FLAGS as readonly string[]).includes(principalType)) {
+    throw new ManagementFlagError(
+      `Invalid principal type "${value}". Expected one of ${oneOf(ROLE_BINDING_PRINCIPAL_FLAGS)}.`,
+    );
+  }
+  return principalType as RoleBindingPrincipalFlag;
+};
+
+/**
+ * The filters a role-bindings listing sends. A filter the caller did not
+ * give is ABSENT, never present and empty: an empty string filter matches
+ * nothing, turning "no filter" into "no results".
+ */
+export const composeRoleBindingFilters = (
+  flags: RoleBindingFilterFlags,
+): ListRoleBindingsOptions => {
+  const filters: ListRoleBindingsOptions = {};
+
+  if (flags.principalId !== undefined) {
+    if (flags.principalType === undefined) {
+      throw new ManagementFlagError(
+        `--principal-id needs --principal-type to say what it names. Expected one of ${oneOf(ROLE_BINDING_PRINCIPAL_FLAGS)}.`,
+      );
+    }
+    filters[PRINCIPAL_FIELD[parsePrincipalType(flags.principalType)]] = flags.principalId;
+  } else if (flags.principalType !== undefined) {
+    throw new ManagementFlagError(
+      "--principal-type needs --principal-id to say which principal it names.",
+    );
+  }
+  if (flags.scopeType !== undefined) {
+    filters.scopeType = parseScopeType(flags.scopeType);
+  }
+  if (flags.scopeId !== undefined) filters.scopeId = flags.scopeId;
+  if (flags.offset !== undefined) {
+    filters.offset = parseCount({ value: flags.offset, flag: "--offset" });
+  }
+  if (flags.limit !== undefined) {
+    filters.limit = parseCount({ value: flags.limit, flag: "--limit" });
+  }
+
+  return filters;
+};
+
+/** The principal half of a role-binding create, as one request field. */
+export const composeRoleBindingPrincipal = ({
+  principalType,
+  principalId,
+}: {
+  principalType: string;
+  principalId: string;
+}): Record<string, string> => ({
+  [PRINCIPAL_FIELD[parsePrincipalType(principalType)]]: principalId,
+});
+
+/** The permission modes `api-keys create` and `update` accept on the wire. */
+export const API_KEY_PERMISSION_MODE_FLAGS = ["all", "readonly", "restricted"] as const;
+
+export type ApiKeyPermissionModeFlag = (typeof API_KEY_PERMISSION_MODE_FLAGS)[number];
+
+export const parsePermissionMode = (value: string): ApiKeyPermissionModeFlag => {
+  const mode = value.trim().toLowerCase();
+  if (!(API_KEY_PERMISSION_MODE_FLAGS as readonly string[]).includes(mode)) {
+    throw new ManagementFlagError(
+      `Invalid permission mode "${value}". Expected one of ${oneOf(API_KEY_PERMISSION_MODE_FLAGS)}.`,
+    );
+  }
+  return mode as ApiKeyPermissionModeFlag;
+};
+
+/** The wire word each `--principal-type` spelling names on `/api/v1/grants`. */
+const GRANT_PRINCIPAL_BY_FLAG = {
+  user: "user",
+  group: "group",
+  "api-key": "apiKey",
+} as const satisfies Record<RoleBindingPrincipalFlag, GrantPrincipalType>;
+
+export const parseGrantPrincipalType = (value: string): GrantPrincipalType =>
+  GRANT_PRINCIPAL_BY_FLAG[parsePrincipalType(value)];
+
+/** Case-insensitive, sent lowercase as the grants family spells it. */
+export const parseGrantScopeType = (value: string): GrantScopeType => {
+  const scopeType = GRANT_SCOPE_TYPES.find((type) => type === value.trim().toLowerCase());
+  if (!scopeType) {
+    throw new ManagementFlagError(
+      `Invalid scope type "${value}" in --scope-type. Expected one of ${oneOf(GRANT_SCOPE_TYPES)}.`,
+    );
+  }
+  return scopeType;
+};
+
+const parseGrantStatus = (value: string): GrantStatus => {
+  const status = GRANT_STATUSES.find((candidate) => candidate === value.trim().toLowerCase());
+  if (!status) {
+    throw new ManagementFlagError(
+      `Invalid status "${value}". Expected one of ${oneOf(GRANT_STATUSES)}.`,
+    );
+  }
+  return status;
+};
+
+export interface GrantFilterFlags {
+  principalType?: string;
+  principalId?: string;
+  role?: string;
+  scopeType?: string;
+  scopeId?: string;
+  status?: string;
+  limit?: string;
+  cursor?: string;
+}
+
+/** The filters a grants listing sends; a filter not given is absent, never empty. */
+export const composeGrantFilters = (flags: GrantFilterFlags): ListGrantsOptions => {
+  const filters: ListGrantsOptions = {};
+  if (flags.principalType !== undefined) {
+    filters.principalType = parseGrantPrincipalType(flags.principalType);
+  }
+  if (flags.principalId !== undefined) filters.principalId = flags.principalId;
+  if (flags.role !== undefined) filters.roleId = flags.role;
+  if (flags.scopeType !== undefined) filters.scopeType = parseGrantScopeType(flags.scopeType);
+  if (flags.scopeId !== undefined) filters.scopeId = flags.scopeId;
+  if (flags.status !== undefined) filters.status = parseGrantStatus(flags.status);
+  if (flags.limit !== undefined) {
+    filters.limit = parseCount({ value: flags.limit, flag: "--limit" });
+  }
+  if (flags.cursor !== undefined) filters.cursor = flags.cursor;
+  return filters;
+};

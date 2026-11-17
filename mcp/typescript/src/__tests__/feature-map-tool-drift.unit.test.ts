@@ -1,0 +1,73 @@
+// Drift guard: the feature-map.json names must match actual MCP tool names or agents will call
+// non-existent tools. See .claude/skills/feature-map/SKILL.md
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+const REPO_ROOT = join(__dirname, "../../../..");
+
+/**
+ * Every tool name the feature map hands to an agent, from any depth: `mcp`
+ * arrays hang off surfaces nested several levels into the tree.
+ */
+function toolNamesInFeatureMap(): Set<string> {
+  const map: unknown = JSON.parse(readFileSync(join(REPO_ROOT, "feature-map.json"), "utf-8"));
+  const names = new Set<string>();
+
+  const walk = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (node === null || typeof node !== "object") return;
+
+    const entry = node as Record<string, unknown>;
+    if (Array.isArray(entry.mcp)) {
+      for (const name of entry.mcp) {
+        if (typeof name === "string") names.add(name);
+      }
+    }
+    for (const value of Object.values(entry)) walk(value);
+  };
+
+  walk(map);
+  return names;
+}
+
+/**
+ * Every name passed as the first argument of a `server.tool(`
+ * registration, read from source: building a server needs config
+ * and credentials this test has no business holding.
+ */
+function registeredToolNames(): Set<string> {
+  const source = readFileSync(join(__dirname, "../create-mcp-server.ts"), "utf-8");
+  const names = new Set<string>();
+  for (const match of source.matchAll(/server\.tool\(\s*"([^"]+)"/g)) {
+    names.add(match[1]!);
+  }
+  return names;
+}
+
+describe("feature map MCP tool names", () => {
+  describe("given the tools this server registers", () => {
+    it("names only tools that exist", () => {
+      const registered = registeredToolNames();
+      const missing = [...toolNamesInFeatureMap()]
+        .filter((name) => !registered.has(name))
+        .toSorted();
+
+      // Listed, not registered: an agent following the map calls a tool that
+      // is not there. Either rename the entry, or register the tool.
+      expect(missing).toEqual([]);
+    });
+
+    it("finds the registrations it is reading", () => {
+      // A regex that silently matched nothing would make the check above pass
+      // for the wrong reason.
+      const registered = registeredToolNames();
+      expect(registered.size).toBeGreaterThan(50);
+      expect(registered).toContain("platform_run_experiment");
+    });
+  });
+});

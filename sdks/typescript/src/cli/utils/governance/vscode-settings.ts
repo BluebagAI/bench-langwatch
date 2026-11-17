@@ -1,0 +1,187 @@
+/**
+ * Hardens VS Code's terminal against the `copilot_vscode` bearer-token leak
+ * (ADR-039 Extension #2): terminals inherit the extension host's OTEL_* env
+ * unless `terminal.integrated.env.<os>` nulls those keys.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+import { applyEdits, modify, parse as parseJsonc, type ParseError } from "jsonc-parser";
+
+export type VscodePlatform = "darwin" | "linux" | "win32";
+
+/**
+ * The telemetry env keys the scoped `code()` function injects, which must be
+ * cleared from VS Code integrated terminals. Kept in sync with the `code` case
+ * of `buildOtelEnvBlock` (a drift test asserts they match).
+ */
+export const VSCODE_TELEMETRY_ENV_KEYS: readonly string[] = [
+  "COPILOT_OTEL_ENABLED",
+  "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT",
+  "OTEL_TRACES_EXPORTER",
+  "OTEL_METRICS_EXPORTER",
+  "OTEL_EXPORTER_OTLP_PROTOCOL",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_HEADERS",
+  "OTEL_RESOURCE_ATTRIBUTES",
+] as const;
+
+/** Absolute path to VS Code's User settings.json for the platform, or null
+ * when the platform isn't a supported VS Code host. */
+export function vscodeUserSettingsPath(
+  platform: VscodePlatform,
+  home: string,
+  appData?: string,
+): string | null {
+  switch (platform) {
+    case "darwin":
+      return path.join(home, "Library", "Application Support", "Code", "User", "settings.json");
+    case "linux":
+      return path.join(home, ".config", "Code", "User", "settings.json");
+    case "win32":
+      return path.join(
+        appData ?? path.join(home, "AppData", "Roaming"),
+        "Code",
+        "User",
+        "settings.json",
+      );
+    default:
+      return null;
+  }
+}
+
+/** VS Code's platform-specific integrated-terminal env settings key. */
+export function vscodeTerminalEnvKey(platform: VscodePlatform): string | null {
+  switch (platform) {
+    case "darwin":
+      return "terminal.integrated.env.osx";
+    case "linux":
+      return "terminal.integrated.env.linux";
+    case "win32":
+      return "terminal.integrated.env.windows";
+    default:
+      return null;
+  }
+}
+
+interface VscodeSettingsArgs {
+  platform: VscodePlatform;
+  home: string;
+  /** The env keys to clear from integrated terminals (the code() env block). */
+  keys: string[];
+  appData?: string;
+}
+
+const JSONC_FORMAT = {
+  formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" },
+};
+
+/** Read the raw settings text; "" when the file is missing. */
+function readSettingsText(filePath: string): string {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Parses settings text as JSONC, returning null when it doesn't parse (then
+ * NOTHING may be written) or parses to a non-object. Empty/whitespace text
+ * parses as `{}` -- a fresh file has no user content to protect.
+ */
+function parseSettings(text: string): Record<string, unknown> | null {
+  if (text.trim() === "") return {};
+  const errors: ParseError[] = [];
+  const parsed = parseJsonc(text, errors, {
+    allowTrailingComma: true,
+    disallowComments: false,
+  }) as unknown;
+  if (errors.length > 0) return null;
+  if (!isPlainObject(parsed)) return null;
+  return parsed;
+}
+
+/** Write via temp+rename: VS Code writes this file concurrently, and a torn
+ * write would hand it a half-serialized settings.json. */
+function atomicWrite(filePath: string, content: string): void {
+  const tmp = `${filePath}.langwatch-tmp-${process.pid}`;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, filePath);
+}
+
+/**
+ * Sets each of `keys` to null under `terminal.integrated.env.<os>` via
+ * minimal, comment-preserving JSONC edits. Returns null when unsupported or
+ * unparseable -- refused rather than clobbered.
+ */
+export function clearVscodeTerminalOtelEnv(args: VscodeSettingsArgs): string | null {
+  const filePath = vscodeUserSettingsPath(args.platform, args.home, args.appData);
+  const envKey = vscodeTerminalEnvKey(args.platform);
+  if (!filePath || !envKey || args.keys.length === 0) return null;
+
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let text = readSettingsText(filePath);
+  if (parseSettings(text) === null) return null; // unparseable — refuse
+
+  for (const k of args.keys) {
+    text = applyEdits(text, modify(text, [envKey, k], null, JSONC_FORMAT));
+  }
+  atomicWrite(filePath, text.endsWith("\n") ? text : `${text}\n`);
+  return filePath;
+}
+
+/**
+ * Removes `keys` from `terminal.integrated.env.<os>` (logout teardown),
+ * dropping empty containers while preserving other settings, comments and
+ * formatting. Returns whether it changed; an unparseable file is left untouched.
+ */
+export function removeVscodeTerminalOtelEnv(args: VscodeSettingsArgs): boolean {
+  const filePath = vscodeUserSettingsPath(args.platform, args.home, args.appData);
+  const envKey = vscodeTerminalEnvKey(args.platform);
+  if (!filePath || !envKey) return false;
+
+  let text: string;
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return false; // ENOENT
+  }
+  const settings = parseSettings(text);
+  if (settings === null) return false; // unparseable — do not touch
+
+  const env = settings[envKey];
+  if (!isPlainObject(env)) return false;
+
+  const present = args.keys.filter((k) => k in env);
+  if (present.length === 0) return false;
+
+  const survivors = Object.keys(env).filter((k) => !args.keys.includes(k));
+  if (survivors.length === 0) {
+    // env object becomes empty — drop the whole settings key.
+    text = applyEdits(text, modify(text, [envKey], undefined, JSONC_FORMAT));
+  } else {
+    for (const k of present) {
+      text = applyEdits(text, modify(text, [envKey, k], undefined, JSONC_FORMAT));
+    }
+  }
+  atomicWrite(filePath, text.endsWith("\n") ? text : `${text}\n`);
+  return true;
+}
+
+/** Whether VS Code settings already clear any of `keys` in the terminal env. */
+export function vscodeTerminalEnvHasAnyClear(args: VscodeSettingsArgs): boolean {
+  const filePath = vscodeUserSettingsPath(args.platform, args.home, args.appData);
+  const envKey = vscodeTerminalEnvKey(args.platform);
+  if (!filePath || !envKey) return false;
+  const settings = parseSettings(readSettingsText(filePath));
+  if (settings === null) return false;
+  const env = settings[envKey];
+  if (!isPlainObject(env)) return false;
+  return args.keys.some((k) => k in env);
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}

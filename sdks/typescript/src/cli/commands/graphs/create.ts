@@ -1,0 +1,91 @@
+import chalk from "chalk";
+
+import { resolveControlPlaneUrl } from "@/cli/utils/governance/resolveEndpoint";
+import { buildRequestHeaders } from "@/internal/api/request-headers";
+import { scopedApiKey } from "@/internal/credentialContext";
+import { langwatchFetch } from "@/internal/http/langwatchFetch";
+
+import { resolveCredentials } from "../../utils/apiKey.ts";
+import { commandValidationError } from "../../utils/errorOutput.ts";
+import { failSpinnerFromResponse } from "../../utils/failFromResponse.ts";
+import type { CommandResult } from "../../utils/output.ts";
+import { createSpinner } from "../../utils/spinner.ts";
+import { failSpinner } from "../../utils/spinnerError.ts";
+/**
+ * Returns the created graph rather than printing it: the output port renders it
+ * in whatever format the caller asked for (utils/output.ts).
+ */
+export const createGraphCommand = async (
+  name: string,
+  options: {
+    dashboardId?: string;
+    graph?: string;
+    filters?: string;
+    colSpan?: string;
+    rowSpan?: string;
+  },
+): Promise<CommandResult | void> => {
+  await resolveCredentials();
+
+  const apiKey = scopedApiKey() ?? process.env.LANGWATCH_API_KEY ?? "";
+  const endpoint = resolveControlPlaneUrl();
+
+  const spinner = createSpinner(`Creating graph "${name}"...`).start();
+
+  try {
+    let graphDef: Record<string, unknown> = {};
+    if (options.graph) {
+      graphDef = JSON.parse(options.graph) as Record<string, unknown>;
+    }
+
+    const response = await langwatchFetch(`${endpoint}/api/v1/graphs`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...buildRequestHeaders({ apiKey }),
+      },
+      body: JSON.stringify({
+        name,
+        graph: graphDef,
+        dashboardId: options.dashboardId,
+        ...(options.filters && { filters: JSON.parse(options.filters) }),
+        ...(options.colSpan && { colSpan: parseInt(options.colSpan, 10) }),
+        ...(options.rowSpan && { rowSpan: parseInt(options.rowSpan, 10) }),
+      }),
+    });
+
+    if (!response.ok) {
+      await failSpinnerFromResponse({ spinner, response, action: "create graph" });
+      process.exit(1);
+    }
+
+    const graph = (await response.json()) as {
+      id: string;
+      name: string;
+      dashboardId: string | null;
+    };
+    spinner.succeed(`Graph "${graph.name}" created (${graph.id})`);
+
+    return {
+      data: graph,
+      table: () => {
+        console.log();
+        console.log(`  ${chalk.gray("ID:")}        ${chalk.green(graph.id)}`);
+        console.log(`  ${chalk.gray("Dashboard:")} ${graph.dashboardId ?? chalk.gray("—")}`);
+        console.log();
+      },
+    };
+  } catch (error) {
+    // Route BOTH failure kinds through failSpinner: a direct spinner.fail()
+    // prints nothing in --json/--jq/agent mode (spinners are silent there).
+    failSpinner({
+      spinner,
+      error:
+        error instanceof SyntaxError
+          ? commandValidationError("--graph and --filters must be valid JSON")
+          : error,
+      action: "create graph",
+    });
+    process.exit(1);
+  }
+};

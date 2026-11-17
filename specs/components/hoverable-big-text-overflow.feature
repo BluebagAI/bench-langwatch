@@ -1,0 +1,73 @@
+Feature: Expanded text dialog handles overflow for large content
+  As a user viewing trace metadata or other large content
+  I want the expanded dialog to scroll when content exceeds the viewport
+  So that I can browse the full content without it breaking the layout
+
+  Background:
+    Given the ExpandedTextDialog is rendered
+
+  # ============================================================================
+  # Dialog body overflow handling
+  # ============================================================================
+
+  @integration @unimplemented
+  Scenario Outline: Full content is accessible when it exceeds the dialog viewport
+    Given a large <content_type> that exceeds the dialog viewport height
+    When the ExpandedTextDialog opens with formatted mode <mode>
+    Then all content is accessible within the dialog
+
+    Examples:
+      | content_type  | mode     |
+      | JSON object   | enabled  |
+      | plain text    | disabled |
+      | Markdown text | enabled  |
+
+  @integration @unimplemented
+  Scenario: Small content does not trigger unnecessary scrolling
+    Given a small JSON object that fits within the dialog viewport height
+    When the ExpandedTextDialog opens with formatted mode enabled
+    Then all content is visible without scrolling
+
+  # ============================================================================
+  # Content rendering remains correct with overflow fix
+  # ============================================================================
+
+  @integration @unimplemented
+  Scenario: JSON content renders with interactive viewer and copy button
+    Given a JSON object with nested keys and values
+    When the ExpandedTextDialog opens with formatted mode enabled
+    Then the JSON is rendered using the interactive JSON viewer
+    And the copy button is visible
+    And all JSON keys and values are accessible within the dialog
+
+  @integration @unimplemented
+  Scenario: Scrollability persists after toggling formatted mode
+    Given a large JSON object displayed in the ExpandedTextDialog
+    When I toggle the "Formatted" switch off
+    Then all content is accessible within the dialog
+
+  # ============================================================================
+  # The measurement tracks the box, not only the render
+  # ============================================================================
+
+  # A window resize, a column drag or a sidebar opening reflows the box without
+  # rendering the component, so a measurement taken only after a render goes
+  # stale in both directions: hidden text with no way to reach it, or a tooltip
+  # offered on text that is no longer clipped.
+  @integration
+  Scenario: Text clipped by a resize becomes readable again
+    Given a HoverableBigText whose text fits its box
+    When the box narrows without anything re-rendering the component
+    Then the text is measured again
+    And the full text is offered on hover and on click
+
+  # ============================================================================
+  # The overflow probe never outlives the component
+  # ============================================================================
+
+  @integration
+  Scenario: The overflow measurement is dropped when the text is unmounted
+    Given a HoverableBigText is on the page with its overflow probe pending
+    When the component is unmounted before the probe runs
+    Then no measurement remains scheduled
+    And running every pending timer raises nothing

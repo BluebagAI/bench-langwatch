@@ -1,0 +1,404 @@
+Feature: Coding agent terminal view
+  As someone reviewing a coding agent session
+  I want the Terminal tab to replay the WHOLE session, in order
+  So that reading it is like scrolling back through the real CLI session,
+  not just the last thing the model said
+
+  # The browser used to rebuild the transcript itself by parsing the LAST model
+  # call's rolling message history. That works only for the final turn: when
+  # that last call is a lone tool request, the whole 458-span, 115-tool session
+  # rendered as one line ("step 1/1"). The backend's `codingAgentTranscript`
+  # orders every span and log by timestamp instead, so it cannot collapse this
+  # way and it works for every agent, not just Claude Code.
+
+  Background:
+    Given a coding agent session with prompts, tool calls, and a final reply
+
+  @integration
+  Scenario: The transcript shows every beat, not just the final turn
+    Given the session's last model call is a single tool request with no reply text
+    When the Terminal tab renders the session
+    Then every prompt, message, and tool call from the whole session is shown
+    And the session does not collapse to a single step
+
+  @integration
+  Scenario: A tool the user denied is shown even though it left no span
+    Given the user denied a tool call partway through the session
+    When the Terminal tab renders the session
+    Then the denied call is shown as rejected, not silently missing
+
+  @integration
+  Scenario: A tool call that was aborted reads differently from one the user denied
+    Given a tool call was cancelled or timed out before it ran
+    When the Terminal tab renders the session
+    Then the call is shown as aborted and never ran
+    And it is not said to be denied, nor pinned on the user
+
+  # The agents' own decision source says who refused: Claude and Grok send "user_*",
+  # Codex "User"; "config", "hook", "classifier" or no source at all is a policy.
+  @integration
+  Scenario: A tool call a policy denied is not pinned on the user
+    Given a permission rule, hook or reviewer refused a tool call before it ran
+    When the Terminal tab renders the session
+    Then the call is shown as denied and never ran
+    And it is not said to be the user's denial
+
+  @integration
+  Scenario: A tool call the user answered instead of approving reads differently from a denial
+    Given the user typed a reply at a tool prompt instead of approving the call
+    When the Terminal tab renders the session
+    Then the call is shown as answered by the user and never ran
+    And it is not said to be denied
+
+  Scenario: A tool call shows what actually ran, not just what the model was told
+    Given a tool span carries real stdout, a real file's content, or a real structured patch
+    When the Terminal tab renders that tool call
+    Then the real output is shown in place of the model's capped echo
+
+  @integration
+  Scenario: The top of the session identifies the agent, model, and repo
+    Given the session was run by Claude Code version 2.1.207 against a repo
+    When the Terminal tab renders the session
+    Then the top of the session shows the Claude Code version, the model, and the repo
+
+  # Codex never exports the assistant's reply text over OTel (verified against
+  # codex 0.146: no span or log event carries it), so its transcript is the
+  # prompt, the tool calls, and the model-call economics. Everything codex DOES
+  # export must render.
+
+  @unit
+  Scenario: A codex session shows its prompt and its tool calls with real input and output
+    Given a codex session that ran tools
+    When the Terminal tab renders the session
+    Then each tool call shows its name, the arguments it ran with, and what it returned
+
+  @unit
+  Scenario: A tool the agent ran once is shown once
+    Given a codex session whose tool run was reported twice by the agent
+    When the Terminal tab renders the session
+    Then the tool call appears once
+
+  @unit
+  Scenario: Every model call in a codex exec session is shown with its token counts
+    Given a codex exec session that made several model calls
+    When the Terminal tab renders the session
+    Then each model call appears once with the tokens it used
+
+  @unit
+  Scenario: Codex events are rendered whichever way the agent named them
+    Given a codex session whose events name themselves the way the OTel Event API does
+    When the Terminal tab renders the session
+    Then those events are read and rendered like any other
+
+  # Copilot sends no log events: its prompt and reply ride its `chat` spans as
+  # GenAI message parts (`{"type": "text", "content": ...}`) and each tool run is
+  # an `execute_tool` span naming `gen_ai.tool.name`. Read from there, the
+  # replay is the conversation, not only the context it carried.
+
+  @unit
+  Scenario: A Copilot session shows its prompts, replies and tool runs
+    Given a Copilot session whose model calls carry the user's message and the reply as message parts
+    And whose tool runs are execute_tool spans
+    When the Terminal tab renders the session
+    Then each prompt, the reply text and each tool run are shown
+    And the model's reasoning is not shown as its reply
+    And a prompt a log event already reported is shown once
+
+  # The trace read nests a stored span's dotted attribute keys by their dots,
+  # so `gen_ai.tool.name` reaches the transcript as `gen_ai: { tool: { name } }`.
+
+  @unit
+  Scenario: A Copilot tool run read back from storage shows in the terminal
+    Given a stored Copilot execute_tool span that names its tool, arguments and result in GenAI attributes
+    When the trace read hands it to the transcript with those attributes nested by their dots
+    Then the Terminal tab shows the tool run with its name, what it ran and its result
+
+  # pi's spans are in pi's own namespace, so the transcript is told by name that
+  # `pi.ai.request` is a model call (MODEL_CALL_SPAN_NAMES); anything else falls
+  # through to the tool branch.
+
+  # pi's tool span carries its arguments and result only with content capture
+  # on. Without it a pi tool run shows its name, its call id and whether it
+  # errored, and the transcript renders that honestly rather than leave empty
+  # argument and result panes behind.
+
+  @unit
+  Scenario: A pi session reads back as a transcript, not as a span tree
+    Given a pi session whose run, turns and tool executions were captured
+    When the Terminal tab renders the session
+    Then its spans and logs read in timestamp order, not in parent order
+    And each tool execution shows its name and whether it errored
+    And no empty arguments or result pane is shown for it
+
+  # pi's model calls carry no prompt: the user's message rides only the run span.
+
+  @unit
+  Scenario: A pi session's prompt reads from its run span
+    Given a pi session whose run span carries the user's message
+    When the Terminal tab renders the session
+    Then the prompt shows once, before the first model call
+
+  @unit
+  Scenario: A pi model call is shown as a model call, not as a tool run
+    Given a pi session whose model calls are pi.ai.request spans
+    When the Terminal tab renders the session
+    Then each model call appears once with the tokens it used
+    And none of them appears among the tool runs
+
+  # pi stamps no service name the banner can test (`pi` is a substring of
+  # `copilot` and `api`), so the banner names it from its span namespace.
+
+  @unit
+  Scenario: The banner of a pi session names the model pi called
+    Given a pi session whose model calls name their model
+    When the Terminal tab renders the session
+    Then the top of the session shows pi and the model it called
+
+  # A trace with no name of its own is named after its root span (`pi.harness.run`),
+  # which the user never typed.
+
+  @unit
+  Scenario: The prompt line never shows a span name as if the user had typed it
+    Given a session whose trace is named after its own root span
+    When the Terminal tab renders the session
+    Then the bottom bar's prompt line shows the session's first prompt
+    And when the session has no prompt text it shows the untitled placeholder, not the span name
+
+  # A logs-only trace (Grok) has no span to name it, so it is named after its own id.
+
+  @unit
+  Scenario: The prompt line never shows a trace id as if the user had typed it
+    Given a logs-only session whose trace is named after its own id
+    When the Terminal tab renders the session
+    Then the bottom bar's prompt line shows the session's first prompt
+
+  # The system prompt is the context the user pays for on every call - CLAUDE.md,
+  # MCP tool definitions, skills. It rides the first request body of the session.
+
+  @unit
+  Scenario: The session's system context is shown once at the top
+    Given a claude code session that carried a system prompt
+    When the Terminal tab renders the session
+    Then a collapsed system context entry appears before the first prompt
+    And it is not repeated for later model calls
+    And expanding it with the keyboard shows the context
+
+  Scenario: The bottom bar stays put while the transcript scrolls
+    Given a session long enough to scroll
+    When the reader scrolls through the transcript
+    Then the bottom bar stays fixed and keeps showing the session name and running stats
+
+  # A coding-agent session is many traces: one per turn. The Terminal tab opens
+  # on ONE of them, so the session's earlier turns are simply not on screen, and
+  # a reader who scrolls up hits the top of a turn rather than the top of the
+  # session. The turns of the session are already ordered by
+  # `tracesV2.conversationContext`, so the view walks backwards through them and
+  # prepends each earlier turn above the one already loaded.
+  #
+  # The view opens pinned to the session's latest line, the way a terminal sits
+  # at its prompt, and keeps a buffer of earlier turns loaded above the reader:
+  # on open the buffer fills the screen with the turns that came before, and
+  # while reading back it stays ahead of the scroll so a short turn never loads
+  # in front of the reader's eyes. The buffer is a couple of viewports deep, so
+  # walking a long session back still happens turn by turn as the reader asks
+  # for it, not all at once.
+
+Rule: The terminal reads back the whole session
+
+  @integration
+  Scenario: Opening a session lands at its latest line
+    Given the terminal opened on the last turn of a session
+    When the transcript first renders
+    Then the screen is scrolled to the transcript's end
+    And the turns before it start loading above without any gesture
+
+  @integration
+  Scenario: Earlier turns preload before the reader reaches the top
+    Given the terminal opened on a later turn of a session
+    When the reader scrolls to within a couple of viewports of the top
+    Then the previous turn is asked for before the top is on screen
+
+  @integration
+  Scenario: Scrolling up past the top loads the previous turn
+    Given the terminal opened on a later turn of a session
+    When the reader scrolls upward into the top of the transcript
+    Then the previous turn's entries appear above a turn divider
+    And the row the reader was looking at stays where it was
+
+  @integration
+  Scenario: A prepend never yanks the reader to the bottom
+    Given a turn short enough that the reader is at the bottom of it
+    When an earlier turn is prepended above it
+    Then the screen stays where the reader left it instead of following the tail
+
+  # A context note says the context crossed into a bigger size band, which is a
+  # comparison against the call BEFORE the crossing. While earlier turns are
+  # still unloaded that call is unknown, and a note drawn from a guess gets
+  # redrawn when the truth arrives: the note the reader was looking at vanishes
+  # and the transcript under it shifts. A note is only drawn once the call
+  # before it is on screen, so loading history can only ever add lines above
+  # the reader, never remove one below them.
+
+  @integration
+  Scenario: A context note below the reader survives earlier turns loading
+    Given the loaded transcript starts mid-session with its context already grown
+    When an earlier turn is loaded above it
+    Then no context note below the loaded turn appears or disappears
+
+  @integration
+  Scenario: A context note waits for the call before it
+    Given the loaded transcript starts mid-session with its context already grown
+    When the notes are derived before the previous turn is loaded
+    Then no note claims the crossing happened at the first loaded call
+
+  # A turn that made no model call adds no note of its own, but completing the
+  # history lets a note appear at a call further down, below the reader. The
+  # screen follows the row the reader is on, so what arrives above them moves
+  # the screen and what appears below them does not.
+
+  @integration
+  Scenario: A note the completed history adds below the reader moves nothing above it
+    Given the loaded transcript starts mid-session with its context already grown
+    And the earlier turn that lands made no model call of its own
+    When the earlier turn is loaded above the reader
+    Then the row the reader is on stays exactly where it was
+    And the screen moves by what arrived above it and nothing else
+
+  @integration
+  Scenario: Reaching the first turn shows the session start
+    Given the terminal has walked back to the session's first turn
+    When the reader reaches the top of the transcript
+    Then the session start is marked and no further turns are offered
+
+  @integration
+  Scenario: A trace outside any conversation shows no scrollback
+    Given a trace that belongs to no coding agent session
+    When the Terminal tab renders it
+    Then the session banner is at the top and no earlier turns are offered
+
+  @integration
+  Scenario: A failed earlier-turn load offers a retry
+    Given the previous turn's transcript could not be read
+    When the reader reaches the top of the transcript
+    Then the failure is stated on one line and clicking it tries again
+
+  @integration
+  Scenario: The cumulative footer counts every loaded turn
+    Given an earlier turn was loaded above the opened turn
+    When the reader reads the bottom bar
+    Then the step count covers the earlier turn's beats as well
+
+  # The bottom bar reports what the session had cost by the beat the reader is
+  # on. That accumulation starts at turn one of the SESSION, not at the oldest
+  # turn that happens to be loaded: the turns above the loaded window carry
+  # their totals in the session's turn list, so the bar can count them without
+  # loading their transcripts, and loading one moves nothing.
+
+  @integration
+  Scenario: The footer counts the whole session up to the reader's position
+    Given the terminal opened on the last turn of a long session
+    When the reader reads the bottom bar
+    Then the cost and tokens cover every earlier turn of the session
+    And the elapsed time is measured from the session's first turn
+
+  @integration
+  Scenario: Loading an earlier turn does not change the footer's totals
+    Given the bottom bar reports the totals at the reader's position
+    When an earlier turn is loaded above the reader
+    Then the cost, tokens, and elapsed time at that position stay the same
+
+  # A turn that carries no total is not a turn that cost nothing. Counting it as
+  # zero makes the bar report a session total that is short by that turn, and
+  # the reader has no way to see that it is short. The bar states a total it can
+  # stand behind, or it states none. Spend is the everyday case: a reader
+  # without cost:view gets no per-turn cost at all, so the session cost is not
+  # theirs to read, while the token count still is.
+
+  @integration
+  Scenario: The footer states no total it cannot count in full
+    Given an earlier turn of the session carries no token total
+    When the reader reads the bottom bar
+    Then the bar reports no token total
+
+  # Some agents report their economics and no conversation content. The screen
+  # says so, and says the totals are real, so the bar counts them from the whole
+  # loaded window rather than standing on a line that is not there.
+
+  @integration
+  Scenario: The footer counts a transcript that renders nothing
+    Given a session whose telemetry carries economics and no content
+    When the reader reads the bottom bar
+    Then the cost and tokens cover every call of the loaded window
+
+  # A turn can end on model calls that draw nothing after its last line (a reply
+  # the agent did not send, a call that only read the context). At the last line
+  # they have happened, so the bar counts them; a running figure that differs
+  # from the session total is stated beside it however small the gap.
+
+  @integration
+  Scenario: The footer at the last line counts the calls after it
+    Given the loaded window ends on model calls that come after its last line
+    When the reader is at the last line
+    Then the cost and tokens cover every call of the loaded window
+    And a running cost short of the session total is stated beside that total
+
+  @integration
+  Scenario: A reader who may not see cost still reads the session's tokens
+    Given the session's earlier turns carry tokens but no cost
+    When the reader reads the bottom bar
+    Then the bar reports the token total
+    And the bar reports no cost
+
+  @unit
+  Scenario: The turn list carries each turn's cost and tokens
+    Given a session whose turns are listed by the conversation read
+    When a turn of the session is listed
+    Then it carries the turn's total tokens and total cost
+
+  # Spend follows the reader's own cost permission everywhere it is shown. A
+  # reader who may not see the session's cost on the sessions screen must not
+  # be able to add the same total up one turn at a time from the turn list.
+
+  @unit
+  Scenario: A reader who may not see cost reads no per-turn spend
+    Given a session whose turns are listed by the conversation read
+    And the reader may not see cost
+    When a turn of the session is listed
+    Then the turn carries no cost
+    And the turn still carries its total tokens
+
+  # Agents inject blocks into the user's message that the human never typed: a
+  # monitor firing, a hook's system reminder, a queued task notification. Printed
+  # verbatim behind the prompt caret they read as the reader's own words, which
+  # is both wrong and unreadable. They are notes about the session, so they are
+  # drawn like the session's other notes, collapsed to one line.
+
+Rule: An injected notification reads as a note, not as the user's words
+
+  @integration
+  Scenario: A task notification collapses to one gray line naming its summary
+    Given a user message that is a task notification block with a summary
+    When the Terminal tab renders that message
+    Then the notification is one collapsed note naming its summary
+    And no prompt caret claims it as something the user typed
+    And expanding the note shows the block as it arrived
+
+  @integration
+  Scenario: A mixed message keeps the human words as the prompt
+    Given a user message with an injected block above the words the human typed
+    When the Terminal tab renders that message
+    Then the injected block is a collapsed note
+    And the human words are shown as the prompt
+
+  @unit
+  Scenario: A plain system notification marker is drawn back too
+    Given a user message that opens with the system notification marker
+    When the message is classified
+    Then the whole message is one notice and nothing is left as the prompt
+
+  @unit
+  Scenario: The Terminal replay's log read passes the tenant guard
+    Given a coding-agent session whose transcript is read from its stored logs
+    When the Terminal view asks for the session's transcript
+    Then the log read names its time window with parameters the tenant guard does not mistake for a FROM clause
+    And the transcript request answers instead of failing with a tenant-scope refusal

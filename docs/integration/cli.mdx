@@ -1,0 +1,1168 @@
+---
+title: LangWatch CLI
+sidebarTitle: LangWatch CLI
+description: The `langwatch` CLI is a single tool that drives LangWatch from the terminal, for you and for your coding assistant. Instrument code, version prompts, run scenarios, inspect traces, query analytics, and more.
+---
+
+import AgentReportNotice from "/snippets/agent-report-notice.mdx";
+
+The CLI is designed to be driven by a coding assistant, and it reaches everything in the LangWatch app except cache rules, which you manage over [REST](/ai-gateway/api/management#cache-rules) or in the dashboard.
+
+Every subcommand supports `--help`, and every command accepts the output-contract flags (`-o json`, `--json <fields>`, `--jq <expr>`, `--limit <n>`; see [Agent usage](#agent-usage)). Run `langwatch --help` to see the full command tree.
+
+## Install
+
+The CLI needs **Node.js 18 or newer** (the `npm` command ships with it). If you don't already have it, get it from [nodejs.org](https://nodejs.org). Then install globally:
+
+```bash
+npm install -g langwatch
+```
+
+Or run any command with `npx`, no install required:
+
+```bash
+npx langwatch --help
+```
+
+`pnpm install -g langwatch` and `yarn global add langwatch` work the same way; the package is identical across all three package managers.
+
+### Standalone binary (no Node.js required)
+
+Each release also attaches a self-contained binary for Linux, macOS, and Windows. Use it in containers, CI images, and anywhere you'd rather not install Node.js. Download the one for your platform from the [releases page](https://github.com/langwatch/langwatch/releases), then:
+
+```bash
+# Verify the download against the release's SHA256SUMS, then install it
+sha256sum --check --ignore-missing SHA256SUMS
+chmod +x langwatch-<version>-<platform>
+sudo mv langwatch-<version>-<platform> /usr/local/bin/langwatch
+```
+
+Every binary is published with a signed [build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds), so you can confirm it really was built by LangWatch's release workflow from this repository:
+
+```bash
+gh attestation verify langwatch-<version>-<platform> --repo langwatch/langwatch
+```
+
+#### macOS: clearing Gatekeeper
+
+<Warning>
+  The macOS binaries are **not yet codesigned or notarized**. Gatekeeper will refuse to run them
+  with *"langwatch cannot be opened because the developer cannot be verified"*.
+</Warning>
+
+macOS attaches a `com.apple.quarantine` attribute to anything downloaded from the internet. After verifying the checksum above, remove it:
+
+```bash
+xattr -d com.apple.quarantine langwatch-<version>-darwin-arm64
+```
+
+Then run the binary as normal. (If `xattr` reports _"No such xattr"_, the attribute was never set, so no action is needed.)
+
+<Note>
+  Only clear quarantine on a binary whose checksum you have verified against the release's
+  `SHA256SUMS`. Signing and notarization are tracked as follow-up work; until then, `npm install -g
+  langwatch` avoids Gatekeeper entirely and is the smoother path on macOS.
+</Note>
+
+## Authenticate
+
+`langwatch login` is interactive by default, it asks where (cloud vs self-hosted) and how (AI tools vs project SDK), opens your browser to approve, and the credential flows back to the CLI automatically. **No copy-paste of keys**:
+
+```bash
+langwatch login
+```
+
+You'll see two questions:
+
+1. **Where do you want to log in?**: LangWatch Cloud (`app.langwatch.ai`) or a self-hosted instance (custom URL).
+2. **How do you want to use it?**: three options:
+   - **AI tools, agentic flows**: `claude`, `codex`, `copilot`, `code`, `cursor`, `gemini`, `opencode`. Mints an OAuth-style device session in `~/.langwatch/config.json` (user-scoped) so `langwatch claude` etc. wrap any tool through your gateway.
+   - **Project, SDK API key**: for `langwatch sync`, `langwatch eval`, and SDK auto-instrumentation. Writes the API key of the project you pick into `$CWD/.env` (project-scoped).
+   - **Both**: runs both flows in sequence.
+
+The browser shows an "Approve" or "Send API key" button (depending on the chosen mode); after you click, the credential is delivered back to the CLI over the same RFC 8628 device-code poll. **You never copy-paste a key.**
+
+### What the login key can access
+
+The AI-tools login mints a login key that inherits your own access. The authorize screen shows the scopes and permissions before you approve:
+
+- **Scopes**: an organization admin gets the whole organization by default; other members get their teams plus their personal workspace. You can narrow the selection to specific teams or projects.
+- **Permissions**: everything you can do day to day (traces, datasets, prompts, evaluations, the AI Gateway, model providers). Management access stays off by default: the key cannot manage teams, or manage the organization's settings, members and roles. It can never delete the organization.
+
+To manage those from the CLI, log in with `langwatch login --device --management`. The authorize screen then shows a management access request listing what it adds. It needs the organization as the key's scope, and the key gets only the management permissions you hold in the organization; if you hold none, the approval is refused. Any command refused on a login key for one of these permissions names this re-login command.
+
+Project administration is the one thing that rides along. Model providers and project settings are gated by the project management permission, and that same permission answers a project create or delete request, so a key that can configure model providers can also create and delete projects in the scopes it covers. To withhold it, set **Project** to **Read** under **Customize**, which turns model provider writes off with it.
+
+Every request the key makes is checked against your live permissions, so the key can never do more than you can, and it shrinks with you if your role changes. A new login from the same machine replaces the previous login key, and `langwatch logout` revokes it.
+
+Data commands keep targeting your personal workspace by default. Pass `--project <id|slug>` to read another project the key covers, and run `langwatch projects list` to see which projects those are. `langwatch whoami` shows the key's reach.
+
+### Storage discipline (where credentials land)
+
+| Scope       | Path                                     | What lives there                                                                                                                                                                                                 |
+| ----------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Project     | `$CWD/.env`                              | `LANGWATCH_API_KEY`, used by SDK consumers + `langwatch sync`, `eval`, `prompt`                                                                                                                                  |
+| User-global | `~/.langwatch/config.json` (mode `0600`) | Device session (`access_token` + `refresh_token`), control-plane URL, gateway URL, default org, used by `langwatch claude/codex/copilot/code/cursor/gemini/opencode`, `langwatch instrument`, `langwatch whoami` |
+
+The two stores serve different audiences and never leak into each other. Logging out of one (`langwatch logout` clears `~/.langwatch/config.json`) doesn't touch the other, the project API key in `.env` stays put.
+
+### Self-hosted
+
+The CLI picks up your self-hosted endpoint from any of these (highest priority first):
+
+| Priority | Source                                       | Use case                                  |
+| -------- | -------------------------------------------- | ----------------------------------------- |
+| 1        | `--endpoint <url>` flag on `langwatch login` | one-shot login at a different host        |
+| 2        | `LANGWATCH_ENDPOINT` env var                 | CI, scripts                               |
+| 3        | `~/.langwatch/config.json:control_plane_url` | persisted from prior login (daily driver) |
+| 4        | `https://app.langwatch.ai`                   | built-in cloud default                    |
+
+A device login's key is only sent to the address the login was made against. A project's `.env` can set `LANGWATCH_ENDPOINT`, so the CLI never pairs your login with an address a folder names.
+
+When `LANGWATCH_ENDPOINT` names another address than your login's, a command uses the API key given for that address (`LANGWATCH_API_KEY` or `--api-key`). With no key it stops and names both addresses. Run `langwatch login --device` with the variable set to sign in there, or unset it to use the login you have.
+
+The simplest path for self-hosted users is the interactive prompt, pick "Self-hosted instance", enter your URL, and the CLI saves it for future invocations:
+
+```bash
+langwatch login
+# → Where do you want to log in?  ▸ Self-hosted instance
+# → URL: https://langwatch.acme.internal
+```
+
+Or, equivalently, one-shot with the flag:
+
+```bash
+langwatch login --endpoint https://langwatch.acme.internal
+```
+
+To inspect or change persisted settings without re-logging in:
+
+```bash
+langwatch config list                                          # show resolved values + sources
+langwatch config get endpoint
+langwatch config set endpoint https://langwatch.acme.internal  # writes ~/.langwatch/config.json
+```
+
+### Non-interactive escape hatches (for CI, agents)
+
+When you're driving the CLI from automation and already have a credential, skip the prompts:
+
+| Flag                               | Use case                                                                                             | Where it lands             |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------- | -------------------------- |
+| `langwatch login --device`         | AI tools mode, skip Q1/Q2 prompts                                                                    | `~/.langwatch/config.json` |
+| `langwatch login --project`        | Project SDK mode via browser, skip Q1/Q2 prompts; mints a fresh project key                          | `$CWD/.env`                |
+| `langwatch login --api-key <KEY>`  | CI pipeline that has `LANGWATCH_API_KEY` injected from secrets                                       | `$CWD/.env`                |
+| `langwatch login --token <TOKEN>`  | Agent harness with a pre-minted device session token (issued via dashboard "Personal Access Tokens") | `~/.langwatch/config.json` |
+| `langwatch login --endpoint <URL>` | combine with any of the above to pin a self-hosted instance                                          | persisted to config        |
+
+The interactive `langwatch login` always shows these flags in a banner above the prompts, so a fake-TTY agent (`Claude Code`, certain Gemini CLI sandboxes) can detect the prompt and re-invoke with the right flag instead of getting stuck.
+
+When stdin is not a TTY (genuine CI or an agent's piped stdin), `langwatch login` with no flags defaults to **project login** (the same as `--project`): it mints a project key into `$CWD/.env`, which is what the SDK, `langwatch eval`, and `langwatch prompt` expect. AI-tools login stays explicit behind `--device`.
+
+### Letting an agent do it
+
+A coding assistant driving `langwatch` will see the always-on banner naming `--device`, `--project`, `--api-key`, `--token`, `--endpoint` whenever the interactive prompt fires. If the assistant's harness reports as a TTY but can't actually answer prompts, the banner gives it everything it needs to re-invoke:
+
+```bash
+langwatch login --device                # AI tools mode (recommended for assistants)
+langwatch login --project               # project SDK key into .env via the browser
+langwatch login --api-key sk-lw-...     # if a project key was injected from secrets
+langwatch login --token lwc_...         # if a device session token was pre-minted
+langwatch login --endpoint https://...  # combine with any of the above for self-hosted
+```
+
+## Fetch documentation
+
+`langwatch docs` returns any LangWatch documentation page as plain Markdown, ideal for feeding into an agent's context before it writes code.
+
+```bash
+langwatch docs                                # Documentation index
+langwatch docs integration/python/guide       # Python integration guide
+langwatch docs integration/typescript/guide   # TypeScript integration guide
+langwatch docs prompt-management/cli          # Prompts CLI reference
+langwatch docs integration/python/langgraph   # Framework-specific guides
+```
+
+Scenario framework docs live under a separate namespace:
+
+```bash
+langwatch scenario-docs                       # Scenario index
+langwatch scenario-docs advanced/red-teaming
+```
+
+Both commands accept full URLs too, and any missing `.md` extension is appended automatically.
+
+<Tip>
+  If you're inside an assistant with no shell (for example, a chat-only environment), the same
+  content is available over plain HTTP, append `.md` to any documentation path, e.g.
+  `https://langwatch.ai/docs/integration/python/guide.md`. Indexes:
+  [docs](https://langwatch.ai/docs/llms.txt), [scenarios](https://langwatch.ai/scenario/llms.txt).
+</Tip>
+
+## Version prompts
+
+The Prompts CLI turns your prompts into tracked files alongside your code, with lock files, tagging, and sync to the LangWatch platform.
+
+```bash
+langwatch prompt init             # scaffold prompts.json + prompts/ folder
+langwatch prompt create my-agent  # create a new local prompt
+langwatch prompt sync             # push local changes, pull remote updates
+langwatch prompt list             # see all prompts in the project
+```
+
+In your application code, fetch the latest version at runtime:
+
+<CodeGroup>
+```python Python
+import langwatch
+prompt = langwatch.prompts.get("my-agent")
+```
+
+```typescript TypeScript
+import { LangWatch } from "langwatch";
+const langwatch = new LangWatch();
+const prompt = await langwatch.prompts.get("my-agent");
+```
+
+```go Go
+import "github.com/langwatch/langwatch/sdks/go/client"
+
+lw, _ := client.New()
+prompt, _ := lw.Prompts.Get(ctx, "my-agent", nil)
+```
+</CodeGroup>
+
+### Tag versions for deployment
+
+Three built-in tags are available: `latest` (auto-assigned), `production`, and `staging`. Assign a tag to the current version:
+
+```bash
+langwatch prompt tag assign my-agent production
+```
+
+Then fetch by tag at runtime:
+
+<CodeGroup>
+```python Python
+prompt = langwatch.prompts.get("my-agent", tag="production")
+```
+
+```typescript TypeScript
+const prompt = await langwatch.prompts.get("my-agent", { tag: "production" });
+```
+
+```go Go
+prompt, _ := lw.Prompts.Get(ctx, "my-agent", &client.GetPromptOptions{Tag: "production"})
+// Shorthand: a suffix in the handle works too.
+prompt, _ = lw.Prompts.Get(ctx, "my-agent:production", nil)
+```
+</CodeGroup>
+
+For canary or blue/green deployments, create custom tags with `langwatch prompt tag create`.
+
+For the full Prompts CLI reference, see the [Prompt Management CLI guide](/prompt-management/cli).
+
+## Manage agents
+
+An agent is what a scenario runs against. `langwatch agent list` prints one row per agent:
+
+```bash
+langwatch agent list
+langwatch agent list --format json
+langwatch agent get <id>
+```
+
+| Column        | Value                                                                         |
+| ------------- | ----------------------------------------------------------------------------- |
+| `Name`        | The agent's name                                                              |
+| `Environment` | Which environment the row belongs to, for a connected agent                   |
+| `Status`      | `Online` with the instance count, or `Offline` with the time it was last seen |
+| `Type`        | `connected`, `http`, `code` or `workflow`                                     |
+| `ID`          | The agent id, which every `--target` accepts                                  |
+| `Owner`       | The person or the machine a personal development agent belongs to             |
+| `Updated`     | When the agent was last changed                                               |
+
+`--format json` adds the parameters the agent declares and the instances that serve it.
+
+A **connected** agent registers itself: the process that runs the agent opens the connection and reports its name, its environment and its parameters. The CLI creates no row for it. See [Connect your agent](/agent-testing/connect-your-agent).
+
+An **HTTP** agent is a URL the platform calls, and it is created from the CLI:
+
+```bash
+langwatch agent create 'My Agent' --type http --config '{
+  "url": "https://staging.example.com/chat",
+  "bodyTemplate": "{\"thread_id\": \"{{ threadId }}\", \"messages\": {{ messages }}}",
+  "outputPath": "$.reply"
+}'
+
+langwatch agent update <id> --config '{"url": "https://staging.example.com/v2/chat"}'
+langwatch agent run <id> --input '{"message": "where is my order?"}'
+langwatch agent delete <id>
+```
+
+`langwatch agent run` sends one input to the agent and does not call its [setup and teardown hooks](/agent-testing/setup-and-teardown-hooks), which run only on scenario runs.
+
+### Point an HTTP agent at your machine
+
+`langwatch agent tunnel` (alias `langwatch agent dev`) fronts a local port with a public tunnel, points a registered HTTP agent's URL at it, and restores the previous URL on Ctrl-C.
+
+```bash
+langwatch agent tunnel --port 8010
+langwatch agent tunnel --port 8010 --agent <id or name>
+```
+
+| Flag                   | Effect                                                                                       |
+| ---------------------- | -------------------------------------------------------------------------------------------- |
+| `--port <port>`        | Tunnel `localhost:<port>`.                                                                   |
+| `--url <url>`          | Tunnel a full local URL, path included.                                                      |
+| `--agent <id or name>` | Which registered HTTP agent to repoint. A picker opens when omitted.                         |
+| `--tunnel-url <url>`   | Use a tunnel you already run and skip provisioning one. Also skips the session secret proxy. |
+| `--no-update-url`      | Print the tunnel URL and leave the agent configuration as it is.                             |
+| `--no-auth`            | Skip the session secret proxy, for a server that authenticates every request itself.         |
+
+The command is a live session with no machine-readable output, so it refuses `-o json`.
+
+A connected agent needs none of this: it reaches out from your machine, so a local process is already a target. See [Other ways to connect](/agent-testing/other-ways-to-connect) for when each one applies.
+
+## Share your local folder with Langy
+
+`langwatch langy --share-control` shares this folder with the Langy conversation that asked for it, so Langy can read and change files here, with your toolchain.
+
+```bash
+langwatch langy --share-control
+```
+
+Ask Langy for a code change in the LangWatch panel first. Its request appears in the terminal:
+
+```text
+╭─ Langy wants to work in acme-support ───────────────────────────────────────╮
+│                                                                             │
+│   Instrument traces with LangWatch                                          │
+│   Project ACME Support, asked 2 minutes ago.                                │
+│   /Users/dev/acme-support                                                   │
+│                                                                             │
+│   Do you want to share this folder?                                         │
+│ ❯ 1. Share this folder with Langy                                           │
+│   2. Cancel this request                                                    │
+│                                                                             │
+│   Enter or a number to answer · ↑↓ to choose · Esc to leave the request     │
+│   open                                                                      │
+╰─────────────────────────────────────────────────────────────────────────────╯
+```
+
+When two conversations asked for the same folder, you pick one first. After you share it, the command prints what Langy does, one line per call:
+
+```text
+⏺ Read(app/main.py)
+  ⎿  Read 84 lines
+⏺ Edit(app/main.py)
+  ⎿  Added 3 lines, removed 1 line
+⏺ Bash(uv run pytest)
+  ⎿  2 passed in 3.1s
+```
+
+Reading files, running read-only commands and ordinary git work need no answer. Everything else stops and asks:
+
+```text
+╭─ Langy wants to run in acme-support ────────────────────────────────────────╮
+│                                                                             │
+│   uv run pytest                                                             │
+│   This runs checks. Stops after 5 minutes if it has not finished.           │
+│                                                                             │
+│   Do you want to allow this?                                                │
+│ ❯ 1. Yes, allow "uv run" for this session                                   │
+│   2. Yes, this time only                                                    │
+│   3. No, and tell Langy what to do instead                                  │
+│                                                                             │
+│   The session grant covers every command that starts with "uv run".         │
+│                                                                             │
+│   Enter or a number to answer · ↑↓ to choose · Esc to deny · or answer on   │
+│   the card in LangWatch                                                     │
+╰─────────────────────────────────────────────────────────────────────────────╯
+```
+
+A number answers at once. The arrow keys move the highlight and Enter confirms it, and Escape denies with no reason. Choosing the third option reads one line of text and sends it to Langy as the reason, so you can say what to do instead.
+
+The same question also appears as a card in the LangWatch panel, and the first answer wins. When the card is answered first, the selector closes and the line under the call says the answer came from the card.
+
+With the output piped or redirected there is no selector, because there is no terminal to draw it on. The command prints the question and the card in the panel is the only way to answer it.
+
+A session grant is the program and its first argument, so `uv run` allows the tests and not `uv pip install`, and `.venv/bin/python -c` allows a one-line program and not every python command. The line under the options says what it covers.
+
+Paths outside the folder and `sudo` are refused whatever you answer. A grant lives with this run of the command: stop it and start it again, and Langy asks once more.
+
+A file that may hold secrets always asks, whether Langy reads it directly or through a shell command: `.env` and `.envrc`, keys and keystores, `.netrc`, `.npmrc`, `.pgpass`, `.git-credentials`, anything named for a token or a secret, `.git/config`, and anything under `.ssh/`, `.aws/` or `.docker/`. A committed `.env.example` still reads without a question.
+
+A command inherits only what a toolchain needs from your machine:
+
+- the shell and the locale: `PATH`, `HOME`, `SHELL`, `USER`, `TMPDIR`, `TERM`, `LANG`, and the `LC_*` and `XDG_*` families
+- where the toolchains live: `GOPATH`, `GOROOT`, `NVM_DIR`, `PYENV_ROOT`, `VIRTUAL_ENV`, `CONDA_PREFIX`, the `HOMEBREW_*` paths, and every `*_HOME` such as `JAVA_HOME`, `PNPM_HOME` or `CARGO_HOME`
+- how it reaches the network and what it trusts: `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `ALL_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE`
+
+Everything else your terminal holds stays behind, and a name that ends in `_KEY`, `_TOKEN`, `_SECRET` or `_PASSWORD` never passes even when it belongs to one of those families. Your project reads its own `.env` file itself, so it keeps working with the smaller environment.
+
+The command is a live session with no machine-readable output, so it refuses `-o json`. Press Ctrl-C to stop sharing; commands Langy started in the background keep running, and the terminal prints their process id and log path.
+
+## Run scenario tests
+
+Scenarios are the LangWatch equivalent of end-to-end tests for agents: a user simulator chats with your agent, an LLM judge scores the conversation against criteria you define, and everything is recorded for later inspection.
+
+```bash
+langwatch scenario list                       # see all scenarios
+langwatch scenario create "refund flow" \
+  --situation "User asks for a refund on a recent order" \
+  --criteria "Agent verifies identity,Agent processes the refund" \
+  --test-suite "Checkout"                     # file it into a test suite
+langwatch scenario run <scenario-id> --target http:<agent-id>
+```
+
+A **test suite** groups scenarios: a name and the scenarios you file under it. Every project has a `Default` test suite, so no scenario is loose.
+
+Run `langwatch test-suite list` before `scenario create` and file the scenario in the suite that fits; if none fits, ask the user which suite (or whether to make a new one).
+
+```bash
+langwatch test-suite list
+langwatch test-suite create "Checkout"
+langwatch test-suite get <id|name>
+langwatch test-suite rename <id|name> "Checkout regression"
+langwatch test-suite archive <id|name>
+langwatch test-suite run <id|name> --target http:<agent-id>   # every scenario × target
+```
+
+A **run plan** is what you run, and its name is its identity. A run under the name of a plan that exists replaces that plan's configuration and joins its history; a run under a new name creates the plan. The configuration is the scope, the targets, the repeat count and the two simulation models:
+
+```bash
+langwatch run-plan run --target http:<agent-id> --test-suite "Checkout" \
+  --name "Checkout nightly" --repeat 3 --note "after the pricing change"
+langwatch run-plan run --target http:<agent-id> --target prompt:<prompt-id> --all
+langwatch run-plan run --target http:<agent-id> --label critical --label support
+langwatch run-plan run --target http:<agent-id> --scenario <scenario-id>
+
+langwatch run-plan list                       # the plans of the project
+langwatch run-plan get <id>                   # the configuration the next run uses
+langwatch run-plan archive <id>
+```
+
+| Flag                                             | Effect                                                                                                                                                                                                                                           |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--target <type:id>`                             | What to run against, repeatable. `connected:`, `http:`, `code:` and `workflow:` take an agent id, `prompt:` takes a prompt id. `connected:` also takes `<name>@<environment>`. A `?key=value` suffix gives that target its own parameter values. |
+| `--all`, `--test-suite`, `--label`, `--scenario` | The scope. Exactly one kind per run; `--test-suite`, `--label` and `--scenario` repeat.                                                                                                                                                          |
+| `--name <text>`                                  | The plan to run under. Left out, the platform names the plan itself.                                                                                                                                                                             |
+| `--repeat <n>`                                   | How many times to run each scenario, 1 to 5.                                                                                                                                                                                                     |
+| `--simulator-model`, `--judge-model`             | The model that plays the user, and the model that judges.                                                                                                                                                                                        |
+| `--param key=value`                              | A value for a parameter the scenarios declare, repeatable.                                                                                                                                                                                       |
+| `--note <text>`                                  | One line about this run, up to 200 characters. It belongs to the run, not to the plan.                                                                                                                                                           |
+| `--idempotency-key <key>`                        | Repeat it to make a retry join the first run instead of starting a second one.                                                                                                                                                                   |
+| `--wait [minutes]`                               | Block until the batch is complete, for up to 45 minutes or the number of minutes given, and exit non-zero when a run failed.                                                                                                                      |
+
+A target is written `<type>:<referenceId>`. A **connected** agent takes a second form, `connected:<name>@<environment>`, which reads better in a CI job than an id and survives a project rebuild:
+
+```bash
+langwatch run-plan run --test-suite "Checkout" \
+  --target connected:support-agent@production \
+  --target connected:support-agent@staging --wait
+```
+
+Every connected target must be online when the run starts. A run naming an offline agent is refused with `agent_offline` before any scenario is scheduled. A personal development agent is refused with `agent_owner_only` for anyone but its owner, and a project API key names nobody, so it can never target one.
+
+Add `--format json` (or `-o json`) to any of the three run commands and they print one final document on stdout. With `--wait` that document comes after the poll and carries `outcome`, `tallies` and the per-run `results`.
+
+`langwatch test-suite run` and `langwatch scenario run` are shorter forms of the same thing: they run a plan named after the test suite or the scenario and the target, and take `--name`, `--repeat`, `--param`, `--note` and `--wait` the same way.
+
+The `/api/v1/suites` endpoints the older CLI versions called still answer and are deprecated. The commands above use `/api/v1/run-plans` and `/api/v1/test-suites`.
+
+### Compare two agents, or one agent on two models
+
+`--target` is repeatable, and every target runs every scenario of the run. Two targets in one run is a comparison: the batch holds both, and the results page shows one column per target with its own pass rate, duration and cost.
+
+A target may also carry the parameter values it alone runs with, written as a query string after the reference id. The same agent named twice with different values compares that agent on two models.
+
+```bash
+langwatch run-plan run --test-suite "Checkout" \
+  --target 'http:agent_abc123?model=gpt-6-sol' \
+  --target 'http:agent_abc123?model=gpt-6-luna' \
+  --name "Checkout model comparison" --wait
+
+langwatch run-plan run --all \
+  --target http:agent_candidate \
+  --target http:agent_production
+```
+
+Quote the value: the shell reads `?` and `&` itself. Both halves of a pair are percent-decoded, so a reference id or a value that holds `?` or `&` must be written as `%3F` or `%26`. A value is read as the type it looks like, the same rule `--param` uses.
+
+A target value wins over the same name given with `--param`, so `--param` carries what every target shares and the suffix carries what tells the targets apart:
+
+```bash
+langwatch test-suite run "Checkout" \
+  --param account_tier=platinum \
+  --target 'http:agent_abc123?model=gpt-6-sol' \
+  --target 'http:agent_abc123?model=gpt-6-luna'
+```
+
+Both targets run with `account_tier=platinum`, and each one with its own `model`.
+
+### Pass values into a run
+
+Every run command accepts a repeatable `--param key=value`. A parameter is a constant value that the whole run shares: a fixture id, a tenant, a plan, a region.
+
+```bash
+langwatch test-suite run <test-suite-id> --target http:<agent-id> --param account_tier=platinum --param region=eu-central
+langwatch scenario run <scenario-id> --target http:<agent-id> --param account_tier=platinum
+langwatch experiment run <experiment-slug> --param model=gpt-6-luna
+langwatch workflow run <workflow-id> --input '{"question":"where is my order?"}' --param region=eu-central
+```
+
+The value type follows the text you type. `true` and `false` are booleans. A value that parses as a number and prints back the same is a number. All other values stay text, so `007` and `1.50` stay text. When you repeat a name, the last value wins.
+
+Each command uses the values differently:
+
+- `run-plan run`, `test-suite run` and `scenario run` supply the parameters that the scenarios declare. A name that no scenario in the run declares is rejected before anything is scheduled. See [Scenario run parameters](/agent-testing/run-parameters).
+- `experiment run` merges the values into every dataset row. It also takes `--concurrency <n>`, from 1 to 24, for how many cells (one row against one target) run at once in this run only. Use `--concurrency 1` to run them one at a time, in order. See [Running experiments in CI/CD](/evaluations/experiments/ci-cd#choosing-what-to-evaluate).
+- `workflow run` sends the values as entry inputs. They are merged over `--input`, so a `--param` pair wins when both name the same key.
+
+`experiment run` also takes `--dataset-version <n>` to run a saved version of the experiment's dataset instead of its current content:
+
+```bash
+langwatch experiment run <experiment-slug> --dataset-version 1
+```
+
+### Inspect simulation runs
+
+Every scenario execution produces a **simulation run** you can inspect after the fact, full conversation, judge verdict, reasoning, met/unmet criteria, cost, and duration.
+
+```bash
+langwatch simulation-run list                         # recent runs, with relative timestamps
+langwatch simulation-run list --status FAILED        # only failures
+langwatch simulation-run list --name "refund flow"   # filter by name substring
+langwatch simulation-run get <run-id>                 # full details for one run
+langwatch simulation-run get <run-id> --full         # don't truncate long messages
+```
+
+The `get` command renders assistant thinking blocks and tool calls as readable plain text, no raw JSON dumps in your terminal. Use `--format json` on either command for structured output.
+
+For the full scenario testing guide, see the [Scenarios documentation](/agent-testing/scenarios).
+
+## Inspect traces
+
+Traces capture every LLM call your agent makes, prompts, responses, latency, cost, errors. Search and drill into them from the terminal:
+
+```bash
+langwatch trace search --limit 10              # most recent traces
+langwatch trace search --query "error"         # full-text search
+langwatch trace get <trace-id>                 # one trace in detail
+langwatch trace export --output traces.jsonl   # stream traces for offline analysis
+```
+
+With a device login, these commands read your personal workspace by default. Add `--project <id|slug>` to read any other project your login key covers:
+
+```bash
+langwatch projects list                              # projects the key can read
+langwatch trace search --project checkout-agent      # search another project by slug
+```
+
+Agents use this to debug their own instrumentation: after running your code once, ask the assistant to run `langwatch trace search --limit 5` and verify traces are flowing. If no trace appears, the instrumentation is wrong, no need to read logs.
+
+## Query analytics
+
+Analytics aggregate your traces into performance and cost metrics without leaving the terminal:
+
+```bash
+langwatch analytics --help          # available metrics and dimensions
+```
+
+Use it to answer questions like "what's my P95 latency this week", "how much did each agent cost last month", or "which prompts produce the most errors". The underlying data is the same as the LangWatch dashboard.
+
+## Manage platform resources
+
+Every LangWatch resource follows the same consistent subcommand shape:
+
+```bash
+langwatch <resource> list
+langwatch <resource> get <id>
+langwatch <resource> create <name> [options]
+langwatch <resource> update <id> [options]
+langwatch <resource> delete <id>
+```
+
+Available resources include:
+
+- **`evaluator`**, create and version evaluators (answer correctness, faithfulness, custom LLM judges)
+- **`monitor`**, online evaluations that score production traces automatically
+- **`dataset`**, evaluation datasets (upload CSV, download, manage columns)
+- **`agent`**, agent definitions used by scenarios and monitors (see [Manage agents](#manage-agents))
+- **`dashboard`** and **`graph`**, custom analytics dashboards
+- **`trigger`**, automations (alerts, webhooks, dataset-append on failure)
+- **`secret`**, encrypted environment variables for scheduled agent runs
+- **`workflow`**, reusable workflows built in the UI
+- **`model-provider`**, configure OpenAI, Anthropic, Azure, or Bedrock for your project
+- **`annotation`**, attach labels to traces for supervised fine-tuning data
+
+Run `langwatch <resource> --help` on any of these for subcommand-level options, and `--format json` to get structured output for scripting.
+
+## Organization management
+
+These commands manage org-wide resources and require an API key with organization-level permissions.
+
+The organization, members, invites, groups, roles, role bindings and SCIM token commands are available on Enterprise plans. Without one they exit with `enterprise_plan_required` and tell you what to do about it. Projects, teams, API keys and the self-hosted organizations command are not gated.
+
+### Projects
+
+```bash
+# List all projects in your organization
+langwatch projects list
+langwatch projects list --format json
+
+# Create a project (returns a one-time service API key)
+langwatch projects create \
+  --name "My Agent Project" \
+  --language python \
+  --framework langchain \
+  --new-team-name "Engineering"
+
+# Get project details
+langwatch projects get proj_01HZX9K3MN...
+
+# Update project metadata
+langwatch projects update proj_01HZX9K3MN... --name "Renamed"
+
+# Move a project to another team (project and team by id, slug or name)
+langwatch projects move checkout --team Payments
+
+# Archive a project (soft-delete)
+langwatch projects delete proj_01HZX9K3MN...
+```
+
+When creating a project, the CLI displays the service API key exactly once. Save it immediately. It cannot be retrieved later.
+
+A move runs the same checks as the project settings screen: the team must be an active team of the same organization, and a project cannot cross the personal workspace boundary. Gateway keys that send traces to the project switch to the new team's budgets right away.
+
+### API keys
+
+```bash
+# List all API keys
+langwatch api-keys list
+langwatch api-keys list --format json
+
+# Create a service key (org-wide)
+langwatch api-keys create --name "CI Pipeline"
+
+# Create a service key scoped to specific projects
+langwatch api-keys create \
+  --name "Staging Key" \
+  --project-id proj_01HZX... \
+  --project-id proj_02ABC...
+
+# Read one key and the access it carries
+langwatch api-keys get key_01HZX...
+
+# Rename it, or replace what it reaches
+langwatch api-keys update key_01HZX... --name "Staging (read only)"
+
+# Revoke a key (cannot be undone)
+langwatch api-keys revoke key_01HZX...
+```
+
+Both `create` and `update` take the access flags: `--binding role:scopeType:scopeId` says what the key reaches and where, `--permission resource:action` narrows a restricted key to an exact list, and `--permission-mode` picks between `all`, `readonly` and `restricted`. The first two repeat. On `update`, the bindings you pass replace the key's existing ones rather than adding to them.
+
+```bash
+langwatch api-keys create \
+  --name "Nightly evaluations" \
+  --permission-mode restricted \
+  --binding CUSTOM:PROJECT:proj_01HZX... \
+  --permission project:view \
+  --permission evaluations:create
+```
+
+### Organization
+
+Read and update the organization your key belongs to. There is no id to pass: the credential decides which organization you are talking to.
+
+```bash
+langwatch organization get
+
+langwatch organization update --name "Acme" --support-contact support@acme.example
+
+# Presence and trace sharing are on/off pairs
+langwatch organization update --no-trace-sharing
+```
+
+Turning trace sharing off revokes the share links that were already handed out, not only future ones.
+
+### Members
+
+Manage the people already in the organization. Someone joins through an invite, so `invites` is where a new person starts.
+
+```bash
+langwatch members list
+langwatch members list --include-disabled
+
+langwatch members get user_01HZX...
+langwatch members update user_01HZX... --role ADMIN
+
+# Offboarding: disable keeps the membership, remove does not
+langwatch members disable user_01HZX...
+langwatch members enable user_01HZX...
+langwatch members remove user_01HZX...
+```
+
+`langwatch members access user_01HZX...` answers the auditor's question: everything the person can reach, and whether it comes from their organization role, a group, or a binding of their own.
+
+### Invites
+
+Invite people in, up to 50 at a time, landing on the teams you name. Accepting stays a browser step; everything before it is here.
+
+```bash
+# One person, one team
+langwatch invites create \
+  --email engineer@acme.example \
+  --role MEMBER \
+  --team team_01HZ...:MEMBER
+
+# A batch, from a file
+langwatch invites create --file ./new-hires.json
+
+langwatch invites list
+langwatch invites revoke <invite_id>
+```
+
+`--email` and `--team` repeat, and `--role` takes either one value for the whole batch or one per email. When people need different teams or a custom role each, `--json`, `--file` and `--stdin` take a JSON array of invites instead, the same entries the API takes. Every invite comes back with its acceptance link, so a deployment with no email provider still has something to send.
+
+### Teams
+
+Teams group projects and the people who work on them.
+
+```bash
+langwatch teams list
+langwatch teams get team_01HZ...
+langwatch teams create --name "Engineering"
+langwatch teams create --name "Payments" --copy-members-from team_01HZ...
+langwatch teams update team_01HZ... --name "Platform Engineering"
+langwatch teams archive team_01HZ...
+
+langwatch teams members list team_01HZ...
+langwatch teams members add team_01HZ... user_01HZX... user_01HZY... --role MEMBER
+langwatch teams members remove team_01HZ... user_01HZX...
+```
+
+`--copy-members-from` adds every member of the source team with the role they hold there. A member holding only a custom role is listed as not copied; grant it with `langwatch grants create`. `teams members add` takes several users; one that cannot be added does not stop the rest, and the command fails naming it.
+
+### Groups
+
+A group is a named set of people that carries role bindings, so everyone in it inherits the same access. Groups synced from your identity provider land here too.
+
+```bash
+langwatch groups list
+langwatch groups get group_01HZ...
+
+# Create with members and access in one call
+langwatch groups create \
+  --name "Backend Engineers" \
+  --member-id user_01HZX... \
+  --binding MEMBER:TEAM:team_01HZ...
+
+langwatch groups rename group_01HZ... --name "Platform Engineers"
+langwatch groups delete group_01HZ...
+
+langwatch groups members list group_01HZ...
+langwatch groups members add group_01HZ... user_01HZX...
+langwatch groups members remove group_01HZ... user_01HZX...
+
+langwatch groups bindings list group_01HZ...
+langwatch groups bindings add group_01HZ... \
+  --role MEMBER --scope-type TEAM --scope-id team_01HZ...
+langwatch groups bindings remove group_01HZ... <binding_id>
+```
+
+A group your identity provider owns cannot be renamed or have its membership edited here, because the provider is the source of truth for both. Its bindings are still yours to manage.
+
+### Roles
+
+Custom roles are named permission sets, for when `ADMIN`, `MEMBER` and `VIEWER` are not the shape you need.
+
+```bash
+# The catalog the permission keys come from
+langwatch roles permissions
+
+langwatch roles create \
+  --name "Release reviewer" \
+  --description "Reads traces and runs evaluations, changes nothing" \
+  --permission project:view \
+  --permission traces:view \
+  --permission evaluations:create
+
+langwatch roles list
+langwatch roles get <custom_role_id>
+langwatch roles delete <custom_role_id>
+```
+
+`langwatch roles update` replaces the permission set with the `--permission` flags you pass, so send the full list you want the role to end up with. A role something still holds cannot be deleted: the error says how many bindings and assignments are in the way.
+
+### Grants
+
+A grant is one sentence: this principal holds this role, here. Users, groups and API keys are all principals. Built-in roles are `admin`, `member` and `viewer`; a custom role is its id.
+
+```bash
+langwatch roles list --built-in    # admin, member and viewer
+langwatch roles list --no-built-in # custom roles only
+
+langwatch grants list
+langwatch grants list --principal-type user --principal-id user_01HZX...
+langwatch grants list --scope-type project --scope-id proj_01HZX... --status active
+
+langwatch grants create \
+  --principal-type group --principal-id group_01HZ... \
+  --role member \
+  --scope-type team --scope-id team_01HZ... \
+  --idempotency-key onboard-group-01HZ
+
+# A service credential, scoped to one project through a custom role, with an end date
+langwatch grants create \
+  --principal-type api-key --principal-id key_01HZX... \
+  --role <custom_role_id> \
+  --scope-type project --scope-id proj_01HZX... \
+  --expires-at 2027-01-01T00:00:00Z
+
+langwatch grants get <grant_id>
+langwatch grants change-role <grant_id> --role admin
+langwatch grants revoke <grant_id>
+```
+
+`grants list` prints one page; pass the `--cursor` it prints to read the next. Each create makes a new grant, so a provisioning script that may run twice passes `--idempotency-key`: a repeat with the same key and flags returns the first grant. `change-role` changes only the role; the principal and the scope are the grant's identity, so moving a grant means revoking it and creating another.
+
+You cannot grant a role carrying permissions you do not hold at that scope, and an API key is judged by its own permissions, not its owner's. The refusal, `grant_exceeds_caller_permissions`, lists the permissions you lack under **Details**. See [Roles & access](/platform/roles-and-access).
+
+### Role bindings (deprecated)
+
+`langwatch role-bindings list|create|update|delete` still works against the same records, and prints a deprecation warning on stderr pointing to `langwatch grants`. Move scripts to `grants`; the flags map as in the [migration table](/api-reference/role-bindings/overview#migrating-to-grants).
+
+### SCIM tokens
+
+The bearer tokens your identity provider presents to the SCIM endpoints.
+
+```bash
+langwatch scim-tokens create --description "Okta production"
+langwatch scim-tokens list
+langwatch scim-tokens revoke <scim_token_id>
+```
+
+The token value is printed once, when you create it. To rotate: create a second token, store it in the provider, watch the new token's last-used time move, then revoke the old one.
+
+### Organizations (self-hosted)
+
+The one family that authenticates against the instance rather than an organization, because it runs before any organization exists. It is available on self-hosted deployments that have `LANGWATCH_INSTANCE_ADMIN_API_KEY` configured.
+
+```bash
+export LANGWATCH_INSTANCE_ADMIN_API_KEY=...
+
+langwatch organizations create --name "Acme" --slug acme
+langwatch organizations list
+langwatch organizations get organization_01HZ...
+```
+
+Creating an organization returns an organization admin API key alongside it, printed once. That key is what every command above takes, so an infrastructure-as-code run can go from an empty deployment to a configured organization without opening a browser. Pass the instance credential with `--instance-key` if you would rather not export it.
+
+### Checkup (self-hosted)
+
+`langwatch doctor` runs the same checks as **Settings, Checkup** on the install the CLI is pointed at, and prints one line per row with `PASS`, `FAIL` or `NOT CHECKED`, the fix under a fail, and then the exact usage report the install sends to LangWatch.
+
+```bash
+export LANGWATCH_ENDPOINT=https://langwatch.acme.internal
+export LANGWATCH_API_KEY=...        # a project API key of the install
+
+langwatch doctor                    # the free checks and the usage report
+langwatch doctor --run              # also reach the LangWatch hosts, write to storage, verify SMTP, test a model provider, run the canaries
+langwatch doctor --run --scenario-run-plan-id smoke-suite
+langwatch doctor --format json      # the rows and the report as one document
+```
+
+The checks live on the install, behind `GET /api/checkup` and `POST /api/checkup/run`; the command asks and prints, so the page and the terminal cannot disagree. `--run` opens connections and can spend money on a judge or a model, which is why it is a flag. See [Data and telemetry](/self-hosting/data-and-telemetry) for what the report carries.
+
+## Trigger experiments
+
+Experiments batch-run an agent or prompt against a dataset and produce an evaluation report:
+
+```bash
+langwatch evaluation --help
+```
+
+Typically you script this in CI: check out the branch, run the experiment, fail the build if the pass rate drops below your threshold. The CLI emits machine-readable results so this plumbing is straightforward.
+
+## Progressive disclosure
+
+The CLI leans heavily on `--help`. Every subcommand has its own, and the top-level `langwatch --help` is the best way to discover what's available:
+
+```bash
+langwatch --help
+langwatch prompt --help
+langwatch prompt tag --help
+langwatch prompt tag create --help
+```
+
+New capabilities show up in `--help` the moment they ship, so you never have to wonder whether a flag exists.
+
+## AI Gateway commands
+
+The CLI provisions AI Gateway resources without touching the UI. Behaviour matches the dashboard exactly; both share a server-side service layer. Every command takes `--format json` for scripting.
+
+### Virtual keys
+
+```bash
+langwatch virtual-keys list
+langwatch virtual-keys get vk_01HZX9K3MN...
+
+# Create: the secret is printed once, store it immediately
+langwatch virtual-keys create \
+  --name prod-key \
+  --scope team:team_01HZ... \
+  --providers-allowed mp_01HZX...,mp_01HZY... \
+  --budget-limit 500 --budget-window month
+
+# Create for someone else: the secret is not printed, the app shows it to them once
+langwatch virtual-keys create --name prod-key --reveal-once
+
+langwatch virtual-keys update vk_01HZX9K3MN... --budget-limit 750
+langwatch virtual-keys spend vk_01HZX9K3MN... --from 2026-07-01T00:00:00Z
+
+# Rotate: the new secret is printed once, the old one keeps working for 24 hours
+langwatch virtual-keys rotate vk_01HZX9K3MN...
+
+# Disable is reversible, revoke is not
+langwatch virtual-keys disable vk_01HZX9K3MN... --reason "payment overdue"
+langwatch virtual-keys enable vk_01HZX9K3MN...
+langwatch virtual-keys revoke vk_01HZX9K3MN...
+```
+
+With a device login, `list`, `get` and `spend` answer for every virtual key your login can see, across projects. Add `--project <id|slug>` to narrow them to one project.
+
+`--scope` takes `type:id` pairs (`org`, `team`, or `project`) and repeats for several; it defaults to the project named by `--project`, or your personal project. `--providers-allowed` is a comma-separated list of ModelProvider ids. The atomic `--budget-*` flags cap the key itself and accept `day`, `week`, or `month`.
+
+`--reveal-once` withholds the secret from the output and returns a `reveal_id` and the key's prefix instead. The secret is stored encrypted for 24 hours and can be read exactly once through the app, which is how Langy shows a key without ever printing it.
+
+### Gateway budgets
+
+```bash
+langwatch gateway-budgets list --scope-type team,project
+
+langwatch gateway-budgets create \
+  --name eng-team-monthly \
+  --scope team --team team_01HZ... \
+  --window month --limit 5000 --on-breach warn
+
+# Anchor the cycle to your own billing date instead of the calendar
+langwatch gateway-budgets create \
+  --name customer-acme \
+  --scope virtual-key --virtual-key vk_01HZX... \
+  --window month --limit 250 --cycle-anchor-at 2026-01-17T09:00:00Z
+
+langwatch gateway-budgets update bgt_01HZ... --limit 6000
+langwatch gateway-budgets reset bgt_01HZ... --reason "contract renewed"
+langwatch gateway-budgets archive bgt_01HZ...
+```
+
+A budget counts spend from the moment it is created: spend earlier in the current window is not counted against it. The budget commands take a project key or an organization key; an organization key needs no project.
+
+`--scope` is `organization|team|project|virtual-key|principal|group`, each paired with its own id flag. `--window` accepts `minute|hour|day|week|month|total|manual`, `--on-breach` is `block` (default) or `warn`, and `--limit` is USD. `--cycle-anchor-at` takes an RFC 3339 instant and cannot be used with `total` or `manual`; it is fixed at creation. List output colourises spent-vs-limit, red at 100%, yellow from 80%.
+
+### Webhooks
+
+Endpoint management needs an **organization** API key (see [Webhooks](/features/webhooks)).
+
+```bash
+langwatch webhooks list
+langwatch webhooks get whe_01HZ...
+langwatch webhooks event-types            # the subscribable catalog, by family
+
+# Create: the signing secret is printed once
+langwatch webhooks create \
+  --url https://billing.example.com/webhooks/langwatch \
+  --events gateway.request.completed,gateway.request.settled
+
+langwatch webhooks update whe_01HZ... --max-batch-size 50 --max-in-flight 4
+langwatch webhooks test whe_01HZ...       # one signed test.ping through the real path
+langwatch webhooks health whe_01HZ...     # how stale your feed could be
+langwatch webhooks deliveries whe_01HZ... --limit 100
+langwatch webhooks roll-secret whe_01HZ...
+langwatch webhooks disable whe_01HZ...
+langwatch webhooks enable whe_01HZ...
+langwatch webhooks archive whe_01HZ...
+
+# The org's emitted-events log, independent of delivery
+langwatch webhooks events --type gateway.request.completed --from 2026-07-01
+```
+
+`--events` replaces the whole subscription set. `deliveries` and `events` page with `--cursor` and `--limit`.
+
+### Spend events
+
+The billing pull surface, also an **organization** API key (see [Billing and spend events](/ai-gateway/billing-events)).
+
+```bash
+# Reconciliation checksums first
+langwatch spend-events summary --group-by virtual_key --from 2026-07-01 --to 2026-08-01
+
+# Item diff only where a checksum diverged
+langwatch spend-events list --from 2026-07-01 --to 2026-08-01 --virtual-key vk_01HZX...
+
+# One external end user's rollup
+langwatch spend-events by-user customer-acme-42 --window month
+
+# Re-deliver a gap to one endpoint (7-day window cap)
+langwatch spend-events replay --from 2026-07-14 --to 2026-07-15 --endpoint whe_01HZ...
+```
+
+Date flags take ISO-8601 or epoch milliseconds.
+
+<Note>
+  Provider credentials and cache rules have no CLI group. Manage providers with `langwatch
+  model-provider`, and cache rules over [REST](/ai-gateway/api/management#cache-rules) or the
+  dashboard.
+</Note>
+
+Required token permissions map onto the [RBAC](/ai-gateway/rbac) grants:
+
+| Command group         | Permission           |
+| --------------------- | -------------------- | --------------------- | -------------------- | ------ | ------------ | ----------------------- | ------------------------- |
+| `projects list        | get`                 | `project:view`        |
+| `projects create`     | `project:create`     |
+| `projects update`     | `project:update`     |
+| `projects move`       | `project:update`     |
+| `projects delete`     | `project:delete`     |
+| `api-keys list`       | `organization:view`  |
+| `api-keys create      | revoke`              | `organization:manage` |
+| `virtual-keys list    | get`                 | `virtualKeys:view`    |
+| `virtual-keys create` | `virtualKeys:create` |
+| `virtual-keys update  | disable              | enable`               | `virtualKeys:update` |
+| `virtual-keys rotate` | `virtualKeys:rotate` |
+| `virtual-keys revoke` | `virtualKeys:delete` |
+| `virtual-keys spend`  | `gatewayUsage:view`  |
+| `gateway-budgets *`   | `gatewayBudgets:*`   |
+| `webhooks list        | get                  | deliveries            | health               | events | event-types` | `webhookEndpoints:view` |
+| `webhooks create      | update               | archive               | roll-secret          | test   | enable       | disable`                | `webhookEndpoints:manage` |
+| `spend-events *`      | `gatewaySpend:view`  |
+
+See the [public REST API reference](/ai-gateway/api/chat-completions) for direct HTTP calls that don't require Node.
+
+## Agent usage
+
+In a terminal the CLI prints tables, colour, and spinners. Driven by an AI coding assistant it switches to machine output automatically. Everything an agent needs to know is also built into the CLI itself: `langwatch help agent-mode` prints the condensed version of this section.
+
+### Agent mode
+
+`--agent` on any command, or auto-detection from the environment (`CLAUDECODE`, `CLAUDE_CODE`, `CURSOR_AGENT`, `GITHUB_COPILOT`, `AMAZON_Q`, `LW_AGENT_MODE`, `LANGWATCH_AGENT_MODE`), switches output to compact single-line JSON and turns colour and spinners off:
+
+```bash
+langwatch trace search --agent
+LW_AGENT_MODE=1 langwatch monitor list
+```
+
+### Output contract
+
+Every command accepts the same output flags (with a few documented exceptions:
+`trace export -o` is an output _file_, the coding-assistant wrappers pass flags
+through to the wrapped tool, and `dataset records add/update --json` takes a
+record _payload_):
+
+| Flag                    | Meaning                                                                                                                                                                      |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-o, --output <format>` | `table` (human default), `json`, `agents` (compact single-line JSON), `yaml`                                                                                                 |
+| `--json <fields>`       | JSON with only the given comma-separated fields                                                                                                                              |
+| `--jq <expr>`           | Project the result before printing: dot paths, `.items[]`, `.items[].field`, `.items[0]` (negative indexes count from the end), and `length` with or without a `\|` in front |
+| `--limit <n>`           | Keep at most n rows of the result, in the machine formats. A command that pages with a `--limit` of its own keeps that one                                                   |
+
+```bash
+langwatch trace search --jq '.traces[].traceId'
+langwatch prompt list --jq length          # how many, in one call
+langwatch prompt list --limit 5 -o json    # the first five rows only
+langwatch evaluator list --json id,name,slug
+langwatch monitor list -o yaml
+```
+
+The legacy `-f/--format json` spelling keeps working and maps onto the same contract. The contract is fully wired for traces, evaluators, monitors, status, skills, `commands`, and `help-tree`; on the remaining resource commands the flags parse but machine output is still rolling out, so those commands keep their legacy `-f json` behavior until migrated.
+
+### Structured errors
+
+A failed command prints one JSON document on **stdout** (`{ "ok": false, "error": { "code", "message", "httpStatus", "suggestions", "docUrl", "traceId", ... } }`), keeps the human-readable block on **stderr**, and exits non-zero. Never merge the streams (`2>&1`) when parsing output; hints and error prose live on stderr by design so stdout stays parseable.
+
+### Discovery
+
+An agent can learn the whole CLI without reading these docs:
+
+```bash
+langwatch commands --flat --jq '.commands[].path'   # machine catalog: args, flags, hints, token costs
+langwatch help-tree                                  # compact annotated tree for context injection
+langwatch help agent-mode                            # the agent-mode guide, from the CLI itself
+langwatch status                                     # project overview + what needs attention
+```
+
+### Skills
+
+The CLI carries LangWatch's agent skills and installs them into `~/.agents/skills` (or the project-level `.agents/skills` with `--dir .`):
+
+```bash
+langwatch skills list                  # bundled skills + installed state
+langwatch skills install --all         # install everything (use --dry-run to preview)
+langwatch skills get tracing           # raw SKILL.md on stdout, for piping into context
+```
+
+See the [Skills Directory](/skills/directory) for what each skill covers.
+
+### Daemon note
+
+Non-TTY invocations (agents, pipes, CI) are served by the background daemon described below. The output is identical, and the command returns faster. `LANGWATCH_NO_DAEMON=1` opts out per invocation.
+
+## Report issues to LangWatch
+
+If anything did not work (broken commands, confusing docs, unexpected errors, things that took trial and error), send it straight to the LangWatch team. No login or API key needed:
+
+```bash
+# Summary report: what you tried, verbatim errors, what you had to figure out
+npx langwatch report --user-approved \
+  --title "scenario create 500" \
+  --summary "langwatch scenario create returned HTTP 500 with ..."
+
+# Full session report (best): attach the transcript, redacted locally
+npx langwatch report --user-approved \
+  --title "agent stuck instrumenting" \
+  --session ~/.claude/projects/<project-dir>/<session-id>.jsonl
+```
+
+Agents must ask the user for permission first, then pass `--user-approved`. Secrets, API keys, emails, and phone numbers are redacted locally before anything is sent; the [redaction rules are auditable](https://github.com/langwatch/langwatch/blob/main/packages/redaction/src/sessionReport.ts) and `--dry-run` previews the exact payload. See the [reporting guide](/support#reporting-issues-from-coding-agents) for transcript locations and details.
+
+## The background daemon
+
+Non-interactive invocations (an agent piping output, CI, any call whose stdin/stdout/stderr is not a TTY) are served by a warm background daemon instead of paying node's cold start on every call. Interactive (terminal) invocations always run in-process and are unaffected.
+
+So are the commands that mutate auth or take over stdio (`login`, `logout`, `config`, `open`, `instrument`, `report`, the `claude`/`codex`/`copilot`/`code`/`cursor`/`gemini`/`opencode` wrappers, `daemon` itself) and the long-running flags (`--follow`, `--watch`, `--wait`). Windows is excluded too: the daemon is not supported there, so on Windows every invocation runs in-process.
+
+What to know:
+
+- **One daemon per identity.** The socket name is a hash of endpoint + API key + uid + config path, so two projects with different keys never share a daemon. The socket lives in `$XDG_RUNTIME_DIR` (or the temp dir) with `0600` permissions inside a `0700` directory, and the daemon self-exits after 10 idle minutes.
+- **Always optional.** If no daemon is reachable, or it is stale, or from an older CLI build, the command runs in-process, and a daemon is auto-spawned in the background for next time. Set `LANGWATCH_DAEMON_NO_SPAWN=1` to disable the auto-spawn.
+- **Buffered output.** A daemon-served command's output is buffered and flushed when it exits, so a mid-command daemon failure can retry in-process without duplicating output. Piped callers therefore see output at exit, not progressively (beyond an 8MB buffer it starts streaming early).
+- **Timeouts and cancellation.** A command that hangs is abandoned after a per-request timeout (default 10 minutes, override with `LANGWATCH_DAEMON_REQUEST_TIMEOUT_MS`) with exit code 124; the clock starts when the daemon accepts the request, so time spent queued behind another caller's working directory counts against it. Ctrl-C on the client cancels the server-side command with exit code 130.
+- **Environment hygiene.** The daemon does not inherit the spawning shell's environment. It receives only process essentials (PATH, HOME, locale, …), the pinned identity variables, and the spawner's allowlisted output/proxy knobs (`FORCE_COLOR`, `NO_COLOR`, `HTTPS_PROXY`, …). Those allowlisted values from the _spawning_ caller persist in the daemon's baseline and are visible to later callers that don't set them; secrets are never in the allowlist. Per request, the caller's own `.env` is applied scoped to `LANGWATCH_*` keys only.
+
+Manage it explicitly:
+
+```bash
+langwatch daemon status          # pid, uptime, served/in-flight counts (--json supported)
+langwatch daemon start           # start in the background (normally automatic)
+langwatch daemon stop            # stop and remove the socket
+```
+
+Opt out:
+
+```bash
+LANGWATCH_NO_DAEMON=1 langwatch trace list   # per-invocation
+langwatch config set daemon off              # persistent, user-global (~/.langwatch/config.json)
+```
+
+`config set daemon off` doesn't stop an already-running daemon. Clients stop dialling it, and it idles out on its own within 10 minutes (`langwatch daemon stop` kills it immediately).
+
+## Use the CLI as your agent's control plane
+
+An AI coding assistant operates LangWatch end-to-end through the CLI. Skills like [Tracing, Evaluations, Scenarios, and Prompt Versioning](/skills/directory) are built on top of it, the assistant reads docs via `langwatch docs`, runs platform operations via the subcommands, and verifies its own work by searching traces and inspecting simulation runs.
+
+If you're building your own agent workflows, the pattern works the same way: give the assistant the CLI and ask it what you want. Everything it does is auditable in the LangWatch app afterwards.
+
+<AgentReportNotice />

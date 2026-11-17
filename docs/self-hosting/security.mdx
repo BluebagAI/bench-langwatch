@@ -1,0 +1,414 @@
+---
+title: Security
+description: "Security model, encryption, secrets management, and hardening for LangWatch"
+---
+
+Self-hosted LangWatch authenticates users, encrypts stored credentials, isolates tenants at the query layer, and hardens every pod it authors by default. Three bundled components cannot meet [strict admission control](#strict-admission-control) and must be disabled or replaced there.
+
+<Frame caption="Identity, keys, secrets and network exposure of a self-hosted install.">
+  <img src="/images/self-hosting/self-hosting-security-light.svg" alt="Security view of a self-hosted install: sign-in through your identity provider, API keys for agents, TLS at the ingress with only the App exposed, internal services and data stores, and Kubernetes Secrets synced from your secret manager" className="block dark:hidden" />
+  <img src="/images/self-hosting/self-hosting-security-dark.svg" alt="Security view of a self-hosted install: sign-in through your identity provider, API keys for agents, TLS at the ingress with only the App exposed, internal services and data stores, and Kubernetes Secrets synced from your secret manager" className="hidden dark:block" />
+</Frame>
+
+## Authentication & Authorization
+
+LangWatch handles user authentication with support for:
+
+- Email/password (default)
+- SSO providers: Azure AD, Okta, Auth0, Google, GitHub, GitLab
+
+See [SSO Configuration](/self-hosting/configuration/sso) for setup guides.
+
+**Role-Based Access Control (RBAC)** controls what users can do within a project:
+
+- Organization-level roles (owner, admin, member)
+- Project-level permissions
+
+**SCIM provisioning** (Enterprise) enables automated user lifecycle management from your identity provider.
+
+**API keys** authenticate the SDKs, the CLI and the REST API. They are random tokens, not JWTs. A key in the current format (`sk-lw-`, `ik-lw-` or `pat-lw-` followed by a lookup id and a secret) is stored as a lookup id plus an HMAC-SHA256 of the secret, keyed with [`CREDENTIALS_SECRET`](#credentials-secret), so a database dump alone cannot be used to recover or verify a key.
+
+Two exceptions: `pat-lw-` keys created before the HMAC upgrade keep a plain SHA-256 hash until their next use, when it is rewritten as HMAC; older project keys are stored as-is on the project and compared directly.
+
+## Encryption
+
+### At Rest
+
+| Data Store         | Encryption Method                                            |
+| ------------------ | ------------------------------------------------------------ |
+| PostgreSQL         | Provider-level encryption (RDS: AES-256, Cloud SQL: AES-256) |
+| ClickHouse         | Encrypted volumes (EBS encryption, PD encryption)            |
+| S3                 | Server-side encryption (SSE-S3 or SSE-KMS)                   |
+| Stored credentials | Application-level encryption via `CREDENTIALS_SECRET`        |
+
+### Credentials secret
+
+`CREDENTIALS_SECRET` is the application-level encryption key, applied on top of database-level encryption. The app and workers read it. The Helm chart always sets it, from `app.credentialsEncryptionKey` or from the `credentialsEncryptionKey` key of the app Secret, and fails to render when no value, Secret or autogen provides one.
+
+**Format.** 64 hex characters (32 bytes). Generate one with `openssl rand -hex 32`. Any other value makes every encrypt and decrypt call fail. When `CREDENTIALS_SECRET` is unset the app falls back to `NEXTAUTH_SECRET`, which then has to meet the same format. Set `CREDENTIALS_SECRET` explicitly.
+
+**What it encrypts.** Values are stored as AES-256-GCM ciphertext in PostgreSQL:
+
+- Model provider API keys and custom provider settings
+- Project secrets and scenario run secret values
+- Project and organization S3 storage credentials
+- SSO connection credentials
+- Webhook signing secrets and Slack integration credentials
+- Stored MCP and agent API keys, Langy virtual keys, and API idempotency receipts
+
+**What else it keys.** The same value is the HMAC pepper for API keys (see Authentication & Authorization above) and signs short-lived tokens (voice session tokens, GitHub App install state).
+
+**Changing it without the old value.** Data written under the old value cannot be read under a new one:
+
+- Model provider keys, project secrets, S3 credentials, SSO credentials and integration secrets have to be entered again. Checkup reports model providers whose keys no longer decrypt.
+- Every API key and SCIM token in the current format stops authenticating and has to be recreated. Older project keys, and `pat-lw-` keys still on a plain SHA-256 hash, keep working.
+- In-flight signed tokens are rejected and the user starts that flow again.
+
+The rows are not deleted, so setting the old value back makes them readable again, except for anything already re-entered under the new value.
+
+Keep the value stable across upgrades, restores and migrations to a new cluster, and back it up together with your PostgreSQL backups. A database restored without its `CREDENTIALS_SECRET` comes back with none of its stored credentials usable. To replace the value while keeping the data, follow the rotation procedure below.
+
+### Rotating the credentials secret
+
+Rotation needs the old value. `CREDENTIALS_SECRET_PREVIOUS` holds it while data moves to the new one. The app and workers write only with `CREDENTIALS_SECRET`. They read with `CREDENTIALS_SECRET` first and fall back to `CREDENTIALS_SECRET_PREVIOUS`.
+
+<Steps>
+  <Step title="Set both values">
+    Generate a new value with `openssl rand -hex 32`. Set it as `CREDENTIALS_SECRET` and set the old value as `CREDENTIALS_SECRET_PREVIOUS`. On Helm the old value goes in `app.credentialsEncryptionKey.previous.value` or `app.credentialsEncryptionKey.previous.secretKeyRef`. With `secrets.existingSecret`, add it to that Secret and name its key in `secrets.secretKeys.credentialsEncryptionKeyPrevious`.
+
+    An install that never set `CREDENTIALS_SECRET` encrypts with `NEXTAUTH_SECRET`. Use that value as `CREDENTIALS_SECRET_PREVIOUS`.
+  </Step>
+  <Step title="Roll every app and worker pod">
+    Wait until no pod is left on the old configuration. A pod that has only the old value cannot read what a pod with the new value writes.
+  </Step>
+  <Step title="Re-encrypt stored credentials">
+    Run the `credentials-reseal` task from a workers pod, first as a dry run:
+
+    ```bash
+    kubectl -n langwatch exec deploy/langwatch-workers -- \
+      sh -c 'cd /app/apps/tasks && HOME=/tmp pnpm run task credentials-reseal --dry-run'
+    ```
+
+    On Docker Compose:
+
+    ```bash
+    docker compose -f infra/compose.yml --project-directory . exec workers \
+      sh -c 'cd /app/apps/tasks && HOME=/tmp pnpm run task credentials-reseal --dry-run'
+    ```
+
+    Run it again without `--dry-run` to write. The task scans the text and JSON columns in PostgreSQL and rewrites each value encrypted with the old secret. It logs one line per column with the counts `resealed`, `alreadyCurrent` and `undecryptable`, then the totals.
+  </Step>
+  <Step title="Let API keys and SCIM tokens move">
+    API key and SCIM token hashes cannot be recomputed from the database. Each one moves to the new secret the next time it is used while `CREDENTIALS_SECRET_PREVIOUS` is set. Keep both values in place long enough for every key in use to make one request.
+  </Step>
+  <Step title="Remove the old value">
+    Run the task once more. When it reports `resealed: 0`, unset `CREDENTIALS_SECRET_PREVIOUS` and roll the pods.
+  </Step>
+</Steps>
+
+The task is safe to run again and safe to interrupt. A value the new secret already opens is left alone. An `undecryptable` count is not a failure: it covers values encrypted with a secret older than both, and unrelated data that has the same shape. The task logs the primary keys of those rows, never their content.
+
+After the old value is removed:
+
+- An API key or SCIM token that made no request during the overlap stops authenticating and has to be issued again.
+- A Slack connection that was not used during the overlap keeps working, but LangWatch no longer recognises its token as already connected, so the same token can be added a second time.
+- Encrypted values held in Redis are read with the old value during the overlap and are not rewritten. They are short-lived caches and queued jobs, so let the queues drain before removing the old value.
+- Signed tokens in flight at the moment of the first roll (voice sessions, GitHub App install state) are rejected and the user starts that flow again.
+
+When `API_KEY_PEPPER` is set, API key hashes use it instead of `CREDENTIALS_SECRET`, so rotating `CREDENTIALS_SECRET` leaves API keys untouched.
+
+### In Transit
+
+| Path | Encryption |
+|------|-----------|
+| Client to App | TLS at Ingress, Load Balancer |
+| App to PostgreSQL | TLS (configure via connection string: `?sslmode=require`) |
+| App to ClickHouse | HTTPS (configure ClickHouse with TLS certificates) |
+| App to Redis | TLS (configure via connection string: `rediss://...`) |
+| Inter-service (App, Workers, NLP, LangEvals) | Plain HTTP within cluster (use a service mesh for mTLS). App and workers authenticate to NLP with `LANGWATCH_NLP_INTERNAL_SECRET` |
+
+<Tip>
+  For inter-service encryption, deploy a service mesh like Istio or Linkerd. This adds mTLS between
+  all pods without application changes.
+</Tip>
+
+## Secrets Management
+
+### Development (Auto-Generated)
+
+`autogen.enabled: true` (off by default) generates random values for the app Secret on first install. `helm upgrade` keeps the values already in the Secret and only generates keys that are missing. The Secret is deleted with `helm uninstall`, so a reinstall generates a new `credentialsEncryptionKey` and the stored credentials become unreadable (see [Changing it](#credentials-secret)).
+
+GitOps tools that render without cluster access, such as Argo CD, cannot see the existing Secret; use a pre-created Secret there (see [Argo CD](/self-hosting/deployment/argocd)). Use autogen for evaluation installs, not production.
+
+### Production (Kubernetes Secrets)
+
+Create secrets manually and reference them in the Helm chart:
+
+```bash
+kubectl create secret generic langwatch-secrets \
+  --namespace langwatch \
+  --from-literal=credentialsEncryptionKey=$(openssl rand -hex 32) \
+  --from-literal=nextAuthSecret=$(openssl rand -hex 32) \
+  --from-literal=virtualKeyPepper=$(openssl rand -hex 32) \
+  --from-literal=LW_GATEWAY_INTERNAL_SECRET=$(openssl rand -hex 32) \
+  --from-literal=LW_GATEWAY_JWT_SECRET=$(openssl rand -hex 32) \
+  --from-literal=LANGY_INTERNAL_SECRET=$(openssl rand -hex 32) \
+  --from-literal=LANGWATCH_NLP_INTERNAL_SECRET=$(openssl rand -hex 32)
+```
+
+The two `LW_GATEWAY_*` keys are needed while `gateway.chartManaged` is `true` (the default), and `LANGY_INTERNAL_SECRET` while `langyagent.chartManaged` is `true`. `LANGWATCH_NLP_INTERNAL_SECRET` is optional: without it the NLP service accepts unauthenticated requests from inside the cluster. `helm install` prints the exact list for your values (section "Required Secrets").
+
+Reference in `values.yaml`. The gateway and the Langy agent mount the same Secret, so point them at it too:
+
+```yaml
+secrets:
+  existingSecret: langwatch-secrets
+gateway:
+  secrets:
+    existingSecretName: langwatch-secrets
+langyagent:
+  secrets:
+    existingSecretName: langwatch-secrets
+```
+
+### Production (External Secret Managers)
+
+For tighter security, use an external secrets operator to sync secrets from your cloud provider:
+
+- **AWS Secrets Manager**: via [External Secrets Operator](https://external-secrets.io/)
+- **HashiCorp Vault**: via [Vault Secrets Operator](https://developer.hashicorp.com/vault/docs/platform/k8s/vso)
+- **Azure Key Vault**: via [Azure Key Vault Provider](https://azure.github.io/secrets-store-csi-driver-provider-azure/)
+
+The Helm chart's `secretKeyRef` pattern works with any Kubernetes Secret, regardless of how it was created.
+
+## Network Security
+
+### Recommended Network Architecture
+
+- **Only the LangWatch App should be exposed externally** via Ingress or Load Balancer
+- All other components (Workers, NLP, LangEvals, PostgreSQL, ClickHouse, Redis) should be on internal networks only (ClusterIP services)
+- Place databases in private subnets with no internet access
+- Use VPC endpoints, PrivateLink for S3 access
+
+### Private control-plane paths are blocked at the ingress
+
+Everything under `/api/internal/*` is the app's private control plane: the Langy
+agent's callbacks and the AI Gateway's usage callbacks. Those routes authenticate
+with a shared secret, but they are never meant to be reachable from the internet.
+
+The chart blocks them at the ingress by default, via `ingress.blockedPaths`
+(default `["/api/internal"]`). Each blocked prefix is routed to a Service with no
+endpoints, so the controller has nowhere to forward the request:
+
+```yaml
+ingress:
+  enabled: true
+  # Defaults to ["/api/internal"]. Add prefixes your install keeps in-cluster.
+  blockedPaths:
+    - /api/internal
+    - /api/cron   # only if you do NOT drive cron from an external scheduler
+```
+
+Before you change it:
+
+- **Blocked requests answer 503** on ingress-nginx. The exact code is
+  controller-dependent (the Ingress API does not specify what a backend with no
+  endpoints returns), and this is verified against ingress-nginx only. If you
+  run a different controller, confirm it answers 5xx rather than falling through
+  to another rule before relying on the block. Expect a low background rate in
+  your ingress 5xx metrics from scanners: that is the block working, not the
+  app faulting.
+- **In-cluster callers are unaffected.** The agent, gateway and CronJobs use the
+  internal Service.
+- **It covers this ingress only.** If you publish the app another way (NodePort,
+  LoadBalancer, your own Ingress), restrict these paths where that route ends.
+- **The chart refuses configurations that would defeat the block.** Each of
+  these renders a manifest that looks protected and is not, so the chart fails
+  at render time rather than shipping it:
+  - an `ingress.hosts` path nested under a blocked prefix (it out-matches the
+    blackhole)
+  - a blocked prefix with a trailing slash, a repeated slash, or surrounding
+    whitespace (none of them match any real request path)
+  - a regex `pathType: ImplementationSpecific` path, which ingress-nginx ranks
+    _above_ prefix rules
+  - the `nginx.ingress.kubernetes.io/default-backend` annotation, which is
+    defined as the handler for a backend with no endpoints (exactly what the
+    blackhole is), so it converts the block into a proxy
+  - a host whose `http.paths` list is empty, which would leave an Ingress whose
+    only rules are blackholes
+- **The block depends on no principal being able to create an EndpointSlice named
+  for the blackhole Service.** It is selector-less, so endpoints can only arrive by
+  hand. Restrict `discovery.k8s.io/endpointslices: create` in this namespace if
+  that is not already the case.
+- **AWS LBC (default `target-type: instance`) and GKE without NEG** reject a
+  ClusterIP backend and stop reconciling the Ingress. Set
+  `alb.ingress.kubernetes.io/target-type: ip` (or the NEG equivalent), or empty
+  `blockedPaths` and block at the load balancer instead.
+- **To disable**, set `blockedPaths: []` in a values file or use `--set-json`;
+  plain `--set` assigns a string and is rejected.
+- **Gateway or Langy agent running outside the cluster?** Their callbacks arrive
+  over the public ingress and are blocked. Narrow the list rather than
+  emptying it.
+
+### Kubernetes Network Policies
+
+Restrict traffic between pods:
+
+```yaml
+# Example: only allow app and workers to reach ClickHouse
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: clickhouse-access
+  namespace: langwatch
+spec:
+  podSelector:
+    matchLabels:
+      app: clickhouse
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: app
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: workers
+      ports:
+        - port: 8123
+```
+
+### Firewall Rules
+
+| Source | Destination | Port | Protocol |
+|--------|-------------|------|----------|
+| Internet, VPN | App (Ingress) | 443 | HTTPS |
+| App | PostgreSQL | 5432 | TCP |
+| App, Workers | ClickHouse | 8123 | HTTP |
+| App, Workers | Redis | 6379 | TCP |
+| App, Workers | NLP | 5561 | HTTP |
+| App, Workers | LangEvals | 5562 | HTTP |
+| NLP, LangEvals | External LLMs | 443 | HTTPS |
+| CronJobs you add under `cronjobs.jobs` | App | 5560 | HTTP |
+
+## Pod Security
+
+Every LangWatch pod (app, workers, NLP, LangEvals, gateway, and the cron pods) and every bundled datastore (PostgreSQL, Redis, ClickHouse, Keeper) runs hardened. The defaults the first-party services inherit:
+
+```yaml
+# Pod-level (global.podSecurityContext)
+runAsNonRoot: true
+runAsUser: 1000
+fsGroup: 1000
+seccompProfile:
+  type: RuntimeDefault
+```
+
+```yaml
+# Container-level (global.containerSecurityContext)
+runAsNonRoot: true
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities:
+  drop: [ALL]
+```
+
+The bundled datastores carry the same posture but keep their image's own uid: PostgreSQL and Redis run 999, ClickHouse and Keeper 101, the gateway 65532, and Keeper's init container 65534. If you write a Gatekeeper `MustRunAs` constraint, allow all of those, not only 1000: a constraint that misses the init container's 65534 denies the whole Keeper pod. (The bundled Prometheus also runs 65534, though `strict-admission` removes it.)
+
+`runAsNonRoot` is deliberately set at both pod and container level. Kubernetes inherits the pod-level value, but some Gatekeeper constraints read the container-level field directly and deny pods that only carry it on the pod.
+
+No LangWatch pod mounts a ServiceAccount token (`global.automountServiceAccountToken: false`); none of these services talk to the Kubernetes API. The bundled Prometheus does mount one. It is an upstream subchart, and `strict-admission` removes it.
+
+The root filesystem is read-only on every one of those pods. Anything a process writes at runtime (the app's `/tmp`, ClickHouse's server logs and `/tmp`, Postgres' socket directory) lands on an `emptyDir` mounted over that path; persistent data stays on its PVC. The image layer is never writable.
+
+### Strict admission control
+
+On a cluster enforcing Pod Security Admission [`restricted`](https://kubernetes.io/docs/concepts/security/pod-security-standards/) or an equivalent Gatekeeper / Kyverno bundle, apply the [`strict-admission` overlay](https://github.com/langwatch/langwatch/blob/main/charts/langwatch/examples/overlays/strict-admission.yaml):
+
+```bash
+helm install lw . \
+  -f examples/overlays/size-prod.yaml \
+  -f examples/overlays/access-ingress.yaml \
+  -f examples/overlays/strict-admission.yaml
+```
+
+A **default** install does not pass on its own. Everything LangWatch authors already complies (read-only root, non-root at both levels, dropped capabilities, `RuntimeDefault` seccomp, no privilege escalation, no automounted token, CPU + memory requests and limits), but three bundled components cannot, and the overlay turns all three off:
+
+- **Prometheus** (`prometheus.chartManaged`) is an upstream subchart LangWatch doesn't control. Its pods carry no `readOnlyRootFilesystem`, no seccomp profile, and no resource limits on the config-reload sidecar. Bring your own, or disable metrics.
+- **The Langy assistant** (`langyagent.chartManaged`) runs its manager as root with `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETUID` and `SETGID`. That is by design: the manager gives every assistant worker a distinct UID, and without those capabilities sibling workers share a UID and can read each other's credentials. Don't force it non-root. Deploy it on a cluster that allows it, or run without the assistant.
+- **The ClickHouse preflight Job** (`clickhouse.preflight.enabled`) shells out to `kubectl` to check your Secret's keys, so it needs both an automounted token and a writable root for kubectl's discovery cache. It only renders when you supply the ClickHouse Secret yourself rather than using autogen, which is the production path, so the overlay pins it off.
+
+One more toggle in the overlay isn't an admission failure but an unmet dependency:
+
+- **Gateway HPA** (`gateway.autoscaling.enabled`) scales on a custom metric via `prometheus-adapter`. Set it to `false` if you don't run one; the overlay pins `gateway.replicaCount: 2` instead.
+
+With Prometheus off, app metrics reporting (`app.telemetry.metrics.enabled`) is off by default too, so no component exposes or scrapes a `/metrics` endpoint; the overlay pins it off to keep the two coupled. Anonymous usage analytics (`app.telemetry.usage.enabled`) is a separate setting, on by default; set it to `false` for an air-gapped or no-egress install.
+
+In-cluster datastores satisfy read-only-root policies, but managed databases (the `postgres-external`, `redis-external`, and `clickhouse-external` overlays) are still the better production choice: you get backups, HA, and patching, and there are no datastore pods to admit.
+
+## PII Redaction
+
+LangWatch includes a built-in PII redaction pipeline step that automatically detects and masks personally identifiable information in traces before storage.
+
+- **On by default** at the essential level (secrets and common identifiers), configurable per project
+- The strict level adds a pass through the Presidio analysis service in LangEvals
+- `app.features.disableStrictPiiRedaction: true` skips only that strict pass. Secrets and essential PII redaction still run (not recommended)
+- Runs as part of the event sourcing pipeline in workers
+
+## Multitenancy
+
+LangWatch enforces tenant isolation at the application level:
+
+- Every ClickHouse query includes `WHERE TenantId = ...` as the first predicate
+- PostgreSQL queries include `projectId` in WHERE clauses
+- Project keys are scoped to one project; API keys are limited to the organization, team and project role bindings they were created with
+- Cross-tenant data access is prevented at the query layer
+
+## Supply Chain
+
+LangWatch container images and CLI packages are published with verifiable supply-chain attestations so operators can confirm an artifact was built by LangWatch CI from a specific source commit.
+
+### Container images (Docker Hub)
+
+Every release of `langwatch/langwatch`, `langwatch/langwatch_nlp`, `langwatch/langevals`, and `langwatch/ai-gateway` is signed with [Sigstore](https://www.sigstore.dev/) cosign using keyless OIDC. Both the multi-arch index manifest and each per-platform manifest (linux/amd64, linux/arm64) are signed by digest. A CycloneDX SBOM is generated per platform and attached as a cosign attestation against the matching platform manifest digest, so the SBOM you verify always corresponds to the architecture you actually pulled.
+
+Verify a signature with [cosign](https://github.com/sigstore/cosign):
+
+```bash
+cosign verify langwatch/langwatch:<tag> \
+  --certificate-identity-regexp '^https://github\.com/langwatch/langwatch/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Inspect the attached SBOM for the platform you pulled (cosign resolves the right per-platform manifest digest automatically when you pass a tag):
+
+```bash
+cosign download attestation \
+  --predicate-type https://cyclonedx.org/bom \
+  langwatch/langwatch:<tag> \
+  | jq -r '.payload | @base64d | fromjson | .predicate' \
+  > langwatch.cdx.json
+```
+
+The per-platform `*.cdx.json` files (e.g. `langwatch-linux-amd64.cdx.json`, `langwatch-linux-arm64.cdx.json`) are also attached to each `langwatch@vX.Y.Z` [GitHub release](https://github.com/langwatch/langwatch/releases).
+
+### npm CLI
+
+The `langwatch` npm package is published with [npm provenance attestations](https://docs.npmjs.com/generating-provenance-statements) via GitHub Actions OIDC, also backed by Sigstore. The provenance link is visible on the [package page](https://www.npmjs.com/package/langwatch) and can be verified with `npm audit signatures`.
+
+## Production Hardening Checklist
+
+- [ ] `autogen.enabled: false`, use manually created secrets
+- [ ] All secrets stored in a secrets manager (not inline in values.yaml)
+- [ ] TLS enabled on Ingress (HTTPS only)
+- [ ] Database connections use TLS (`?sslmode=require`)
+- [ ] PostgreSQL, ClickHouse, Redis in private subnets (no public access)
+- [ ] Network policies restrict pod-to-pod traffic
+- [ ] S3 buckets have public access blocked
+- [ ] ClickHouse backups enabled and tested
+- [ ] Monitoring and alerting configured
+- [ ] Secret rotation procedure documented
+- [ ] Pod security contexts verified (non-root, read-only filesystem, `RuntimeDefault` seccomp, no automounted token)
+- [ ] On strict admission clusters: apply `examples/overlays/strict-admission.yaml` (`prometheus.chartManaged: false`, `langyagent.chartManaged: false`, and, without a custom metrics API, `gateway.autoscaling.enabled: false`)
+- [ ] Ingress rate limiting configured
+- [ ] Audit logs enabled (Enterprise)
+- [ ] Image signatures verified at pull time (admission controller or `cosign verify` in CI)

@@ -1,0 +1,112 @@
+Feature: Auto S3 staging for large nlpgo Lambda invoke payloads
+  As a user running a workflow or evaluation that serializes large per-trace
+    input/output text
+  I want the control plane to offload an oversized invoke body to S3 instead of
+    inlining it into the AWS Lambda invoke
+  So that big evaluations and workflows run instead of failing with
+    "Request must be smaller than 6291456 bytes for the InvokeFunction operation"
+
+  Background:
+    On SaaS the per-project nlpgo engine is fronted by an AWS Lambda invoked via
+    the SDK InvokeFunction operation, whose request Payload is capped at 6 MiB
+    (6291456 bytes). Workflow and evaluation runs (the engine receives them as
+    execute_flow / execute_component / execute_evaluation on /studio/execute_sync)
+    regularly serialize past that cap.
+
+    The process-owned NLP Lambda runtime owns the ARN invoke envelope and
+    staging decision for both nlpgo and Studio. Composition injects the S3
+    staging port; utils/lambdaFetch is only a compatibility delegate. The nlpgo
+    receiver fetches X-Payload-S3-URL bodies through readStudioRequestBody.
+
+  @unit
+  Scenario: A small invoke is sent inline
+    Given the serialized invoke envelope is below the staging threshold
+    When the control plane invokes the per-project nlpgo Lambda
+    Then the body is sent inline in the invoke Payload
+    And no S3 object is created
+    And no X-Payload-S3-URL header is added
+
+  @unit
+  Scenario: A large invoke is staged via a presigned URL
+    Given the serialized invoke envelope is above the staging threshold
+    When the control plane invokes the per-project nlpgo Lambda
+    Then the body is uploaded to S3 under the project's nlpgo staging prefix
+    And a GET presigned URL is generated with the configured TTL
+    And the invoke Payload carries an empty body and the X-Payload-S3-URL header
+    And the invoke Payload is below the 6 MiB cap
+
+  @unit
+  Scenario: Staging triggers on the real serialized envelope, not the raw body
+    Given a body that is below the threshold on its own but crosses it once
+      escaped into the invoke envelope
+    When the control plane invokes the per-project nlpgo Lambda
+    Then the invoke is staged via S3
+    # Inlining the raw-body size would under-count and let the invoke fail at the
+    # 6 MiB cap; the decision is made against the actual over-the-wire envelope.
+
+  @unit
+  Scenario: A staged object is deleted after the invoke returns
+    Given a payload was staged to S3 for a nlpgo invoke
+    When the Lambda invoke returns
+    Then the staged object is deleted from the same bucket and key
+    And a delete failure is non-fatal because a bucket lifecycle rule on the studio-staging/ prefix (3-day minimum) reaps orphans
+
+  @unit
+  Scenario: A staged object is deleted even when the invoke fails
+    Given a payload was staged to S3 for a nlpgo invoke
+    When the Lambda invoke rejects with an error
+    Then the staged object is still deleted from the same bucket and key
+    And the invoke error propagates to the caller
+    # The finally-block reap must run on failure too, otherwise a failed run
+    # leaks an S3 object that only the studio-staging/ lifecycle rule would eventually clean up.
+
+  @unit
+  Scenario: An invoke body over the hard cap is rejected before staging
+    Given an invoke body larger than the maximum allowed payload size
+    When the control plane invokes the per-project nlpgo Lambda
+    Then the invoke is rejected with an actionable payload-too-large error
+    And no S3 object is created
+    And no Lambda invoke is attempted
+    # Staging would otherwise offload an unbounded body that the engine then
+    # re-fetches whole into memory, moving the 6 MiB invoke failure to an OOM.
+    # The hard cap mirrors the langevals HTTP path's fail-fast.
+
+  @unit
+  Scenario: Staging falls back to a built-in threshold when the env var is unset
+    Given the staging threshold is not configured
+    And the serialized invoke envelope is above the built-in default threshold
+    When the control plane invokes the per-project nlpgo Lambda
+    Then the invoke is still staged via S3
+    # So a deploy that forgets the env var does not silently re-expose the 6 MiB cap.
+
+  @unit
+  Scenario: A self-hosted HTTP nlpgo target never stages
+    Given the nlpgo service is reached over a plain HTTP URL, not a Lambda ARN
+    When the control plane sends any body to nlpgo
+    Then the body is posted inline
+    And no S3 upload happens
+
+  @integration
+  Scenario: A real oversized payload round-trips through S3 to the live engine
+    Given a workflow invoke body larger than the 6 MiB Lambda cap
+    When the control plane stages it to S3 and the engine fetches it back
+    Then the engine receives the full body and executes it to a correct result
+    And the staged object is removed after the invoke
+    # Proven against a live nlpgo subprocess and an in-memory object store
+    # behind the staging port; the un-exercised hops are AWS's own (the Lambda
+    # transport and S3 storage), not our code. The engine admits the store's
+    # loopback origin only through a test-only variable it ignores outright on
+    # a deployed environment.
+
+  @unit
+  Scenario: A staged body is accepted up to the same size as a direct request body
+    Given a dataset row carrying ten inline images at the default per-file limit
+    When the control plane stages the invoke body to S3
+    Then the engine accepts a staged body as large as the largest body it reads directly
+    And a staged body past that size is refused
+
+  @e2e
+  Scenario: The engine refuses a staged-payload header pointing off S3
+    Given a staged-payload header whose host is not an AWS S3 host
+    When the engine receives the invoke
+    Then the engine rejects the request before fetching anything

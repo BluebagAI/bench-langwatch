@@ -1,0 +1,60 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/langwatch/langwatch/tools/thuishaven/app"
+	"github.com/langwatch/langwatch/tools/thuishaven/domain"
+)
+
+// runHeavy is `haven machine run` — take a machine-wide slot, run the command, release.
+//
+// The command arrives as ONE argument on --sh rather than as trailing argv,
+// because the gate hands over a shell string and splicing it bare would let
+// everything after an operator run outside the slot.
+func runHeavy(ctx context.Context, d deps, inv invocation) error {
+	shell := inv.value("--sh")
+	if shell == "" {
+		return fmt.Errorf("haven machine run needs a command: haven machine run --sh 'pnpm test:unit'")
+	}
+	// One pool exists, so any other name is a request haven cannot honour.
+	// Accepting it silently would run the command against the heavy pool while
+	// the caller believes it took a different one.
+	if class := inv.value("--class"); class != "" && class != domain.HeavySlotClass {
+		return fmt.Errorf("haven machine run has one slot class today, %q — not %q", domain.HeavySlotClass, class)
+	}
+	if domain.UnderRushGate(os.Getenv) {
+		return execUnderRush([]string{"bash", "-lc", shell}, d.worktree)
+	}
+	return d.orch.RunHeavy(ctx, app.HeavyRun{
+		Shell: shell,
+		Dir:   d.worktree,
+		// A terminal on stdout means a human is watching, and a human waiting is
+		// not an idle API session — so they keep the long failsafe rather than an
+		// agent's tighter ceiling.
+		Interactive: stdoutIsTTY(),
+	})
+}
+
+// runGate answers one PreToolUse hook in the selected client protocol.
+//
+// `haven self setup gate-hook` registers the hook by hand, and `haven up` now
+// registers it automatically for the worktree it starts - a per-worktree hook
+// only guards the checkout it was installed in, and remembering to run setup in
+// every one of them is exactly what stopped happening. `haven self setup gate-hook
+// --off` opts a worktree back out of both.
+//
+// It always exits 0. Exit code 2 BLOCKS the tool call, and an unrecovered Go
+// panic exits with exactly 2, so returning an error from here would risk
+// converting a haven bug into a machine-wide tool-call blocker. Every failure
+// inside Gate already resolves to a neutral answer with no permission decision.
+func runGate(_ context.Context, d deps, inv invocation) error {
+	if inv.value("--client") == "codex" {
+		d.orch.GateCodex(os.Stdin, os.Stdout)
+		return nil
+	}
+	d.orch.Gate(os.Stdin, os.Stdout)
+	return nil
+}

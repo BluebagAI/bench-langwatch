@@ -1,0 +1,26 @@
+/** Whether a log line can say which build produced it. */
+
+import { describe, expect, it } from "vitest";
+
+import { resolveLoggerConfiguration } from "../logger-config.ts";
+import { serviceVersionField } from "../logger.ts";
+
+describe("serviceVersionField", () => {
+  it("emits the build identity injected by process configuration", () => {
+    const configuration = resolveLoggerConfiguration({ serviceVersion: "git-5373dad" });
+
+    expect(serviceVersionField(configuration)).toEqual({
+      "service.version": "git-5373dad",
+    });
+  });
+
+  it("trims an injected version", () => {
+    const configuration = resolveLoggerConfiguration({ serviceVersion: " git-abc " });
+
+    expect(serviceVersionField(configuration)).toEqual({ "service.version": "git-abc" });
+  });
+
+  it("adds no field when process configuration supplies no build identity", () => {
+    expect(serviceVersionField(resolveLoggerConfiguration())).toEqual({});
+  });
+});

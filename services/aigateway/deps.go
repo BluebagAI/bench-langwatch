@@ -1,0 +1,348 @@
+package aigateway
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"go.uber.org/zap"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/langwatch/langwatch/pkg/breaker"
+	"github.com/langwatch/langwatch/pkg/clog"
+	"github.com/langwatch/langwatch/pkg/contexts"
+	"github.com/langwatch/langwatch/pkg/health"
+	"github.com/langwatch/langwatch/pkg/jwtverify"
+
+	"github.com/langwatch/langwatch/pkg/customertracebridge"
+	"github.com/langwatch/langwatch/pkg/otelsetup"
+	"github.com/langwatch/langwatch/pkg/profiling"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/authresolver"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/budget"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/cacherules"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/controlplane"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/gatewaymetrics"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/gatewaytracer"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/modelresolver"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/policy"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/providers"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/ratelimit"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/spendemitter"
+	"github.com/langwatch/langwatch/services/aigateway/adapters/voicesession"
+)
+
+// Deps holds validated infrastructure adapters needed by the gateway.
+type Deps struct {
+	Logger        *zap.Logger
+	NodeID        string
+	OTel          *otelsetup.Provider
+	TraceBridge   *customertracebridge.Emitter
+	TraceRegistry *customertracebridge.Registry
+	ControlPlane  *controlplane.Client
+	Auth          *authresolver.Service
+	Providers     *providers.BifrostRouter
+	RateLimiter   *ratelimit.Limiter
+	BudgetChecker *budget.Checker
+	// Voice supervises brokered voice calls and ends them on shutdown.
+	Voice   *voicesession.Manager
+	Policy  *policy.Matcher
+	Cache   *cacherules.Evaluator
+	Models  *modelresolver.Resolver
+	Health  *health.Registry
+	Metrics *gatewaymetrics.Recorder
+	Breaker *breaker.Registry
+	// Spend emission (nil when LW_GATEWAY_SPEND_ENABLED is off).
+	SpendEmitter *spendemitter.Emitter
+	SpendSpool   *spendemitter.Spool
+	SpendDrainer *spendemitter.Drainer
+	// Profiler is the continuous CPU/heap profiler. Its zero value is a
+	// no-op, so an unconfigured deployment carries an inert struct rather
+	// than a nil check at every use.
+	Profiler profiling.Profiler
+}
+
+// NewDeps builds all infrastructure adapters from the given config.
+// The returned context carries the enriched logger.
+func NewDeps(ctx context.Context, cfg Config) (context.Context, *Deps, error) {
+	if err := cfg.Log.Validate(); err != nil {
+		return ctx, nil, err
+	}
+	logger := clog.New(ctx, cfg.Log)
+	ctx = clog.Set(ctx, logger)
+	nodeID := otelsetup.ResolveNodeID(logger)
+
+	// Built first so every adapter below can be handed the recorder it
+	// reports into. Holds no resources and starts no goroutines.
+	metrics := gatewaymetrics.New()
+
+	otelProvider, err := cfg.OTel.Configure(ctx, nodeID)
+	if err != nil {
+		return ctx, nil, fmt.Errorf("otel init: %w", err)
+	}
+	// When the debug collector is enabled, tee stdout logs into it too,
+	// before the adapters below capture `logger`. No-op otherwise.
+	if lp := otelProvider.LoggerProvider(); lp != nil {
+		logger = clog.WithCollector(ctx, cfg.Log, logger, lp)
+		ctx = clog.Set(ctx, logger)
+	}
+
+	projectRegistry := customertracebridge.NewRegistry()
+	bridge, err := customertracebridge.NewEmitter(ctx, customertracebridge.EmitterOptions{
+		Registry: projectRegistry,
+		// This service's customer-trace policy: no resource attribute passes
+		// through (the pod environment is platform detail), and every retold
+		// span carries this service's origin identity.
+		Policy: customertracebridge.Policy{
+			Stamp: []attribute.KeyValue{
+				attribute.String(otelsetup.AttrLangWatchOrigin, gatewaytracer.OriginGateway),
+			},
+		},
+		// ADR-061 mirror leg: when configured, a Langy VK's gen_ai span is
+		// duplicated into the mirror project at the bundle's tier. Unset leaves
+		// the leg dormant.
+		Mirror: customertracebridge.MirrorConfig{
+			Endpoint:  cfg.LangyMirror.TraceEndpoint,
+			Key:       cfg.LangyMirror.TraceKey,
+			ProjectID: cfg.LangyMirror.ProjectID,
+		},
+	})
+	if err != nil {
+		return ctx, nil, fmt.Errorf("customer trace bridge init: %w", err)
+	}
+
+	signer, err := controlplane.NewSigner(cfg.ControlPlane.InternalSecret, nodeID)
+	if err != nil {
+		return ctx, nil, fmt.Errorf("hmac signer init: %w", err)
+	}
+	verifier := jwtverify.NewJWTVerifier(
+		cfg.ControlPlane.JWTSecret,
+		cfg.ControlPlane.JWTSecretPrev,
+		jwtverify.WithIssuer("langwatch-control-plane"),
+		jwtverify.WithAudience("langwatch-gateway"),
+	)
+	svcInfo := contexts.MustGetServiceInfo(ctx)
+	userAgent := fmt.Sprintf("langwatch-aigateway/%s", svcInfo.Version)
+
+	cpClient := controlplane.NewClient(controlplane.ClientOptions{
+		BaseURL:   cfg.ControlPlane.BaseURL,
+		Sign:      signer.Sign,
+		Verifier:  verifier,
+		UserAgent: userAgent,
+		// Custom transport: OTel instrumentation wraps the pooled inner
+		// transport so every control-plane RPC gets a span automatically,
+		// and the metrics round-tripper wraps that so every RPC is also
+		// timed and counted for operators without a trace backend. The
+		// inner transport keeps connections warm to avoid TCP/TLS
+		// handshake cost on auth-miss bursts.
+		HTTPClient: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: gatewaymetrics.WrapTransport(otelhttp.NewTransport(&http.Transport{
+				MaxIdleConnsPerHost: 100,
+				IdleConnTimeout:     90 * time.Second,
+				ForceAttemptHTTP2:   true,
+			}, otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+				return "controlplane " + r.Method + " " + r.URL.Path
+			})), metrics),
+		},
+		Logger: logger,
+	})
+
+	authSvc, err := authresolver.New(authresolver.Options{
+		Resolver:      cpClient,
+		ConfigFetcher: cpClient,
+		ChangePoller:  changePollerAdapter{client: cpClient},
+		Logger:        logger,
+		Metrics:       metrics,
+		SoftBump:      time.Duration(cfg.AuthCache.SoftBumpSeconds) * time.Second,
+		HardGrace:     time.Duration(cfg.AuthCache.HardGraceSeconds) * time.Second,
+		ConfigTTL:     time.Duration(cfg.AuthCache.ConfigTTLSeconds) * time.Second,
+	})
+	if err != nil {
+		return ctx, nil, fmt.Errorf("auth service init: %w", err)
+	}
+
+	router, err := providers.NewBifrostRouter(ctx, providers.BifrostOptions{
+		Logger:                        logger,
+		BlockLocalHTTPCalls:           cfg.BlockLocalHTTPCalls,
+		RequireHTTPSCustomerEndpoints: cfg.RequireHTTPSCustomerEndpoints,
+		AllowedEndpointHosts:          splitAllowedHosts(cfg.AllowedProxyHosts),
+		// The control plane owns codex OAuth sessions; the router calls back
+		// through it to refresh a 401'd access token once.
+		CodexRefresher:  cpClient,
+		CodexBackendURL: codexBackendURL(cfg.CodexAPIBase),
+	})
+	if err != nil {
+		return ctx, nil, fmt.Errorf("bifrost init: %w", err)
+	}
+
+	limiter, err := ratelimit.New(ratelimit.Options{Metrics: metrics})
+	if err != nil {
+		return ctx, nil, fmt.Errorf("ratelimit init: %w", err)
+	}
+
+	budgetChecker := budget.NewChecker(budget.CheckerOptions{
+		Logger:  logger,
+		Metrics: metrics,
+		// Attributed-user templates enforce per end user through a cached
+		// control-plane bucket read; everything else stays bundle-local.
+		Buckets: budget.NewCachedBucketSpend(cpClient),
+	})
+
+	voice := voicesession.NewManager(voicesession.Options{
+		Registry:      cpClient,
+		Vendor:        voicesession.NewOpenAIVendor(router.VoiceHTTPClient(), providers.OpenAIVoiceEndpoint),
+		RelayEndpoint: providers.VoiceRelayEndpoint,
+		Budget:        budgetChecker.Precheck,
+		Keys:          authSvc,
+		Metrics:       metrics,
+		Logger:        logger,
+		MaxSessions:   cfg.Voice.MaxSupervisedSessions,
+		DrainBudget:   time.Duration(cfg.Voice.DrainSeconds) * time.Second,
+	})
+
+	// Per-credential circuit breaker. A provider that keeps failing is
+	// skipped outright rather than costing every request another dead
+	// round-trip, and its state is published so operators can see which
+	// credential is cut off.
+	circuits := breaker.NewRegistry(breaker.Options{
+		Window:       time.Duration(cfg.Circuit.WindowS) * time.Second,
+		Threshold:    cfg.Circuit.Threshold,
+		OpenDuration: time.Duration(cfg.Circuit.CooldownS) * time.Second,
+	})
+
+	probes := health.New(contexts.MustGetServiceInfo(ctx).Environment)
+	// Note: previously had an `auth_cache_warm` readiness check gated on
+	// `authSvc.KnownRevision() != 0`, but maxRev was never incremented
+	// anywhere in the codebase — so the check failed forever and pods
+	// never went ready. Cold-start chicken-and-egg: K8s won't route
+	// traffic until /readyz=200; first Resolve only happens once traffic
+	// routes; so the cache could never warm. Removed entirely — the
+	// resolver warms organically on the first request per VK and an
+	// unwarmed gateway adds at most one extra ~50-200ms control-plane
+	// round-trip on cold-cache requests, which is the correct behavior
+	// for a fresh deployment. If we ever ship the bootstrap-pull
+	// feature (specs/ai-gateway/auth-cache.feature: "Bootstrap-pull
+	// enables gateway to serve when control plane is cold") the
+	// /readyz signal can be re-added based on the bootstrap completion
+	// state, not on observed traffic.
+	probes.MarkStarted()
+
+	// Gauges that read their value at scrape time, wired once their
+	// source exists.
+	metrics.TrackDraining(probes.Draining)
+	metrics.TrackAuthCacheSize(authSvc.CacheLen)
+
+	var spendSpool *spendemitter.Spool
+	var spendEmitterAdapter *spendemitter.Emitter
+	var spendDrainer *spendemitter.Drainer
+	if cfg.SpendEmitter.Enabled {
+		spoolDir := cfg.SpendEmitter.SpoolDir
+		if spoolDir == "" {
+			spoolDir = filepath.Join(os.TempDir(), "langwatch-gateway-spend-spool")
+		}
+		flushEvery := time.Duration(cfg.SpendEmitter.FlushIntervalSeconds) * time.Second
+		spendSpool, err = spendemitter.Open(spendemitter.SpoolOptions{
+			Dir:           spoolDir,
+			MaxTotalBytes: cfg.SpendEmitter.SpoolMaxBytes,
+			FlushEvery:    flushEvery,
+			PodID:         nodeID,
+			Logf:          func(format string, args ...any) { logger.Sugar().Warnf(format, args...) },
+		})
+		if err != nil {
+			// Spend emission is best-effort billing telemetry: a bad spool
+			// directory must not take the LLM proxy down with it. Serve
+			// without emission and scream; settlement reconciliation surfaces
+			// the gap.
+			logger.Sugar().Errorf("spend spool unavailable, serving WITHOUT spend emission: %v", err)
+		} else {
+			ingestBase := cfg.SpendEmitter.IngestBaseURL
+			if ingestBase == "" {
+				ingestBase = cfg.ControlPlane.BaseURL
+			}
+			ingestClient, err := spendemitter.NewIngestClient(ingestBase, signer)
+			if err != nil {
+				logger.Sugar().Errorf("spend ingest client unavailable, serving WITHOUT spend emission: %v", err)
+				_ = spendSpool.Close()
+				spendSpool = nil
+			} else {
+				spendEmitterAdapter = spendemitter.NewEmitter(spendSpool)
+				spendDrainer = spendemitter.NewDrainer(spendemitter.DrainerOptions{
+					Spool:   spendSpool,
+					Shipper: ingestClient,
+					Logf:    func(format string, args ...any) { logger.Sugar().Warnf(format, args...) },
+				})
+			}
+		}
+	}
+	if spendSpool != nil {
+		metrics.TrackSpendSpool(func() gatewaymetrics.SpoolStats {
+			stats := spendSpool.Stats()
+			return gatewaymetrics.SpoolStats{
+				Appended:        stats.Appended,
+				DroppedIntake:   stats.DroppedIntake,
+				DroppedOverflow: stats.DroppedOverflow,
+			}
+		})
+	}
+
+	return ctx, &Deps{
+		Logger:        logger,
+		NodeID:        nodeID,
+		OTel:          otelProvider,
+		TraceBridge:   bridge,
+		TraceRegistry: projectRegistry,
+		ControlPlane:  cpClient,
+		Auth:          authSvc,
+		Providers:     router,
+		RateLimiter:   limiter,
+		BudgetChecker: budgetChecker,
+		Voice:         voice,
+		Policy:        policy.NewMatcher(),
+		Cache:         cacherules.NewEvaluator(),
+		Models:        modelresolver.New(),
+		Health:        probes,
+		Metrics:       metrics,
+		Breaker:       circuits,
+		SpendEmitter:  spendEmitterAdapter,
+		SpendSpool:    spendSpool,
+		SpendDrainer:  spendDrainer,
+		// Started here rather than at the top of NewDeps so the one line saying
+		// profiling is on lands wherever the rest of this service's logs do —
+		// `logger` above is the collector-teed one.
+		Profiler: profiling.StartFromEnv(svcInfo.Service, svcInfo.Environment, logger),
+	}, nil
+}
+
+// changePollerAdapter bridges the controlplane client (which returns
+// its own []controlplane.Change wire shape) to the authresolver's
+// ChangePoller interface (which takes []authresolver.CacheChange).
+// Two slices share the same fields, so the adapter is a one-shot
+// element-wise copy.
+type changePollerAdapter struct {
+	client *controlplane.Client
+}
+
+func (a changePollerAdapter) PollChanges(ctx context.Context, organizationID, since string) ([]authresolver.CacheChange, string, error) {
+	cs, next, err := a.client.PollChanges(ctx, organizationID, since)
+	if err != nil {
+		return nil, since, err
+	}
+	out := make([]authresolver.CacheChange, len(cs))
+	for i, c := range cs {
+		out[i] = authresolver.CacheChange{
+			Kind:            c.Kind,
+			VirtualKeyID:    c.VirtualKeyID,
+			BudgetID:        c.BudgetID,
+			ModelProviderID: c.ModelProviderID,
+			ProjectID:       c.ProjectID,
+			Revision:        c.Revision,
+		}
+	}
+	return out, next, nil
+}

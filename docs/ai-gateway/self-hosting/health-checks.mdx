@@ -1,0 +1,132 @@
+---
+title: Health Checks
+description: Kubernetes probes and the public status endpoint for the LangWatch AI Gateway.
+sidebarTitle: Health Checks
+---
+
+The gateway serves its probes on the same port as the API (`5563`, the container port named `http` in the chart). The three Kubernetes probes report process state only. `/health` is the one endpoint meant for a monitor outside the cluster, and the only one that reports the control plane.
+
+## Endpoints
+
+| Endpoint               | Used by                              | Answers 200 when                                                                                                                                        |
+| ---------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/healthz`             | `livenessProbe`                      | The process answers                                                                                                                                     |
+| `/readyz`              | `readinessProbe`                     | The pod is not draining                                                                                                                                 |
+| `/startupz`            | `startupProbe`                       | Startup is complete. The process marks startup complete before it opens the listener, so this endpoint answers 200 on the first request that reaches it |
+| `/health`              | Uptime monitors, through the ingress | The process is up and the control plane answered the signed probe within the last 60 seconds                                                            |
+| `/metrics` on port 9464 | Prometheus                          | When the metrics listener is enabled, with the bearer `METRICS_API_KEY`. See [Observability](/ai-gateway/observability#metrics-prometheus)               |
+| `/debug/control-plane` | Operators, in-cluster                | Always. Returns `{"control_plane_base_url":"..."}`, the resolved `LW_GATEWAY_BASE_URL`                                                                  |
+
+None of these endpoints requires a key. With the chart's ClusterIP Service and `ingress.gateway.host` set, `/health` is the only one published and the rest stay in-cluster. A Service of type `LoadBalancer` publishes all of them, `/debug/control-plane` included.
+
+## Probe responses
+
+The three probes share one body:
+
+```json
+{
+  "status": "ok",
+  "version": "local",
+  "uptime_s": 84.12
+}
+```
+
+`status` is `ok`, `draining` or `starting`. `version` carries the `ENVIRONMENT` value. The gateway registers no dependency checks on the probes, so a `checks` map never appears: dependency state is on `/health`, in the per-request error codes and in the traces.
+
+### `/healthz`
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: http }
+  periodSeconds: 10
+  timeoutSeconds: 2
+  failureThreshold: 3
+```
+
+Chart values: `probes.liveness.*`. The handler does no network I/O.
+
+### `/readyz`
+
+After `SIGTERM` the endpoint answers:
+
+```http
+HTTP/1.1 503 Service Unavailable
+{"status":"draining","version":"local","uptime_s":1812.74}
+```
+
+```yaml
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+  periodSeconds: 5
+  timeoutSeconds: 1
+  failureThreshold: 2
+  successThreshold: 1
+```
+
+Chart values: `probes.readiness.*`. `SIGTERM` is the only condition that flips it. Readiness does not check the control plane: warm virtual keys keep serving from the auth cache through a control plane outage, and dropping every pod from the load balancer would turn that degradation into an outage. It does not check providers or any shared store either; the gateway has no database and no shared cache.
+
+### `/startupz`
+
+```yaml
+startupProbe:
+  httpGet: { path: /startupz, port: http }
+  initialDelaySeconds: 5
+  periodSeconds: 2
+  failureThreshold: 60
+```
+
+Chart values: `probes.startup.*`. Startup is marked complete while the process builds its dependencies, before the listener opens, so the `starting` state is not observable over HTTP. The auth cache warms on the first request per virtual key; there is no bootstrap step to wait for.
+
+## `/health`
+
+Point a status page or uptime monitor at `https://<ingress.host>/health`. `GET` and `HEAD` answer 200 when healthy and 503 when not; any other method answers 405. Every response carries `Cache-Control: no-store`.
+
+```json
+{ "status": "ok", "checks": { "gateway": "ok", "control_plane": "ok" } }
+```
+
+```json
+{ "status": "degraded", "checks": { "gateway": "ok", "control_plane": "unreachable for 65s" } }
+```
+
+The body carries no version and no uptime, because the endpoint is public.
+
+A background probe calls the control plane's `/api/internal/gateway/health` every 15 seconds over the same HMAC-signed channel every request uses, with a 5 second timeout. A success proves DNS, the connection, the app being up and `LW_GATEWAY_INTERNAL_SECRET` matching on both sides. A secret mismatch is the one misconfiguration where every probe is green and every virtual key resolve is refused, and this endpoint is what catches it.
+
+The verdict flips to 503 after 60 seconds without a successful probe, and a new pod gets one full 60 second window before it can report 503, so a rolling deploy does not blink the page. The endpoint never contacts a model provider: a provider outage fails completions and leaves `/health` at 200. A poll reads the cached verdict and triggers no call.
+
+The probe failure itself is logged on the gateway pod as `statusprobe_control_plane_unreachable`, with the underlying error.
+
+The chart Ingress for `ingress.gateway.host` publishes `/health` as an `Exact` path next to `/v1`. To keep the endpoint in-cluster, route the gateway with your own route and leave `/health` out.
+
+## Graceful shutdown
+
+On `SIGTERM` the gateway flips `/readyz` to 503, waits `shutdown.preDrainWaitSeconds` (default 5), closes the listener and gives in-flight requests `shutdown.timeoutSeconds` (default 60). `terminationGracePeriodSeconds` must cover both plus 10 seconds of slack. The sequence, the metrics to watch and the values for long streams are on [Helm chart](/ai-gateway/self-hosting/helm#graceful-drain).
+
+If requests still reach a pod after it flipped to draining during a rollout, raise `shutdown.preDrainWaitSeconds` and `terminationGracePeriodSeconds` together. A `preStop` sleep delays the `SIGTERM` instead, so the pod still reports ready during the sleep and the load balancer has no signal to act on.
+
+## Synthetic request
+
+Neither the probes nor `/health` exercise the request path. Run a small completion on a schedule and alert on it internally, so a provider incident does not show on your public status page:
+
+```bash
+curl --fail --max-time 30 \
+  -H "Authorization: Bearer $LW_SYNTHETIC_VK" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-6-luna","messages":[{"role":"user","content":"ping"}],"max_completion_tokens":16,"reasoning_effort":"none"}' \
+  https://gateway.acme.com/v1/chat/completions
+```
+
+On failure, read the `X-LangWatch-Gateway-Request-Id` response header and search for it in [Trace Explorer](/ai-gateway/observability#debugging-a-single-request). A `502 provider_error` with the provider's message in the body means the gateway is healthy and the provider is not.
+
+## Common failures
+
+| Symptom                                                         | Cause                                                                                        | First step                                                                                                  |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `/healthz` 200, `/v1/*` answers `503 auth_upstream_unavailable` | The gateway cannot reach the control plane                                                   | `curl /debug/control-plane` in-cluster and compare the URL with the app Service                             |
+| `/health` 503 with `control_plane: unreachable for Ns`          | Control plane down, unroutable, or `LW_GATEWAY_INTERNAL_SECRET` differs between the two pods | Compare the value on both Deployments, then read `statusprobe_control_plane_unreachable` in the gateway log |
+| `/health` 503 while completions succeed                         | Control plane outage longer than 60 seconds; warm keys still serve from the auth cache       | Fix the control plane. `/readyz` stays 200 on purpose                                                       |
+| `/readyz` flips to 503 mid-life                                 | The pod received `SIGTERM`                                                                   | `kubectl describe pod` for the termination reason                                                           |
+| 502 from the load balancer during a rollout                     | The load balancer had not removed the draining pod                                           | Raise `shutdown.preDrainWaitSeconds` and `terminationGracePeriodSeconds`                                    |
+
+More symptoms are on [Troubleshooting](/ai-gateway/troubleshooting).

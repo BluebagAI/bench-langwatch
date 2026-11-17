@@ -1,0 +1,375 @@
+@unit
+Feature: Agent management
+  As a user of LangWatch
+  I want to create, edit, and manage reusable agents
+  So that I can use them across evaluations and other platform features
+
+  # Note: Agents are now only Code or Workflow types.
+  # For LLM-based prompts, use the Prompts feature instead.
+
+  # The remaining @unimplemented scenarios in this file cover the agents-page
+  # CRUD flows (create / list / edit / archive via the UI) and the
+  # WorkflowSelectorDrawer flows below. These still need either a Next.js
+  # page-level integration harness or Playwright E2E support — neither exists
+  # for these surfaces today. The individual drawer components that are
+  # bindable have been covered by tests in this PR.
+
+  # ============================================================================
+  # Agent types
+  # ============================================================================
+
+  Scenario: Agent types available
+    When I create a new agent
+    Then I can choose from the following types:
+      | type     | description                          |
+      | code     | Python code executor                 |
+      | workflow | Reference to an existing workflow    |
+
+  # ============================================================================
+  # Agent CRUD - Create
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Create code-based agent
+    Given I am on the agents page
+    When I click "New Agent"
+    And I select "Code Agent" type
+    Then the AgentCodeEditorDrawer opens
+    When I enter name "Python Processor"
+    And I enter python code that processes input
+    And I click "Save"
+    Then the agent "Python Processor" is saved to the database
+    And the agent appears in the agents list
+
+  @unimplemented
+  Scenario: Create workflow-based agent
+    Given I am on the agents page
+    And workflow "Complex Pipeline" exists in the project
+    When I click "New Agent"
+    And I select "Workflow Agent" type
+    Then the WorkflowSelectorDrawer opens
+    When I select workflow "Complex Pipeline"
+    And I enter name "Pipeline Agent"
+    And I click "Save"
+    Then the agent "Pipeline Agent" is saved with workflowId reference
+    And the agent appears in the agents list
+
+  # ============================================================================
+  # Agent CRUD - Read/List
+  # ============================================================================
+
+  @unimplemented
+  Scenario: View agents list
+    Given agents "Code Processor" and "Pipeline Agent" exist
+    When I navigate to the agents page
+    Then I see a list of agents
+    And each agent shows its name, type, and last updated date
+
+  @unimplemented
+  Scenario: Empty state when no agents
+    Given no agents exist in the project
+    When I navigate to the agents page
+    Then I see an empty state message
+    And I see a "Create your first agent" call to action
+
+  @unimplemented
+  Scenario: Agents are project-scoped
+    Given I am in project "Project A"
+    And agent "Code Processor" exists in "Project A"
+    And agent "Other Agent" exists in "Project B"
+    When I navigate to the agents page
+    Then I only see "Code Processor"
+    And I do not see "Other Agent"
+
+  # ============================================================================
+  # Agent CRUD - Update
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Edit code-based agent
+    Given agent "Python Processor" of type "code" exists
+    When I click on agent "Python Processor"
+    Then the AgentCodeEditorDrawer opens with existing code
+    When I modify the python code
+    And I click "Save"
+    Then the agent is updated in the database
+    And the updatedAt timestamp is refreshed
+
+  @unimplemented
+  Scenario: Edit workflow-based agent
+    Given agent "Pipeline Agent" of type "workflow" exists
+    When I click on agent "Pipeline Agent"
+    Then the WorkflowSelectorDrawer opens with existing workflow selected
+    When I select a different workflow
+    And I click "Save"
+    Then the agent is updated in the database
+
+  # ============================================================================
+  # Agent CRUD - Delete (soft delete)
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Archive agent
+    Given agent "Old Agent" exists
+    When I click the delete button for "Old Agent"
+    And I confirm the deletion
+    Then the agent is soft-deleted (archivedAt is set)
+    And "Old Agent" no longer appears in the agents list
+
+  @unimplemented
+  Scenario: Archived agents are excluded from list
+    Given agent "Active Agent" exists
+    And agent "Archived Agent" was archived
+    When I navigate to the agents page
+    Then I see "Active Agent"
+    And I do not see "Archived Agent"
+
+  # ============================================================================
+  # Agent config storage
+  # ============================================================================
+
+  @unimplemented
+  Scenario: Code agent config stored as JSON
+    Given I create a code-based agent with:
+      | name | Python Processor           |
+      | code | def execute(input): pass   |
+    Then the agent record has type "code"
+    And the config JSON contains the code configuration
+
+  @unimplemented
+  Scenario: Workflow agent has workflowId at top level
+    Given I create a workflow-based agent referencing workflow "Pipeline"
+    Then the agent record has type "workflow"
+    And the workflowId field is set at the top level (not nested in config)
+    And this allows efficient database joins on workflowId
+
+  # ============================================================================
+  # Agent selection drawer (for use in Evaluations V3)
+  # ============================================================================
+
+  Scenario: AgentListDrawer shows available agents
+    Given agents "Code Processor" and "Pipeline Agent" exist
+    When the AgentListDrawer opens
+    Then I see both agents listed
+    And I see a "New Agent" button at the top
+
+  @integration
+  Scenario: AgentListDrawer opened by address reads the project's agents itself
+    Given agent "Code Processor" exists
+    When the AgentListDrawer opens from the address bar with no props
+    Then I see "Code Processor" listed
+    And clicking it hands it to the flow callback and closes the drawer
+
+  Scenario: AgentListDrawer empty state
+    Given no agents exist
+    When the AgentListDrawer opens
+    Then I see "Create your first agent" message
+    And I see a "New Agent" button
+
+  Scenario: Select agent from drawer
+    Given the AgentListDrawer is open
+    And agent "Code Processor" exists
+    When I click on "Code Processor"
+    Then the drawer closes
+    And "Code Processor" is selected for use
+
+  # The old "Create new agent from drawer flow" walked three drawers in one
+  # scenario. Each drawer is its own page-level scenario below; the caller
+  # that wires New Agent to the type selector is proven in its own module.
+  @integration
+  Scenario: New Agent in the AgentListDrawer starts the new agent flow
+    Given the AgentListDrawer is open
+    When I click "New Agent"
+    Then the caller of the drawer is told to start the new agent flow
+
+  @integration
+  Scenario: Choosing Code Agent in the AgentTypeSelectorDrawer opens the AgentCodeEditorDrawer
+    Given the AgentTypeSelectorDrawer is open
+    When I select "Code Agent"
+    Then the AgentCodeEditorDrawer opens
+
+  @integration
+  Scenario: Saving a new code agent adds it to the project's agents
+    Given the AgentCodeEditorDrawer is open for a new agent
+    When I name the agent and save
+    Then a code agent with that name is created in the project
+    And the agents the AgentListDrawer lists are read again
+    And the editor closes
+
+  @integration
+  Scenario: Edit config shows the stored inputs, outputs and mappings
+    Given a stored code agent with inputs, outputs and scenario mappings
+    When I open the AgentCodeEditorDrawer on it
+    Then the editor shows the agent's inputs and outputs
+    And it shows the scenario mappings with the chosen output field
+
+  @integration
+  Scenario: Saving an edited agent keeps the keys the editor does not show
+    Given the AgentCodeEditorDrawer is open on a stored code agent
+    When I save without changes
+    Then the stored inputs, outputs, mappings and timeout are saved back unchanged
+
+  @integration
+  Scenario: Code agent outputs offer the code output types
+    Given the AgentCodeEditorDrawer is open on a code agent
+    When I open an output's type
+    Then I can pick Text, Number, Boolean, JSON Schema, Object, List or Image
+    And a type a stored output already has is offered too
+
+  @integration
+  Scenario: Adding a JSON schema output to a code agent saves it with its schema
+    Given the AgentCodeEditorDrawer is open on a code agent
+    When I add a JSON Schema output and save
+    Then the agent's config stores an output named output_1 of type JSON schema with its schema
+    And reopening the agent shows that output as a JSON schema output
+
+  @integration
+  Scenario: Changing a code agent output's type saves the new type
+    Given the AgentCodeEditorDrawer is open on a code agent with a described output
+    When I change that output's type and save
+    Then the agent's config stores the new type
+    And the output keeps its description
+
+  @integration
+  Scenario: A stored JSON schema output keeps its schema through a save
+    Given a code agent with a JSON schema output
+    When I open it in the AgentCodeEditorDrawer and save
+    Then the output is stored again with its type and its schema
+
+  @integration
+  Scenario: Mapping a dataset column to a code agent input in the workbench
+    Given an evaluation workbench opens the AgentCodeEditorDrawer on a code agent target
+    When I map one of the agent's inputs to a dataset column
+    Then the workbench stores the mapping at once
+
+  @integration
+  Scenario: HTTP agent editor shows the Variables tab in the workbench
+    Given an evaluation workbench opens the AgentHttpEditorDrawer on an HTTP agent target
+    Then the editor shows a Variables tab that maps its variables to the dataset
+    And it says at least one variable must be mapped until one is
+    When I map a variable to a dataset column
+    Then the workbench stores the mapping at once
+
+  # ============================================================================
+  # Agent type selector drawer
+  # ============================================================================
+
+  Scenario: AgentTypeSelectorDrawer shows two options
+    When the AgentTypeSelectorDrawer opens
+    Then I see two options:
+      | option         | icon     | description                    |
+      | Code Agent     | code     | Create a Python code executor  |
+      | Workflow Agent | workflow | Use an existing workflow       |
+
+  Scenario: The new agent flow offers a Voice Agent while the flag is on
+    Given the release_voice_agents_enabled flag is on
+    When the AgentTypeSelectorDrawer opens
+    Then I see a "Voice Agent" option between "HTTP Agent" and "Code Agent"
+    When I select "Voice Agent"
+    Then the AgentVoiceEditorDrawer opens
+
+  Scenario: The new agent flow hides the Voice Agent while the flag is off
+    Given the release_voice_agents_enabled flag is off
+    When the AgentTypeSelectorDrawer opens
+    Then I do not see a "Voice Agent" option
+
+  Scenario: Selecting type navigates to appropriate editor
+    Given the AgentTypeSelectorDrawer is open
+    When I select "Code Agent"
+    Then the AgentCodeEditorDrawer opens
+    When I go back and select "Workflow Agent"
+    Then the WorkflowSelectorDrawer opens
+
+  # ============================================================================
+  # Workflow selector drawer
+  # ============================================================================
+
+  @unimplemented
+  Scenario: WorkflowSelectorDrawer lists project workflows
+    Given workflows "Pipeline A" and "Pipeline B" exist in the project
+    When the WorkflowSelectorDrawer opens
+    Then I see both workflows listed
+    And I see a "+ New Workflow" button at the top
+
+  @unimplemented
+  Scenario: WorkflowSelectorDrawer empty state
+    Given no workflows exist in the project
+    When the WorkflowSelectorDrawer opens
+    Then I see "No workflows yet" message
+    And I see a "+ New Workflow" button
+
+  @unimplemented
+  Scenario: New Workflow button navigates to workflows page
+    Given the WorkflowSelectorDrawer is open
+    When I click "+ New Workflow"
+    Then I am navigated to /[project]/workflows page
+
+  @unit
+  Scenario: The HTTP agent editor never shows a stored credential
+    Given a saved HTTP agent with a bearer token
+    When I open its editor on the Auth tab
+    Then the token field is blank
+    And it says "Stored; enter a new value to replace it"
+
+  @integration
+  Scenario: Saving an HTTP agent without a name or endpoint says what is missing
+    Given a new HTTP agent with no name and no endpoint URL
+    When I press "Create Agent"
+    Then the button was clickable and each missing field says what to enter
+    And the name field has focus and no agent is created
+    When I enter a name and press "Create Agent" again
+    Then the endpoint field has focus and no agent is created
+
+  @integration
+  Scenario: A saved agent's credentials are read-only on the Studio node
+    Given a Studio node for a saved HTTP agent with a bearer token and a header value
+    When I open the node's properties on the Auth and Headers tabs
+    Then the token and the header value are blank, disabled and say "Stored on the agent"
+    And the headers cannot be added to or removed
+
+  @integration
+  Scenario: A credential kept as a project secret shows as a reference
+    Given an HTTP editor whose token and a header value are references to project secrets
+    When I open the Auth and Headers tabs
+    Then each says "Stored as project secret" with the secret's name
+    And each links to the project's Secrets page
+    And there is no input holding the credential
+
+  @integration
+  Scenario: Replacing a stored credential offers an empty input
+    Given an HTTP editor whose token is a reference to a project secret
+    When I choose "Replace"
+    Then the token field is an empty input
+    And typing a new value changes the token to that value, to be stored as a secret on save
+
+  @integration
+  Scenario: A saved agent's secret reference is read-only on the Studio node
+    Given a Studio node for a saved HTTP agent whose token is a reference to a project secret
+    When I open the node's properties on the Auth tab
+    Then it says "Stored as project secret" with the secret's name
+    And there is no "Replace" action
+
+  @integration
+  Scenario: Looking at a secret reference changes nothing on the node
+    Given an HTTP node whose token is a reference to a project secret
+    When I open the Auth tab and leave without choosing "Replace"
+    Then the node's credential is still the reference
+
+  @unit
+  Scenario: A credential's reference is read from its value
+    Given a credential value that is "{{ secrets.NAME }}", optionally after Bearer, Basic or Token
+    Then its secret name is NAME
+    And any other value, including a literal credential, has no reference
+
+  @unit
+  Scenario: A saved agent's secret reference survives a Studio node save
+    Given a Studio node for a saved HTTP agent whose token and a header value are references
+    When I save the node
+    Then the references travel unchanged and every other credential value is blank
+
+  @unit
+  Scenario: Saving a Studio node never sends credential values
+    Given a Studio node for a saved HTTP agent
+    When I save the node
+    Then the agent update carries the header names and the auth kind
+    And every credential value that is not a secret reference is blank, so the agent keeps what it stored

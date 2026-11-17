@@ -1,0 +1,263 @@
+---
+title: Prometheus alert rules
+description: A PromQL ruleset for the LangWatch AI Gateway, covering reliability, provider health, budget enforcement and the auth cache.
+sidebarTitle: Prometheus alerts
+---
+
+The gateway serves `/metrics` on its own metrics port (`9464` by default) for any Prometheus setup to scrape. Send the bearer `METRICS_API_KEY` as `Authorization: Bearer <key>` in the scrape job's `authorization` block. Copy the ruleset below into `alerts/langwatch-gateway.yml`, or into a `PrometheusRule` resource if you run the Prometheus Operator, then reload Prometheus.
+
+Every metric name and label here comes from the gateway's registry. See [Observability](/ai-gateway/observability#metrics-prometheus) for the full list.
+
+## The ruleset
+
+```yaml
+groups:
+  - name: langwatch-gateway
+    interval: 30s
+    rules:
+      # --- Reliability ---
+
+      - alert: GatewayHighErrorRate
+        expr: |
+          sum(rate(gateway_http_requests_total{status=~"5.."}[5m]))
+            / sum(rate(gateway_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels: { severity: page, team: ai-platform }
+        annotations:
+          summary: "Gateway 5xx rate above 5% over 5m"
+          description: |
+            Read /readyz on the pods, then the provider status pages.
+
+      - alert: GatewayReadinessFlapping
+        expr: |
+          changes(kube_pod_status_ready{
+              condition="true",
+              namespace="langwatch",
+              pod=~"langwatch-gateway-.*"
+            }[10m]) > 4
+        for: 5m
+        labels: { severity: warn, team: ai-platform }
+        annotations:
+          summary: "Gateway pod {{ $labels.pod }} readiness flapped more than 4 times in 10m"
+          description: |
+            /readyz only reports draining, so a flap means pods are
+            restarting. Read kubectl describe pod for the reason.
+
+      # --- Provider health ---
+
+      - alert: CircuitOpenTooLong
+        expr: gateway_circuit_state == 1
+        for: 5m
+        labels: { severity: page, team: ai-platform }
+        annotations:
+          summary: "Circuit open for credential {{ $labels.credential_id }} for more than 5m"
+          description: |
+            The gateway is skipping this credential and letting one probe
+            through per cooldown. Check the provider status page and the
+            credential itself.
+
+      - alert: ExcessiveFallback
+        expr: |
+          sum(rate(gateway_provider_attempts_total{outcome="fallback_success"}[10m]))
+            / sum(rate(gateway_provider_attempts_total[10m])) > 0.1
+        for: 10m
+        labels: { severity: warn, team: ai-platform }
+        annotations:
+          summary: "More than 10% of dispatch attempts fall back over 10m"
+          description: |
+            Fallback is working, so this does not page. The primary
+            credential still needs attention.
+
+      # --- Budget enforcement ---
+
+      - alert: StreamingUsageMissing
+        expr: |
+          sum(rate(gateway_streaming_usage_missing_total[10m])) > 0
+        for: 10m
+        labels: { severity: page, team: ai-platform }
+        annotations:
+          summary: "Streams are closing without token usage"
+          description: |
+            A stream that reports no usage debits nothing, so it never
+            reaches a budget. OpenAI-style clients must send
+            stream_options.include_usage = true.
+            See /ai-gateway/streaming.
+
+      - alert: SpendSpoolDrops
+        expr: |
+          sum by (reason) (rate(gateway_spend_spool_dropped_total[10m])) > 0
+        for: 10m
+        labels: { severity: page, team: ai-platform }
+        annotations:
+          summary: "Gateway spend records dropped (reason={{ $labels.reason }})"
+          description: |
+            Budget debits are written from these records, so a dropped
+            record is spend that is neither billed nor counted.
+            reason=intake means the pod produced faster than the spool
+            could write. reason=overflow means the drainer is behind and
+            the oldest segments were deleted to stay inside the size
+            bound. Check that the control plane answers the spend ingest
+            (gateway_control_plane_requests_total).
+
+      - alert: BudgetBlockSpike
+        expr: |
+          sum by (scope) (rate(gateway_budget_blocks_total[10m])) > 1
+        for: 10m
+        labels: { severity: warn, team: ai-platform }
+        annotations:
+          summary: "Budget scope {{ $labels.scope }} is blocking more than 1 req/s over 10m"
+          description: |
+            A hard cap is rejecting sustained traffic. Either raise the
+            limit or find the caller that is looping.
+
+      # --- Auth cache ---
+
+      - alert: AuthCacheHitRateDropped
+        expr: |
+          sum(rate(gateway_auth_cache_hits_total{tier="l1"}[5m]))
+            / sum(rate(gateway_auth_cache_lookups_total[5m])) < 0.9
+        for: 15m
+        labels: { severity: warn, team: ai-platform }
+        annotations:
+          summary: "Auth cache hit rate below 90% for 15m"
+          description: |
+            Every miss costs a round trip to the control plane. The
+            causes are deploy churn and more active keys than the
+            10,000-entry per-pod cache holds.
+
+      - alert: ControlPlaneCallsFailing
+        expr: |
+          sum by (endpoint) (
+            rate(gateway_control_plane_requests_total{status="error"}[5m])
+          ) > 0
+        for: 5m
+        labels: { severity: page, team: ai-platform }
+        annotations:
+          summary: "Gateway calls to the control plane are failing on {{ $labels.endpoint }}"
+          description: |
+            status=error means no response arrived at all. Cached keys
+            keep serving inside the grace window; keys this pod has
+            never seen answer 503 auth_upstream_unavailable.
+
+      # --- Policy ---
+
+      - alert: GuardrailBlockSpike
+        expr: |
+          sum by (direction) (
+            rate(gateway_guardrail_verdicts_total{verdict="block"}[5m])
+          ) > 10
+        for: 5m
+        labels: { severity: warn, team: ai-platform }
+        annotations:
+          summary: "More than 10 req/s blocked by policy on direction={{ $labels.direction }}"
+          description: |
+            Either a caller is repeating a banned request or a policy
+            change went too wide. Open the traces for the affected key.
+```
+
+## Why these rules
+
+Each rule reports one of three things: customer impact that is happening now (5xx rate, an open circuit), a leading indicator (fallback rate, cache hit rate, failing control-plane calls), or spend that is escaping enforcement (missing stream usage, dropped spend records).
+
+Rules that are deliberately absent:
+
+- **Provider 429s.** Fallback and the circuit breaker handle them without a person.
+- **Request latency.** The provider round trip dominates, so an alert on it is an alert on the provider. Use `gateway_provider_duration_seconds` next to `gateway_http_request_duration_seconds` to see the gateway's own share.
+- **Cost.** The registry holds no per-request cost metric. Spend is priced by the control plane and read from the usage screens.
+
+## Routing
+
+Send `severity: page` to your pager and `severity: warn` to chat:
+
+```yaml
+route:
+  receiver: slack-gateway
+  group_by: [alertname, team]
+  routes:
+    - matchers: [severity="page", team="ai-platform"]
+      receiver: pagerduty-ai-platform
+      continue: true
+    - matchers: [severity="warn", team="ai-platform"]
+      receiver: slack-gateway
+
+receivers:
+  - name: pagerduty-ai-platform
+    pagerduty_configs:
+      - routing_key: "YOUR_PAGERDUTY_SERVICE_KEY"
+  - name: slack-gateway
+    slack_configs:
+      - channel: "#ai-gateway-alerts"
+        title: "{{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.description }}{{ end }}"
+```
+
+## Test the rules before you deploy them
+
+```bash
+promtool check rules alerts/langwatch-gateway.yml
+promtool test rules alerts/langwatch-gateway.test.yml
+```
+
+```yaml
+rule_files:
+  - alerts/langwatch-gateway.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Every request errors, so the 5xx ratio pins at 1.0.
+  - interval: 1m
+    input_series:
+      - series: 'gateway_http_requests_total{route="/v1/chat/completions", status="500", provider="openai", model="gpt-6-luna"}'
+        values: "0+1x15"
+      - series: 'gateway_http_requests_total{route="/v1/chat/completions", status="200", provider="openai", model="gpt-6-luna"}'
+        values: "0+0x15"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: GatewayHighErrorRate
+        exp_alerts:
+          - exp_labels: { severity: page, team: ai-platform }
+
+  # gateway_circuit_state carries the state in the value: 0 closed,
+  # 1 open, 2 half-open. Only 1 means the credential is being skipped.
+  - interval: 1m
+    input_series:
+      - series: 'gateway_circuit_state{credential_id="cred_openai_primary"}'
+        values: "1+0x15"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CircuitOpenTooLong
+        exp_alerts:
+          - exp_labels: { credential_id: cred_openai_primary, severity: page, team: ai-platform }
+
+  # Half the attempts land on a fallback credential, past the 10% threshold.
+  - interval: 1m
+    input_series:
+      - series: 'gateway_provider_attempts_total{credential_id="cred_openai_primary", outcome="success"}'
+        values: "0+1x30"
+      - series: 'gateway_provider_attempts_total{credential_id="cred_anthropic_backup", outcome="fallback_success"}'
+        values: "0+1x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: ExcessiveFallback
+        exp_alerts:
+          - exp_labels: { severity: warn, team: ai-platform }
+
+  # One budget scope rejecting sustained traffic.
+  - interval: 1m
+    input_series:
+      - series: 'gateway_budget_blocks_total{scope="project:proj_acme"}'
+        values: "0+120x30"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: BudgetBlockSpike
+        exp_alerts:
+          - exp_labels: { scope: "project:proj_acme", severity: warn, team: ai-platform }
+```
+
+## See also
+
+- [Grafana dashboard](/ai-gateway/cookbooks/grafana-dashboard): the panels behind these rules.
+- [Troubleshooting](/ai-gateway/troubleshooting): what to do when one of them fires.
+- [Observability](/ai-gateway/observability): every metric, label and span attribute.
+- [Budgets](/ai-gateway/budgets): how spend reaches the ledger and what the precheck reads.

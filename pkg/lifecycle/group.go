@@ -1,0 +1,212 @@
+package lifecycle
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/langwatch/langwatch/pkg/clog"
+	"github.com/langwatch/langwatch/pkg/health"
+)
+
+const (
+	defaultGraceful   = 10 * time.Second
+	defaultDrainDelay = 3 * time.Second
+)
+
+// Group manages ordered start/stop of services with graceful shutdown.
+//
+// Shutdown sequence (K8s-friendly):
+//  1. SIGTERM/SIGINT, context cancellation, or fatal service error
+//  2. Health registry marked draining (/readyz → 503)
+//  3. Drain delay waits for load balancer to remove the pod
+//  4. The graceful budget starts, and services are stopped in reverse
+//     registration order within it
+//
+// The drain delay sits outside the graceful budget, so total wall time from
+// the signal to the last Stop returning is drainDelay + graceful. That is
+// what makes the graceful budget mean what it says: an in-flight request
+// gets all of it, not what the drain delay left over.
+type Group struct {
+	health     *health.Registry
+	services   []Service
+	graceful   time.Duration
+	drainDelay time.Duration
+	logger     *zap.Logger // set at Run-time from the context
+}
+
+// Option configures a Group.
+type Option func(*Group)
+
+// WithGraceful sets how long services get to stop once the drain delay has
+// elapsed. It bounds the stop phase only; the drain delay is charged
+// separately, so the deadline a service's Stop sees is always the full d.
+func WithGraceful(d time.Duration) Option {
+	return func(g *Group) { g.graceful = d }
+}
+
+// WithDrainDelay sets the pause between marking draining and stopping services.
+// This gives the load balancer time to remove the pod from endpoints. It is
+// added to the graceful budget rather than taken out of it, so an operator
+// sizing the pod's termination grace period budgets for the sum of the two.
+func WithDrainDelay(d time.Duration) Option {
+	return func(g *Group) { g.drainDelay = d }
+}
+
+// WithHealth sets the health registry for drain signaling.
+func WithHealth(r *health.Registry) Option {
+	return func(g *Group) { g.health = r }
+}
+
+// New creates a lifecycle Group.
+func New(opts ...Option) *Group {
+	g := &Group{
+		graceful:   defaultGraceful,
+		drainDelay: defaultDrainDelay,
+	}
+	for _, o := range opts {
+		o(g)
+	}
+	return g
+}
+
+// Add registers services. They start in order and stop in reverse.
+func (g *Group) Add(svcs ...Service) {
+	g.services = append(g.services, svcs...)
+}
+
+// ServiceNames returns the registered service names in start order. Stop
+// runs in reverse of this, which is what makes the order worth asserting:
+// which service drains before which is a correctness property, not a
+// detail.
+func (g *Group) ServiceNames() []string {
+	names := make([]string, 0, len(g.services))
+	for _, svc := range g.services {
+		names = append(names, svc.String())
+	}
+	return names
+}
+
+// Run starts all services, blocks until a shutdown trigger fires,
+// then orchestrates graceful shutdown.
+func (g *Group) Run(ctx context.Context) error {
+	g.logger = clog.Get(ctx)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Start services in registration order.
+	started := 0
+	for _, svc := range g.services {
+		g.logger.Info("lifecycle_start", zap.Stringer("lifecycle_service", svc))
+		if err := svc.Start(ctx); err != nil {
+			cancel()
+			_ = g.stopN(context.Background(), started)
+			return fmt.Errorf("start %s: %w", svc, err)
+		}
+		started++
+	}
+
+	// Merge fatal channels from services that can fail after Start.
+	fatal := g.mergeFatal()
+
+	// Wait for shutdown trigger.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+
+	var fatalErr error
+	select {
+	case s := <-sig:
+		g.logger.Info("lifecycle_signal", zap.String("signal", s.String()))
+	case err := <-fatal:
+		fatalErr = err
+		g.logger.Error("lifecycle_fatal", zap.Error(err))
+	case <-ctx.Done():
+		g.logger.Info("lifecycle_context_done")
+	}
+
+	// Cancel the services' context.
+	cancel()
+
+	// Mark draining so /readyz returns 503.
+	if g.health != nil {
+		g.health.MarkDraining()
+		g.logger.Info("lifecycle_draining")
+	}
+
+	// Pause for LB to remove the pod from endpoints. This is time spent
+	// making the pod unroutable, not time an in-flight request gets to
+	// finish in, so it is deliberately outside the graceful budget below.
+	if g.drainDelay > 0 {
+		g.logger.Info("lifecycle_drain_delay", zap.Duration("wait", g.drainDelay))
+		time.Sleep(g.drainDelay)
+	}
+
+	// The graceful budget starts here, with the pod already out of
+	// rotation, so a still-running request gets the whole of it.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), g.graceful)
+	defer shutCancel()
+
+	stopErr := g.stopN(shutCtx, started)
+
+	if fatalErr != nil {
+		return fatalErr
+	}
+	return stopErr
+}
+
+// stopN stops the first n services in reverse order.
+func (g *Group) stopN(ctx context.Context, n int) error {
+	var first error
+	for i := n - 1; i >= 0; i-- {
+		svc := g.services[i]
+		g.logger.Info("lifecycle_stop", zap.Stringer("lifecycle_service", svc))
+		stopCtx, cancel := stopContext(ctx, svc)
+		err := svc.Stop(stopCtx)
+		cancel()
+		if err != nil {
+			g.logger.Warn("lifecycle_stop_error",
+				zap.Stringer("lifecycle_service", svc), zap.Error(err))
+			if first == nil {
+				first = fmt.Errorf("stop %s: %w", svc, err)
+			}
+		}
+	}
+	return first
+}
+
+// stopContext is the context one service stops under: the group's, or one
+// with the service's own budget when it states one. The own budget runs from
+// the moment that service is stopped and is not cut short by the group's.
+func stopContext(ctx context.Context, svc Service) (context.Context, context.CancelFunc) {
+	budgeted, ok := svc.(stopBudgeter)
+	if !ok || budgeted.StopBudget() <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), budgeted.StopBudget())
+}
+
+// mergeFatal fans-in Fatal() channels from all registered services.
+func (g *Group) mergeFatal() <-chan error {
+	out := make(chan error, 1)
+	for _, svc := range g.services {
+		fr, ok := svc.(fatalReporter)
+		if !ok {
+			continue
+		}
+		go func(ch <-chan error) {
+			if err, ok := <-ch; ok {
+				select {
+				case out <- err:
+				default:
+				}
+			}
+		}(fr.Fatal())
+	}
+	return out
+}

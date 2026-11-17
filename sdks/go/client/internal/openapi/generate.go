@@ -1,0 +1,31 @@
+// Package openapi contains the code generated from the LangWatch OpenAPI
+// specification: typed request/response models and a low-level net/http client.
+//
+// Nothing in this package is part of the SDK's public surface. Consumers should
+// use the ergonomic, hand-written wrapper in the parent package
+// (github.com/langwatch/langwatch/sdks/go/client) instead, which is documented,
+// stable, and shields callers from regeneration churn. The contents of
+// zz_generated.gen.go are produced by `go generate` and must not be hand-edited.
+//
+// # Regeneration
+//
+// The generated code is committed so `go build` works without any toolchain
+// beyond Go itself. Regenerating needs a full langwatch repository checkout
+// with pnpm dependencies installed, python3 and Go. From the repository root,
+// `make sync-all-openapi` regenerates every client; to regenerate only this
+// one, run from the client module root:
+//
+//	go generate ./...
+//
+// The directive below performs three steps:
+//
+//  1. Generate the OpenAPI 3.1 document from the api's route declarations
+//     (pnpm --filter @langwatch/platform-api openapi:generate writes
+//     specs/api-reference/openapi-document.json, which git ignores).
+//  2. Down-convert it to a 3.0.3-compatible temporary file via downconvert.py,
+//     because oapi-codegen (kin-openapi) does not parse 3.1.
+//  3. Run oapi-codegen with oapi-codegen.yaml to emit zz_generated.gen.go.
+package openapi
+
+//go:generate sh -c "cd ../../../../.. && pnpm --filter @langwatch/platform-api run openapi:generate"
+//go:generate sh -c "python3 downconvert.py ../../../../../specs/api-reference/openapi-document.json ./openapi-3.0.json && go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.7.1 -config oapi-codegen.yaml ./openapi-3.0.json && rm -f ./openapi-3.0.json"

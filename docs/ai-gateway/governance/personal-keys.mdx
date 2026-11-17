@@ -1,0 +1,91 @@
+---
+title: Personal keys
+description: Sign in from the LangWatch CLI and get a personal virtual key that Claude Code, Codex, Cursor, Gemini CLI, GitHub Copilot CLI and OpenCode use, with your spend attributed to you and capped by your own budget.
+sidebarTitle: Personal keys
+---
+
+## What a personal key is
+
+A personal key is a virtual key that belongs to you. It is scoped to your personal project, it uses the routing policy your admin set for the organization, and the gateway attributes every request made with it to you. A personal key is like a virtual credit card that your admin can attach a budget to.
+
+You never see a provider secret. Your admin adds the providers once; your key inherits them.
+
+## Sign in
+
+Install the CLI and sign in with the device flow:
+
+```bash
+npm install -g langwatch
+langwatch login --device
+```
+
+This opens LangWatch in your browser to sign in and approve this device. Back in the terminal, you see the tools you can run, the model providers your key can use, and the budgets that apply to you:
+
+```text
+✓ Logged in as jane@acme.com @ ACME
+
+Your AI tools (run any of these):
+  $ langwatch claude    # Claude Code
+  $ langwatch codex     # Codex
+
+Model providers you can issue a virtual key for:
+  • anthropic  Anthropic
+  • openai     OpenAI
+
+Budgets that apply to your key:
+  $2.43 used of $100.00 this month (personal budget), resets Sep 1
+
+Or open the app in your browser:
+  $ langwatch open
+```
+
+If the browser does not open, paste the URL the terminal prints and enter the code it shows. The device session is saved to `~/.langwatch/config.json`.
+
+<Note>Your organization needs at least one model provider before a key can be issued. Without one, the first tool run stops with `No personal virtual key on this account` and names the page where an admin adds a provider, **Settings > Model Providers**.</Note>
+
+## Start a tool
+
+Run a coding tool through its wrapper:
+
+```bash
+langwatch claude
+```
+
+The first run issues your personal key, prints `issued your personal virtual key for the gateway path`, and starts Claude Code with the gateway as its endpoint. Later runs reuse the key. The tool itself is unchanged: flags, terminal handling and exit codes pass through.
+
+| Wrapper              | Tool               | Variables the wrapper sets                                                                             |
+| -------------------- | ------------------ | ------------------------------------------------------------------------------------------------------ |
+| `langwatch claude`   | Claude Code        | `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`                                                           |
+| `langwatch codex`    | Codex              | `OPENAI_BASE_URL`, `OPENAI_API_KEY`                                                                    |
+| `langwatch cursor`   | Cursor             | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`                      |
+| `langwatch gemini`   | Gemini CLI         | `GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`                                           |
+| `langwatch copilot`  | GitHub Copilot CLI | `COPILOT_PROVIDER_TYPE`, `COPILOT_PROVIDER_BASE_URL`, `COPILOT_PROVIDER_API_KEY`                       |
+| `langwatch opencode` | OpenCode           | `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY` |
+
+**Also check:** [Coding Agents](/coding-agents/overview) for the setup pages per tool.
+
+## Your keys and devices
+
+Open **Configure** in your personal workspace (`/me/configure`). The **Virtual keys** tab lists your keys with their label, the device that issued them and their last use. **Add a new key** creates a second key with a label of your choice, for example `jane-laptop-2`; the secret is shown once. The **Devices and keys** tab lists the CLI sessions signed in on your account, each with the ingestion keys it minted.
+
+Revoke a key from the same list when a laptop is lost or a secret leaked. The gateway refuses the key on the next request.
+
+`langwatch whoami` prints your user, your organization and the prefix of your personal key once one is issued. `langwatch logout` removes the device session from this machine and invalidates its tokens on the server; your virtual keys stay valid until you revoke them.
+
+### Ingestion keys follow the CLI session
+
+An ingestion key that the CLI mints for a tool belongs to the login session on that machine. It is retired when you run `langwatch logout` there, when you revoke that device from the **Devices and keys** tab, or when the session reaches the end of its window. Every live key is listed on that tab under the device it came from, so you can see and revoke each one on its own.
+
+## Your usage and budget
+
+Open **My Usage** (`/me`) for your spend, your requests and your recent traces. The page lists every budget that applies to you and warns from 80% of a limit.
+
+A budget applies to you when your admin creates one with **Applies to: Member** and picks you, or binds one to your personal team, your personal project or your key. Your admin sets the window: per day, per week, per calendar month, or a total with no reset.
+
+When a blocking budget is reached, the gateway refuses the request with `402 budget_exceeded`. The wrapper checks your budget before it starts the tool and prints a link to `/me/budget/request` with the limit and the spend filled in, so you can ask your admin for an increase from there.
+
+**Also check:** [Budgets](/ai-gateway/budgets) for the budget windows and the error body.
+
+## Sessions and tokens
+
+Your access token lives for one hour and refreshes on its own. The refresh token stays valid for 90 days without use, or less when the organization sets a maximum session length. When your access to the organization ends, the next refresh fails and the CLI asks you to sign in again.

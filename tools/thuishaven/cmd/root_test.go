@@ -1,0 +1,436 @@
+package cmd
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+func TestStripFlag(t *testing.T) {
+	t.Run("when the flag is present", func(t *testing.T) {
+		out, found := stripFlag([]string{"a", "--force", "b"}, "--force")
+		if !found {
+			t.Fatal("stripFlag did not report the flag as found")
+		}
+		if got, want := len(out), 2; got != want {
+			t.Fatalf("remaining args = %q, want length %d", out, want)
+		}
+		if out[0] != "a" || out[1] != "b" {
+			t.Errorf("stripFlag left %q, want [a b]", out)
+		}
+	})
+	t.Run("when the flag is absent", func(t *testing.T) {
+		out, found := stripFlag([]string{"a", "b"}, "--force")
+		if found {
+			t.Error("stripFlag reported an absent flag as found")
+		}
+		if len(out) != 2 {
+			t.Errorf("stripFlag changed args to %q", out)
+		}
+	})
+}
+
+func TestPRWorktreeBaseHonoursEnvOverride(t *testing.T) {
+	t.Setenv("HAVEN_WORKTREE_DIR", "/tmp/custom-worktrees")
+	if got, want := prWorktreeBase("/anywhere"), "/tmp/custom-worktrees"; got != want {
+		t.Errorf("prWorktreeBase = %q, want the HAVEN_WORKTREE_DIR override %q", got, want)
+	}
+}
+
+func TestPRWorktreeBaseDefaultsToSiblingWorktreesDir(t *testing.T) {
+	t.Setenv("HAVEN_WORKTREE_DIR", "")
+	repo := gitInitTemp(t)
+	// Default base is the sibling worktrees/ dir next to the main checkout. git
+	// reports the symlink-resolved checkout path (e.g. /private/var on macOS), so
+	// resolve the expected side too rather than comparing raw temp paths.
+	resolved, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(repo) = %v", err)
+	}
+	if got, want := prWorktreeBase(repo), filepath.Join(filepath.Dir(resolved), "worktrees"); got != want {
+		t.Errorf("prWorktreeBase(%q) = %q, want %q", repo, got, want)
+	}
+}
+
+func TestGitMainWorktreeReturnsPrimaryCheckout(t *testing.T) {
+	repo := gitInitTemp(t)
+	got, err := filepath.EvalSymlinks(gitMainWorktree(repo))
+	if err != nil {
+		t.Fatalf("EvalSymlinks(gitMainWorktree) = %v", err)
+	}
+	want, err := filepath.EvalSymlinks(repo)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(repo) = %v", err)
+	}
+	if got != want {
+		t.Errorf("gitMainWorktree = %q, want the primary checkout %q", got, want)
+	}
+}
+
+// gitInitTemp makes a throwaway git repo with one commit, isolated from the
+// developer's global/system git config, and returns its path.
+func gitInitTemp(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(),
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_SYSTEM=/dev/null",
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("commit", "--allow-empty", "-m", "init")
+	return dir
+}
+
+// @scenario "The managed ClickHouse keeps its own telemetry lightweight"
+func TestClickHouseLimitsEnvWiring(t *testing.T) {
+	t.Run("given no ClickHouse log env vars", func(t *testing.T) {
+		t.Setenv("HAVEN_CLICKHOUSE_FULL_LOGS", "")
+		t.Setenv("HAVEN_CLICKHOUSE_LOG_TTL_DAYS", "")
+
+		t.Run("when resolving the limits", func(t *testing.T) {
+			l := clickHouseLimits()
+
+			t.Run("keeps lightweight logs on by default", func(t *testing.T) {
+				if !l.LightweightLogsEnabled {
+					t.Error("lightweight logs off without any env opt-out")
+				}
+			})
+		})
+	})
+
+	t.Run("given HAVEN_CLICKHOUSE_FULL_LOGS=1", func(t *testing.T) {
+		t.Setenv("HAVEN_CLICKHOUSE_FULL_LOGS", "1")
+
+		t.Run("when resolving the limits", func(t *testing.T) {
+			t.Run("restores full stock logging", func(t *testing.T) {
+				if clickHouseLimits().LightweightLogsEnabled {
+					t.Error("FULL_LOGS=1 did not disable lightweight logs")
+				}
+			})
+		})
+	})
+
+	t.Run("given HAVEN_CLICKHOUSE_FULL_LOGS=0", func(t *testing.T) {
+		t.Setenv("HAVEN_CLICKHOUSE_FULL_LOGS", "0")
+
+		t.Run("when resolving the limits", func(t *testing.T) {
+			t.Run("keeps lightweight logs on — only a truthy value opts out", func(t *testing.T) {
+				if !clickHouseLimits().LightweightLogsEnabled {
+					t.Error("FULL_LOGS=0 disabled lightweight logs; the flag is documented as =1")
+				}
+			})
+		})
+	})
+
+	t.Run("given HAVEN_CLICKHOUSE_LOG_TTL_DAYS=3", func(t *testing.T) {
+		t.Setenv("HAVEN_CLICKHOUSE_LOG_TTL_DAYS", "3")
+
+		t.Run("when resolving the limits", func(t *testing.T) {
+			t.Run("carries the override into the TTL", func(t *testing.T) {
+				if got := clickHouseLimits().SystemLogTTLDays; got != 3 {
+					t.Errorf("got TTL %d, want 3", got)
+				}
+			})
+		})
+	})
+}
+
+// haven's own knobs (LANGWATCH_HAVEN_CH, LANGY_UNSAFE_HOST_ACCESS, …) resolve
+// from .env as well as the shell, so a machine-level preference like
+// "this laptop runs native ClickHouse, never provision one" is pinned next to
+// the CLICKHOUSE_URL it belongs with and travels into every new worktree.
+func TestResolveKnob(t *testing.T) {
+	noSettings := func() map[string]string { return nil }
+	dotenv := func() map[string]string {
+		return map[string]string{"LANGWATCH_HAVEN_CH": "0"}
+	}
+	unset := func(string) (string, bool) { return "", false }
+
+	t.Run("given a knob set only in the dotenv layers", func(t *testing.T) {
+		t.Run("when resolving it", func(t *testing.T) {
+			t.Run("falls back to the dotenv value", func(t *testing.T) {
+				got, ok := resolveKnob("LANGWATCH_HAVEN_CH", knobLayers{lookup: unset, dotenv: dotenv, settings: noSettings})
+				if !ok || got != "0" {
+					t.Errorf(`got (%q, %v), want ("0", true)`, got, ok)
+				}
+			})
+		})
+	})
+
+	t.Run("given the same knob exported in the process environment", func(t *testing.T) {
+		exported := func(string) (string, bool) { return "1", true }
+
+		t.Run("when resolving it", func(t *testing.T) {
+			t.Run("the process environment wins over the dotenv layers", func(t *testing.T) {
+				got, _ := resolveKnob("LANGWATCH_HAVEN_CH", knobLayers{lookup: exported, dotenv: dotenv, settings: noSettings})
+				if got != "1" {
+					t.Errorf("got %q, want %q; an export must override .env for a one-off run", got, "1")
+				}
+			})
+		})
+	})
+
+	t.Run("given a knob exported as the empty string", func(t *testing.T) {
+		emptyExport := func(string) (string, bool) { return "", true }
+
+		t.Run("when resolving it", func(t *testing.T) {
+			t.Run("reports it as set, so an explicit opt-out is not re-read from .env", func(t *testing.T) {
+				got, ok := resolveKnob("LANGWATCH_HAVEN_CH", knobLayers{lookup: emptyExport, dotenv: dotenv, settings: noSettings})
+				if got != "" || !ok {
+					t.Errorf(`got (%q, %v), want ("", true)`, got, ok)
+				}
+			})
+		})
+	})
+
+	t.Run("given a knob absent from both sources", func(t *testing.T) {
+		t.Run("when resolving it", func(t *testing.T) {
+			t.Run("reports it unset so the caller's default applies", func(t *testing.T) {
+				if _, ok := resolveKnob("LANGWATCH_HAVEN_NOPE", knobLayers{lookup: unset, dotenv: dotenv, settings: noSettings}); ok {
+					t.Error("an absent knob must not report as set")
+				}
+			})
+		})
+	})
+
+	t.Run("given a knob answered by the process environment", func(t *testing.T) {
+		t.Run("when resolving it", func(t *testing.T) {
+			t.Run("never reads the dotenv layers", func(t *testing.T) {
+				read := false
+				counting := func() map[string]string {
+					read = true
+					return nil
+				}
+				resolveKnob("LANGWATCH_HAVEN_CH", knobLayers{lookup: func(string) (string, bool) { return "1", true }, dotenv: counting, settings: noSettings})
+				if read {
+					t.Error("dotenv was loaded even though the environment answered")
+				}
+			})
+		})
+	})
+}
+
+// The ENVIRONMENT help text promises that haven's knobs resolve from
+// .env, and names the ones that do not. That promise is only as good
+// as its exclusion list: a knob added on plain os.Getenv without being listed
+// reads, to anyone following the docs, as configurable from .env when it
+// silently is not. Derive the real list from the source so the two cannot part.
+func TestProcessOnlyKnobsAreDocumented(t *testing.T) {
+	source, err := os.ReadFile("root.go")
+	if err != nil {
+		t.Fatalf("read root.go: %v", err)
+	}
+	help, err := os.ReadFile("help.go")
+	if err != nil {
+		t.Fatalf("read help.go: %v", err)
+	}
+
+	found := regexp.MustCompile(`os\.(?:Getenv|LookupEnv)\("([A-Z_]+)"\)`).
+		FindAllStringSubmatch(string(source), -1)
+	if len(found) == 0 {
+		t.Fatal("no os.Getenv knobs found: the pattern stopped matching, not a clean bill of health")
+	}
+
+	for _, match := range found {
+		key := match[1]
+		if !strings.Contains(string(help), key) {
+			t.Errorf(
+				"%s is read straight from the process environment but never named in help.go: "+
+					"either route it through devEnv or add it to the ENVIRONMENT exclusion list",
+				key,
+			)
+		}
+	}
+}
+
+// onlyRemovedKnobSet clears every removed selection variable, then sets one.
+// rejectRemovedSelectionEnv reports the FIRST variable that applies, and it
+// resolves through .env as well as the environment — so without this
+// a developer whose own .env still carries one of these would see these tests
+// assert against the wrong variable's error.
+func onlyRemovedKnobSet(t *testing.T, name, value string) {
+	t.Helper()
+	for _, knob := range removedSelectionEnv {
+		t.Setenv(knob.name, "")
+	}
+	t.Setenv(name, value)
+}
+
+// The selection env vars are gone, not quietly ignored: a stale export would
+// otherwise start services the developer believes they turned off, and `haven
+// status` would report a selection the env had overridden behind its back.
+//
+// @scenario "Removed selection env vars name their replacement"
+// @scenario "A knob nothing reads is refused whichever way it is set"
+func TestRejectRemovedSelectionEnv(t *testing.T) {
+	t.Run("given a removed selection variable set to the value that used to apply", func(t *testing.T) {
+		for _, tc := range []struct{ name, value, wantReplacement string }{
+			{"LANGWATCH_SKIP_NLP", "1", "haven up -nlp"},
+			{"LANGWATCH_SKIP_AIGATEWAY", "1", "haven up -gateway"},
+			{"LANGWATCH_SKIP_LANGYAGENT", "1", "haven up -langy"},
+		} {
+			t.Run("when up runs with "+tc.name, func(t *testing.T) {
+				t.Run("fails naming the sticky command that replaces it", func(t *testing.T) {
+					onlyRemovedKnobSet(t, tc.name, tc.value)
+					err := rejectRemovedSelectionEnv()
+					if err == nil {
+						t.Fatalf("%s=%s was accepted; it no longer selects services", tc.name, tc.value)
+					}
+					if !strings.Contains(err.Error(), tc.wantReplacement) {
+						t.Errorf("error %q does not point at %q", err, tc.wantReplacement)
+					}
+				})
+			})
+		}
+	})
+
+	// The two worker knobs have nothing to point at: neither describes a
+	// topology this repository still has. The background worker is its own
+	// application, so there is no in-process mode to ask for and no way to turn
+	// the workers off — offering `+workers` would be wrong in both directions.
+	t.Run("given a worker knob set either way, which nothing replaces", func(t *testing.T) {
+		for _, tc := range []struct{ name, value string }{
+			{"WORKERS_IN_PROCESS", "1"},
+			{"WORKERS_IN_PROCESS", "0"},
+			{"START_WORKERS", "true"},
+			{"START_WORKERS", "false"},
+		} {
+			t.Run("when up runs with "+tc.name+"="+tc.value, func(t *testing.T) {
+				onlyRemovedKnobSet(t, tc.name, tc.value)
+				err := rejectRemovedSelectionEnv()
+				if err == nil {
+					t.Fatalf("%s=%s was accepted; nothing reads it any more", tc.name, tc.value)
+				}
+
+				t.Run("says it does nothing rather than naming a replacement", func(t *testing.T) {
+					if !strings.Contains(err.Error(), "no longer does anything") {
+						t.Errorf("error %q should say the variable does nothing", err)
+					}
+					if strings.Contains(err.Error(), "run `") {
+						t.Errorf("error %q offers a replacement command; there is none", err)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("given WORKERS_IN_PROCESS set", func(t *testing.T) {
+		t.Run("when up runs, it explains that the worker is its own process", func(t *testing.T) {
+			onlyRemovedKnobSet(t, "WORKERS_IN_PROCESS", "1")
+			err := rejectRemovedSelectionEnv()
+			if err == nil {
+				t.Fatal("WORKERS_IN_PROCESS=1 was accepted; nothing reads it any more")
+			}
+			if !strings.Contains(err.Error(), "its own process") {
+				t.Errorf("error %q does not say the worker is its own process now", err)
+			}
+		})
+	})
+}
+
+// The refusal has to read intent, not one literal. The preset launchers test
+// LANGWATCH_SKIP_* against "1"; other readers accept "true". Matching any single
+// one of those exactly lets a developer's "off" or "yes" through, and through
+// means haven runs a service they believe they turned off — silently, which is
+// the one outcome this mechanism exists to prevent.
+//
+// @scenario "A removed selection variable is read for intent, not one spelling"
+func TestRemovedSelectionEnvIsReadForIntentNotOneSpelling(t *testing.T) {
+	t.Run("given a value that means on in every spelling", func(t *testing.T) {
+		for _, value := range []string{"yes", "on", "TRUE", "True"} {
+			t.Run("when up runs with LANGWATCH_SKIP_NLP="+value, func(t *testing.T) {
+				onlyRemovedKnobSet(t, "LANGWATCH_SKIP_NLP", value)
+				err := rejectRemovedSelectionEnv()
+				if err == nil {
+					t.Fatalf("LANGWATCH_SKIP_NLP=%q was accepted; haven would run nlp for someone who believes it is off", value)
+				}
+				if !strings.Contains(err.Error(), "haven up -nlp") {
+					t.Errorf("error %q does not point at the sticky replacement", err)
+				}
+			})
+		}
+	})
+
+	// Blanking a line is how a .env unsets a knob. There is no intent left in it
+	// to refuse, and refusing would leave the developer deleting an empty line to
+	// start a stack.
+	t.Run("given a variable blanked out to nothing", func(t *testing.T) {
+		for _, name := range []string{"WORKERS_IN_PROCESS", "START_WORKERS", "LANGWATCH_SKIP_NLP"} {
+			t.Run("when up runs with "+name+" empty", func(t *testing.T) {
+				onlyRemovedKnobSet(t, name, "")
+				if err := rejectRemovedSelectionEnv(); err != nil {
+					t.Errorf("%s= blocked a stack: %v", name, err)
+				}
+			})
+		}
+	})
+}
+
+// @scenario "An agent's typecheck is the affected one"
+func TestTypecheckScopeDefaultsByCaller(t *testing.T) {
+	if args, affected := typecheckScope([]string{"--verbose"}, true); !affected || len(args) != 1 {
+		t.Errorf("agent default: affected=%v args=%v", affected, args)
+	}
+	if _, affected := typecheckScope(nil, false); affected {
+		t.Errorf("a person gets the whole tree by default")
+	}
+	if args, affected := typecheckScope([]string{"--all", "--", "--verbose"}, true); affected || len(args) != 1 {
+		t.Errorf("--all must win for an agent and not be forwarded: affected=%v args=%v", affected, args)
+	}
+	if _, affected := typecheckScope([]string{"--affected"}, false); !affected {
+		t.Errorf("--affected must win for a person")
+	}
+}
+
+func TestIsSlotCommandSkipsWiringOnlyForTheSlot(t *testing.T) {
+	cases := map[string]struct {
+		args []string
+		want bool
+	}{
+		"slot run":          {[]string{"machine", "slot", "run", "--", "true"}, true},
+		"slot explain":      {[]string{"machine", "slot", "explain"}, true},
+		"machine typecheck": {[]string{"machine", "typecheck"}, false},
+		"bare machine":      {[]string{"machine"}, false},
+		"stack command":     {[]string{"slot", "run"}, false},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := isSlotCommand(tc.args); got != tc.want {
+				t.Fatalf("isSlotCommand(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDotenvRootFindsTheCheckoutWithoutGit(t *testing.T) {
+	root := t.TempDir()
+	deep := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(deep, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	// A linked worktree's .git is a file, and it still marks the root.
+	if err := os.WriteFile(filepath.Join(root, ".git"), []byte("gitdir: elsewhere\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := dotenvRoot(deep); got != root {
+		t.Fatalf("dotenvRoot(%q) = %q, want %q", deep, got, root)
+	}
+	if _, ok := nearestGitAncestor(filepath.Join(t.TempDir(), "none")); ok {
+		t.Fatal("a directory outside any checkout must not report a root")
+	}
+}

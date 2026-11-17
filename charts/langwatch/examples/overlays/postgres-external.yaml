@@ -1,0 +1,25 @@
+# postgres-external.yaml — Use an external PostgreSQL (RDS, Cloud SQL, etc.).
+#
+# Prerequisites:
+#   kubectl create secret generic langwatch-db -n <namespace> \
+#     --from-literal=connectionString="postgresql://user:pass@host:5432/langwatch"
+#
+# Usage:
+#   helm install lw . \
+#     -f examples/overlays/size-prod.yaml \
+#     -f examples/overlays/access-ingress.yaml \
+#     -f examples/overlays/postgres-external.yaml
+
+postgresql:
+  chartManaged: false
+  external:
+    connectionString:
+      secretKeyRef:
+        name: "langwatch-db"
+        key: "connectionString"
+
+# LangWatchQL's lwql_ro PostgreSQL reader role is converged by the app from
+# whatever DATABASE_URL points at — this external PostgreSQL, in this overlay.
+# The DATABASE_URL role must be allowed to CREATE/ALTER ROLE, or provisioning
+# logs and LangWatchQL stays refused (fail-closed). No chart setting is needed
+# here; see "LangWatchQL (LWQL)" in ../../README.md.

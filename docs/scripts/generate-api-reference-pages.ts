@@ -1,0 +1,1170 @@
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const DOCS_DIR = path.join(__dirname, "..");
+const API_REF_DIR = path.join(DOCS_DIR, "api-reference");
+const SPEC_PATH = path.join(API_REF_DIR, "openapiLangWatch.json");
+const DOCS_JSON_PATH = path.join(DOCS_DIR, "docs.json");
+
+interface OpenAPIOperation {
+  summary?: string;
+  description?: string;
+  operationId?: string;
+  tags?: string[];
+}
+
+interface OpenAPISpec {
+  paths: Record<string, Record<string, OpenAPIOperation>>;
+}
+
+interface EndpointGroup {
+  name: string;
+  dirName: string;
+  pathPrefixes: string[];
+  overviewDescription: string;
+  /**
+   * `METHOD /path` keys, in the order a reader should meet them. CRUD is the
+   * default sort, wrong for a lifecycle sequence — a group can set this so
+   * sidebar and prose agree; anything omitted falls in behind, CRUD-sorted.
+   */
+  endpointOrder?: string[];
+  /**
+   * Hand-written pages that belong to this family but document no single
+   * operation, appended after the generated ones. Declared here, not
+   * `docs.json` — this generator replaces the whole anchor every run.
+   */
+  extraPages?: string[];
+}
+
+/**
+ * Pages that open the anchor, before the first endpoint family. Same reason as
+ * `extraPages`: the anchor is generated wholesale, so its front matter has to
+ * be generated too.
+ */
+const INTRO_GROUP = {
+  group: "Get Started",
+  pages: ["api-reference/introduction"],
+};
+
+const METHOD_ORDER = ["get", "post", "put", "patch", "delete"] as const;
+
+/**
+ * Reasons per family, shared by paths on the same surface: a retired,
+ * intentionally undocumented surface, or a live one not yet documented in
+ * the API reference.
+ */
+const RETIRED_GATEWAY_PROVIDER_BINDINGS =
+  "Retired surface, intentionally undocumented: the gateway provider binding routes answer 410 Gone, and the credentials they wrapped are managed under /api/model-providers.";
+
+const UNDOCUMENTED_INGESTION_TEMPLATES =
+  "Not yet documented in the API reference: the governance ingestion template routes have no reference pages yet.";
+
+const UNDOCUMENTED_CALLER_IDENTITY =
+  "Not yet documented in the API reference: the calling key's own project and usage routes have no reference pages yet.";
+
+const UNDOCUMENTED_MODEL_DEFAULTS =
+  "Not yet documented in the API reference: the default-model cascade routes have no reference pages yet.";
+
+const UNDOCUMENTED_LANGY_LOCAL_CONTROL =
+  "Not yet documented in the API reference: the Langy local control routes are called by the langwatch CLI (langwatch langy --share-control), and the CLI documentation covers that flow.";
+
+const UNDOCUMENTED_SAVED_WORKBENCH_CHARTS =
+  "Not yet documented in the API reference: the saved workbench chart routes require the analytics:view permission and have no reference pages yet.";
+
+const UNDOCUMENTED_CHECKUP =
+  "Not yet documented in the API reference: the checkup routes back Settings, Checkup and langwatch doctor on a self-hosted install, and the CLI documentation covers that flow.";
+
+const RETIRED_LEGACY_AGENTS =
+  "Retired surface, intentionally undocumented: superseded by /api/v1/agents (see the Agents family below); this bare form answers every request with a deprecation notice naming the successor.";
+
+const UNDOCUMENTED_APP_INTERNAL =
+  "Not part of the public API: the LangWatch app, its operators or a vendor webhook call this route, not API key holders.";
+
+const UNDOCUMENTED_STORED_OBJECTS =
+  "Not yet documented in the API reference: the stored object upload routes back signed-URL attachments and have no reference pages yet.";
+
+const UNDOCUMENTED_CLI_AUTH =
+  "Not yet documented in the API reference: the langwatch CLI calls the device login routes and the routes behind its login session, and the CLI documentation covers that flow.";
+
+const UNDOCUMENTED_LANGY_CONVERSATIONS =
+  "Not yet documented in the API reference: the Langy conversation routes have no reference pages yet.";
+
+/**
+ * Spec paths that deliberately get no reference page, each with the reason it
+ * is excluded. Every other spec path has to be owned by an ENDPOINT_GROUPS
+ * entry, and the generator fails when one is owned by neither.
+ */
+const SKIP_PATHS: Record<string, string> = {
+  "/": "Not an API route: the prompts app serves the spec's root path, which has no content to document.",
+  "/api/trace/search":
+    "Retired surface, intentionally undocumented: superseded by /api/traces/search.",
+  "/api/trace/{id}":
+    "Retired surface, intentionally undocumented: superseded by /api/traces/{traceId}.",
+  "/api/docs-session":
+    "Live surface, intentionally undocumented: the docs playground's own revoke call for its session key (ADR-185), not an API for integrations.",
+  "/api/checkup": UNDOCUMENTED_CHECKUP,
+  "/api/checkup/run": UNDOCUMENTED_CHECKUP,
+  "/api/gateway/v1/providers": RETIRED_GATEWAY_PROVIDER_BINDINGS,
+  "/api/gateway/v1/providers/{id}": RETIRED_GATEWAY_PROVIDER_BINDINGS,
+  "/api/agents": RETIRED_LEGACY_AGENTS,
+  "/api/agents/{id}": RETIRED_LEGACY_AGENTS,
+  "/api/governance/ingestion-templates": UNDOCUMENTED_INGESTION_TEMPLATES,
+  "/api/governance/ingestion-templates/admin": UNDOCUMENTED_INGESTION_TEMPLATES,
+  "/api/governance/ingestion-templates/clone": UNDOCUMENTED_INGESTION_TEMPLATES,
+  "/api/governance/ingestion-templates/{ingestionTemplateId}": UNDOCUMENTED_INGESTION_TEMPLATES,
+  "/api/governance/ingestion-templates/{ingestionTemplateId}/ottl-rules":
+    UNDOCUMENTED_INGESTION_TEMPLATES,
+  "/api/me/project": UNDOCUMENTED_CALLER_IDENTITY,
+  "/api/me/usage": UNDOCUMENTED_CALLER_IDENTITY,
+  "/api/model-defaults": UNDOCUMENTED_MODEL_DEFAULTS,
+  "/api/model-defaults/{id}": UNDOCUMENTED_MODEL_DEFAULTS,
+  "/api/v1/langy/control/connect/frames": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/control/connect/poll": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/control/connect/register": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/control/requests": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/control/requests/{requestId}/approve": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/control/requests/{requestId}/cancel": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/projects/{projectId}/analytics/charts": UNDOCUMENTED_SAVED_WORKBENCH_CHARTS,
+  "/api/v1/projects/{projectId}/analytics/charts/{chartId}": UNDOCUMENTED_SAVED_WORKBENCH_CHARTS,
+  "/api/v1/projects/{projectId}/analytics/charts/{chartId}/placement":
+    UNDOCUMENTED_SAVED_WORKBENCH_CHARTS,
+  "/api/auth/logout": UNDOCUMENTED_APP_INTERNAL,
+  "/api/auth/session": UNDOCUMENTED_APP_INTERNAL,
+  "/api/auth/validate": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/elevenlabs/webhook/{modelProviderId}": UNDOCUMENTED_APP_INTERNAL,
+  "/api/track_event": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/admin/impersonate": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/admin/{resource}": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/bug-reports": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/ops/clickhouse/explain": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/platform-health": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/platform-health/{check}": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/unsubscribe": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/auth/cli/approve": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/bootstrap": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/budget-overview": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/budget/status": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/deny": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/device-approval": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/device-code": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/exchange": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingest/sources": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingest/sources/{sourceId}/events": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingest/sources/{sourceId}/health": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingestion-key": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingestion-keys": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingestion-keys/{lookup_id}": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/ingestion-templates": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/governance/status": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/logout": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/lookup": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/personal-project": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/project-key": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/refresh": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/auth/cli/virtual-key": UNDOCUMENTED_CLI_AUTH,
+  "/api/v1/langy/conversations": UNDOCUMENTED_LANGY_CONVERSATIONS,
+  "/api/v1/langy/conversations/{conversationId}/messages": UNDOCUMENTED_LANGY_CONVERSATIONS,
+  "/api/v1/stored-objects/{storedObjectId}": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/stored-objects/uploads": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/stored-objects/uploads/{storedObjectId}/confirmation": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/files/{storedObjectId}": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/files/{projectId}/{storedObjectId}": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/files/{projectId}/{storedObjectId}/{filename}": UNDOCUMENTED_STORED_OBJECTS,
+  "/api/v1/langy/local/calls": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/local/calls/{callId}": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/local/calls/{callId}/cancel": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/local/requests": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/local/workspace": UNDOCUMENTED_LANGY_LOCAL_CONTROL,
+  "/api/v1/langy/ui/actions": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/langy/waits": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/langy/waits/{waitId}": UNDOCUMENTED_APP_INTERNAL,
+  "/api/internal/langy/credentials/revoke": UNDOCUMENTED_APP_INTERNAL,
+  "/api/internal/langy/relay/frames": UNDOCUMENTED_APP_INTERNAL,
+  "/api/internal/langy/turn/{turnId}/result": UNDOCUMENTED_APP_INTERNAL,
+  "/api/rum/v1/traces": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/user-avatar/{projectId}/{userAvatarId}": UNDOCUMENTED_APP_INTERNAL,
+  "/api/v1/webhooks/stripe": UNDOCUMENTED_APP_INTERNAL,
+  "/api/webhooks/auth0-scim": UNDOCUMENTED_APP_INTERNAL,
+};
+
+const ENDPOINT_GROUPS: EndpointGroup[] = [
+  {
+    name: "Traces",
+    dirName: "traces",
+    pathPrefixes: ["/api/traces", "/api/trace"],
+    overviewDescription:
+      "Search, retrieve, and share LangWatch traces via the REST API. Traces capture the full execution of your LLM pipelines including all spans, evaluations, and metadata.",
+    // The projection DSL shapes the response of the search endpoint rather than
+    // being an endpoint itself, and the Traces overview links to it.
+    extraPages: ["api-reference/traces/projection-dsl"],
+  },
+  {
+    name: "Datasets",
+    dirName: "datasets",
+    pathPrefixes: ["/api/dataset"],
+    overviewDescription:
+      "Manage datasets for evaluations, experiments, and fine-tuning. Create, update, upload, and manage records programmatically.",
+  },
+  {
+    name: "Evaluators",
+    dirName: "evaluators-config",
+    pathPrefixes: ["/api/evaluators"],
+    overviewDescription:
+      "Manage evaluator configurations for your project. Create, update, and organize evaluators used for online evaluations, guardrails, and experiments.",
+  },
+  {
+    name: "Evaluations",
+    dirName: "evaluations",
+    // The guardrail path is the same call in gating mode, so it reads with the
+    // evaluate endpoints rather than in a section of its own.
+    pathPrefixes: ["/api/evaluations", "/api/guardrails"],
+    overviewDescription:
+      "Run an evaluator over a single input and get its score back, or run it as a guardrail and gate on one boolean. List the built-in evaluators to see which ids you can address and what each one needs.",
+    endpointOrder: [
+      "GET /api/v1/evaluations/list",
+      "POST /api/v1/evaluations/{evaluator}/evaluate",
+      "POST /api/v1/evaluations/{evaluator}/{subpath}/evaluate",
+      "POST /api/v1/guardrails/{evaluator}/evaluate",
+    ],
+  },
+  {
+    name: "Experiments",
+    dirName: "experiments",
+    // Two prefixes, because the create endpoint is singular: `/api/experiments`
+    // does not start with `/api/experiment/`, so one prefix would leave either
+    // the create call or the rest of the family unowned.
+    pathPrefixes: ["/api/experiments", "/api/experiment", "/api/dspy"],
+    overviewDescription:
+      "Create experiments, run them, and read their results over HTTP. Create an experiment against a slug you choose, start a run, then poll it and pull the per-row results. This is the same surface the SDKs use, so anything they do you can do directly.",
+    // The order the overview describes, so a reader going down the sidebar
+    // meets the calls in the order they would make them.
+    endpointOrder: [
+      "POST /api/v1/experiment/init",
+      "GET /api/v1/experiments",
+      "POST /api/v1/experiments/{slug}/run",
+      "GET /api/v1/experiments/runs",
+      "GET /api/v1/experiments/runs/{runId}",
+      "GET /api/v1/experiments/runs/{runId}/results",
+      "POST /api/v1/dspy/log_steps",
+    ],
+  },
+  {
+    name: "Monitors",
+    dirName: "monitors",
+    pathPrefixes: ["/api/monitors"],
+    overviewDescription:
+      "Manage online evaluation monitors that automatically evaluate traces as they arrive. Create, update, enable/disable, and delete monitors.",
+  },
+  {
+    name: "Prompts",
+    dirName: "prompts",
+    pathPrefixes: ["/api/prompts"],
+    overviewDescription:
+      "Manage prompt templates, versions, and tags. The Prompts API supports version control, tagging for deployment stages, and syncing with local files.",
+  },
+  {
+    name: "Annotations",
+    dirName: "annotations",
+    pathPrefixes: ["/api/annotations"],
+    overviewDescription:
+      "Create and manage human annotations on traces for quality review, labeling, and evaluation.",
+  },
+  {
+    name: "Scenarios",
+    dirName: "scenarios",
+    pathPrefixes: ["/api/scenarios"],
+    overviewDescription:
+      "Manage test scenarios for agent simulations. Create, update, and organize scenarios that define test cases for your AI agents.",
+  },
+  {
+    name: "Scenario Events",
+    dirName: "scenario-events",
+    pathPrefixes: ["/api/scenario-events"],
+    overviewDescription: "Create and manage scenario execution events.",
+  },
+  {
+    name: "Simulation Runs",
+    dirName: "simulation-runs",
+    pathPrefixes: ["/api/simulation-runs"],
+    overviewDescription:
+      "Query simulation run results. List runs, get batch summaries, and retrieve individual run details.",
+  },
+  {
+    name: "Instant Evals",
+    dirName: "instant-evals",
+    pathPrefixes: ["/api/v1/instant-evals"],
+    overviewDescription:
+      "Judge a LangWatchQL statement across your whole production history as a job. Start a run, price one before you start it, poll its progress, read its judgements page by page, sample the text that was judged, and cancel a run that is still going.",
+    endpointOrder: [
+      "POST /api/v1/instant-evals/estimate",
+      "POST /api/v1/instant-evals",
+      "GET /api/v1/instant-evals",
+      "GET /api/v1/instant-evals/{id}",
+      "GET /api/v1/instant-evals/{id}/results",
+      "GET /api/v1/instant-evals/{id}/sample",
+      "POST /api/v1/instant-evals/{id}/cancel",
+    ],
+    extraPages: ["api-reference/instant-evals/running-an-instant-eval"],
+  },
+  {
+    name: "Run Plans",
+    dirName: "run-plans",
+    pathPrefixes: ["/api/v1/run-plans"],
+    overviewDescription:
+      "Run agent tests. A run plan is identified by its name: a run started under a name joins that plan and replaces its configuration, or creates the plan when no plan holds that name. List, read, run and archive run plans.",
+  },
+  {
+    name: "Test Suites",
+    dirName: "test-suites",
+    pathPrefixes: ["/api/v1/test-suites"],
+    overviewDescription:
+      "Organise agent tests. A test suite groups scenarios; the targets a run goes against are sent with the run. Create, read, rename, archive and run test suites.",
+  },
+  {
+    name: "Suites",
+    dirName: "suites",
+    pathPrefixes: ["/api/suites"],
+    overviewDescription:
+      "Deprecated. The /api/suites family is a frozen alias. New integrations use Run Plans and Test Suites.",
+  },
+  {
+    name: "Agents",
+    dirName: "agents",
+    pathPrefixes: ["/api/v1/agents"],
+    overviewDescription:
+      "Manage AI agent configurations. Create, update, and organize agents that are tracked and evaluated in LangWatch.",
+  },
+  {
+    name: "Coding Agents",
+    dirName: "coding-agents",
+    pathPrefixes: ["/api/v1/coding-agent", "/api/coding-agent"],
+    overviewDescription:
+      "Read what a coding agent session did and what it cost. Walk one session's events call by call, with the tokens, cost and compactions of each, or roll a whole pull request up into sessions, tokens and cost per project, user and agent.",
+  },
+  {
+    name: "Triggers",
+    dirName: "triggers",
+    pathPrefixes: ["/api/triggers", "/api/trigger", "/api/slack-connections"],
+    overviewDescription:
+      "Manage automation triggers that fire actions based on trace events. Create Slack notifications, webhooks, and other automated responses.",
+  },
+  {
+    name: "Events",
+    dirName: "events",
+    pathPrefixes: ["/api/events"],
+    overviewDescription:
+      "Record customer events against a trace or thread, so behaviour like a thumbs-up, a conversion or a refund sits alongside the trace that produced it.",
+    endpointOrder: ["POST /api/v1/events/track"],
+  },
+  {
+    name: "Workflows",
+    dirName: "workflows",
+    // `/api/optimization/...` is the older spelling of the version-pinned
+    // workflow run, and reads as part of the same family.
+    pathPrefixes: ["/api/workflows", "/api/optimization"],
+    overviewDescription:
+      "List, run and archive the workflows you build in the LangWatch workflow editor, and update their name, icon and description.",
+  },
+  {
+    name: "Dashboards",
+    dirName: "dashboards",
+    pathPrefixes: ["/api/dashboards"],
+    overviewDescription:
+      "Create and manage dashboards and the widgets on them. Each widget holds a LangWatchQL query and a chart setup.",
+  },
+  {
+    name: "Reports",
+    dirName: "reports",
+    pathPrefixes: ["/api/analytics/reports"],
+    overviewDescription:
+      "Manage the Analytics Reports dashboards. Create, reorder, and organize dashboards with custom graphs.",
+  },
+  {
+    name: "Graphs",
+    dirName: "graphs",
+    pathPrefixes: ["/api/graphs"],
+    overviewDescription:
+      "Manage custom analytics graphs within dashboards. Create, update, and configure graph visualizations.",
+  },
+  {
+    name: "Analytics",
+    dirName: "analytics",
+    pathPrefixes: ["/api/analytics"],
+    overviewDescription: "Query analytics timeseries data with metrics, aggregations, and filters.",
+  },
+  {
+    name: "Query",
+    dirName: "query",
+    pathPrefixes: ["/api/v1/query"],
+    overviewDescription:
+      "Run a read-only LangWatchQL SELECT over your project's analytics datasets, or discover which datasets and columns your key can query.",
+    // The extraction functions are a feature of the query language rather than
+    // an endpoint, so no OpenAPI operation describes them.
+    extraPages: ["api-reference/query/extraction-functions"],
+  },
+  {
+    name: "Secrets",
+    dirName: "secrets",
+    pathPrefixes: ["/api/secrets"],
+    overviewDescription:
+      "Manage project secrets used for external integrations. Values are encrypted at rest and never returned in API responses.",
+  },
+  {
+    name: "Agent Cache",
+    dirName: "agent-cache",
+    pathPrefixes: ["/api/agent-cache"],
+    overviewDescription:
+      "A per-project store an agent keeps its own run state in. Values are encrypted at rest and each entry expires by itself.",
+  },
+  {
+    name: "Model Providers",
+    dirName: "model-providers",
+    pathPrefixes: ["/api/model-providers"],
+    overviewDescription:
+      "Manage model provider configurations (API keys for OpenAI, Anthropic, etc.) used across the platform.",
+  },
+  {
+    name: "Projects",
+    dirName: "projects",
+    pathPrefixes: ["/api/v1/projects"],
+    overviewDescription:
+      "Manage LangWatch projects. Projects are the top-level containers for traces, evaluators, datasets, and other resources.",
+  },
+  {
+    name: "Teams",
+    dirName: "teams",
+    pathPrefixes: ["/api/teams"],
+    overviewDescription:
+      "Manage teams within your organization. Teams group members and control access to projects.",
+  },
+  {
+    name: "Groups",
+    dirName: "groups",
+    pathPrefixes: ["/api/groups"],
+    overviewDescription:
+      "Manage groups: named sets of members that carry role bindings and can hold a per-member spend allowance.",
+  },
+  {
+    name: "Organization",
+    dirName: "organization",
+    // Members and invites live under this prefix but read as families of their
+    // own, so they carry longer prefixes below and win ownership of their paths.
+    pathPrefixes: ["/api/organization"],
+    overviewDescription:
+      "Read and update the organization the calling credential belongs to: its name, support contact, presence and trace sharing settings, and its stored-object storage.",
+  },
+  {
+    name: "Members",
+    dirName: "members",
+    pathPrefixes: ["/api/organization/members"],
+    overviewDescription:
+      "Manage the people in the organization: list them, read one with the teams they reach, change an organization role, disable or re-enable access, remove someone, and read the full breakdown of what a member can reach.",
+  },
+  {
+    name: "Invites",
+    dirName: "invites",
+    pathPrefixes: ["/api/organization/invites"],
+    overviewDescription:
+      "Invite people into the organization in batches, with the teams and roles they land on, and list or revoke the invites still waiting to be accepted.",
+  },
+  {
+    name: "Roles",
+    dirName: "roles",
+    pathPrefixes: ["/api/roles"],
+    overviewDescription:
+      "Build custom roles out of the permission catalog and keep them up to date. A role is a named set of resource and action permissions that a role binding then grants to someone, somewhere.",
+    // The catalog comes first because it is where the permission keys a role is
+    // built from come from, and the overview walks a reader in that order.
+    endpointOrder: [
+      "GET /api/v1/roles/permissions",
+      "GET /api/v1/roles",
+      "POST /api/v1/roles",
+      "GET /api/v1/roles/{id}",
+      "PATCH /api/v1/roles/{id}",
+      "DELETE /api/v1/roles/{id}",
+    ],
+  },
+  {
+    name: "Grants",
+    dirName: "grants",
+    pathPrefixes: ["/api/grants"],
+    overviewDescription:
+      "Grant a built-in or custom role to a user, a group or an API key at the organization, a team or a project. Grants replace role bindings.",
+  },
+  {
+    name: "Role Bindings",
+    dirName: "role-bindings",
+    pathPrefixes: ["/api/role-bindings"],
+    overviewDescription:
+      "Grant a role to one principal, a user, a group or an API key, at one scope: the organization, a team, or a single project. Role bindings are how every kind of access in LangWatch is expressed.",
+  },
+  {
+    name: "SCIM Tokens",
+    dirName: "scim-tokens",
+    pathPrefixes: ["/api/scim-tokens"],
+    overviewDescription:
+      "Mint, list and revoke the bearer tokens an identity provider uses to reach the SCIM endpoints. Token values are shown once, when they are created, and never again.",
+  },
+  {
+    name: "SCIM",
+    dirName: "scim",
+    pathPrefixes: ["/api/scim/v2"],
+    overviewDescription:
+      "The SCIM 2.0 endpoints an identity provider calls to provision and deprovision users and groups. Point Okta, Entra ID or any other SCIM 2.0 provider at this base URL with a SCIM token.",
+    // Discovery first, then the two resource types whole, because a provider
+    // reads the service provider configuration before it calls anything else,
+    // and the default sort would interleave Users and Groups.
+    endpointOrder: [
+      "GET /api/scim/v2/ServiceProviderConfig",
+      "GET /api/scim/v2/ResourceTypes",
+      "GET /api/scim/v2/Schemas",
+      "GET /api/scim/v2/Users",
+      "POST /api/scim/v2/Users",
+      "GET /api/scim/v2/Users/{id}",
+      "PUT /api/scim/v2/Users/{id}",
+      "PATCH /api/scim/v2/Users/{id}",
+      "DELETE /api/scim/v2/Users/{id}",
+      "GET /api/scim/v2/Groups",
+      "POST /api/scim/v2/Groups",
+      "GET /api/scim/v2/Groups/{id}",
+      "PUT /api/scim/v2/Groups/{id}",
+      "PATCH /api/scim/v2/Groups/{id}",
+      "DELETE /api/scim/v2/Groups/{id}",
+    ],
+  },
+  {
+    name: "Organizations (Self-Hosted)",
+    dirName: "organizations",
+    // Plural, and a different family from `/api/organization`: this one
+    // authenticates against the instance, before any organization exists.
+    pathPrefixes: ["/api/organizations"],
+    overviewDescription:
+      "Create organizations on a self-hosted instance with an instance administrator credential, and read the ones already there. This is where an infrastructure-as-code run starts, because it hands back the first organization admin API key.",
+  },
+  {
+    name: "API Keys",
+    dirName: "api-keys",
+    pathPrefixes: ["/api/api-keys"],
+    overviewDescription:
+      "Manage API keys for authenticating with the LangWatch API. Create service keys, personal keys, and manage their lifecycle.",
+  },
+  {
+    name: "Gateway: Virtual Keys",
+    dirName: "gateway-virtual-keys",
+    pathPrefixes: ["/api/gateway/v1/virtual-keys"],
+    overviewDescription:
+      "Manage virtual keys for the AI Gateway. Virtual keys abstract provider credentials and enable usage tracking, rate limiting, and access control.",
+  },
+  {
+    name: "Gateway: Budgets",
+    dirName: "gateway-budgets",
+    pathPrefixes: ["/api/gateway/v1/budgets"],
+    overviewDescription:
+      "Manage spending budgets for the AI Gateway. Set cost limits per project, team, or virtual key with configurable time windows.",
+  },
+  {
+    name: "Gateway: Cache Rules",
+    dirName: "gateway-cache-rules",
+    pathPrefixes: ["/api/gateway/v1/cache-rules"],
+    overviewDescription:
+      "Manage cache-control rules for the AI Gateway. Configure semantic caching to reduce latency and costs for repeated queries.",
+  },
+  {
+    name: "Gateway: Spend",
+    dirName: "gateway-spend",
+    pathPrefixes: [
+      "/api/gateway/v1/spend-events",
+      "/api/gateway/v1/spend-summaries",
+      "/api/gateway/v1/end-users",
+    ],
+    overviewDescription:
+      "Pull the per-request spend record for billing reconciliation: cursor-paged spend events, aggregate checksums, per-end-user rollups, and replay to a webhook endpoint.",
+  },
+  {
+    name: "Webhooks",
+    dirName: "webhooks",
+    pathPrefixes: ["/api/webhooks/v1"],
+    overviewDescription:
+      "Register endpoints that receive signed, retried batches of LangWatch events, and inspect their delivery log, health, and the events the organization emitted.",
+  },
+];
+
+/** Longer summary slugs are cut at a whole word: a cut mid-word published `...-fields-ho`. */
+const SLUG_MAX = 48;
+
+function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function generateTitle(method: string, apiPath: string, op: OpenAPIOperation): string {
+  if (op.summary) return op.summary;
+
+  const desc = op.description ?? "";
+  if (desc) {
+    const firstSentence = desc.split(/[.()]/)![0]!.trim();
+    if (firstSentence.length <= 50) return firstSentence;
+  }
+
+  const resource = getResourceName(apiPath);
+  const methodNames: Record<string, string> = {
+    get: apiPath.includes("{") ? "Get" : "List",
+    post: "Create",
+    put: "Update",
+    patch: "Update",
+    delete: "Delete",
+  };
+  return `${methodNames[method] ?? method.toUpperCase()} ${resource}`;
+}
+
+function getResourceName(apiPath: string): string {
+  const parts = apiPath
+    .split("/")
+    .filter((p) => !p.startsWith("{") && p !== "api" && p !== "v1" && p !== "v3")
+    .filter(Boolean);
+  const last = parts[parts.length - 1] ?? "resource";
+  return last
+    .split("-")
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+function generateFileName(method: string, apiPath: string, op: OpenAPIOperation): string {
+  if (op.summary) {
+    const s = slugify(op.summary);
+    return s.length > SLUG_MAX ? s.slice(0, SLUG_MAX + 1).replace(/-[^-]*$/, "") : s;
+  }
+
+  const resource = getResourceName(apiPath);
+  const hasParam = apiPath.includes("{");
+
+  const methodVerb: Record<string, string> = {
+    get: hasParam ? "get" : "list",
+    post: hasParam ? "action" : "create",
+    put: "update",
+    patch: "update",
+    delete: "delete",
+  };
+
+  const verb = methodVerb[method] ?? method;
+  const base = slugify(`${verb}-${resource}`);
+
+  // Add sub-resource context if path has depth
+  const parts = apiPath.split("/").filter(Boolean);
+  const nonParam = parts.filter((p) => !p.startsWith("{"));
+  if (nonParam.length > 3) {
+    const extra = nonParam.slice(-1)[0];
+    if (extra && extra !== slugify(resource).replace(/-/g, "")) {
+      return slugify(`${verb}-${resource}-${extra}`);
+    }
+  }
+
+  return base;
+}
+
+/**
+ * The `/api/{family}` twin of a spec path served at `/api/v1/{family}`, or
+ * null with no `/api/v1` segment to strip (Decision 20, 2026-09-04). Lookups
+ * fall back to this bare twin, except the four families only ever documented at v1.
+ */
+function bareTwinOf(apiPath: string): string | null {
+  if (apiPath === "/api/v1" || !apiPath.startsWith("/api/v1/")) return null;
+  return `/api${apiPath.slice("/api/v1".length)}`;
+}
+
+/** Skip reasons that retire only the bare path, never its live `/api/v1` successor. */
+const BARE_ONLY_SKIP_REASONS = new Set([RETIRED_LEGACY_AGENTS]);
+
+/** Whether `apiPath`, or its `/api/v1` bare twin, is named in SKIP_PATHS. */
+function isSkipped(apiPath: string): boolean {
+  if (Object.hasOwn(SKIP_PATHS, apiPath)) return true;
+  const bare = bareTwinOf(apiPath);
+  if (bare === null || !Object.hasOwn(SKIP_PATHS, bare)) return false;
+  return !BARE_ONLY_SKIP_REASONS.has(SKIP_PATHS[bare]!);
+}
+
+/**
+ * How much of `apiPath` this group's best prefix covers, or 0 when none
+ * match. Ownership goes to the longest match, checked against `apiPath` and
+ * its `/api/v1` bare twin (see {@link bareTwinOf}).
+ */
+function matchStrength(apiPath: string, group: EndpointGroup): number {
+  const bare = bareTwinOf(apiPath);
+  const candidates = bare === null ? [apiPath] : [apiPath, bare];
+  let best = 0;
+  for (const prefix of group.pathPrefixes) {
+    for (const candidate of candidates) {
+      if (
+        candidate === prefix ||
+        candidate.startsWith(prefix + "/") ||
+        candidate.startsWith(prefix + "?")
+      ) {
+        best = Math.max(best, prefix.length);
+      }
+    }
+  }
+  return best;
+}
+
+/** The group that owns each spec path, by longest matching prefix. */
+function resolveOwners(specPaths: string[]): Map<string, EndpointGroup> {
+  const owners = new Map<string, EndpointGroup>();
+  for (const apiPath of specPaths) {
+    if (isSkipped(apiPath)) continue;
+    let winner: EndpointGroup | undefined;
+    let winningStrength = 0;
+    for (const group of ENDPOINT_GROUPS) {
+      const strength = matchStrength(apiPath, group);
+      if (strength > winningStrength) {
+        winner = group;
+        winningStrength = strength;
+      }
+    }
+    if (winner) owners.set(apiPath, winner);
+  }
+  return owners;
+}
+
+function findExistingMdxFiles(dirPath: string): Map<string, string> {
+  const openapiToFile = new Map<string, string>();
+  if (!fs.existsSync(dirPath)) return openapiToFile;
+
+  for (const file of fs.readdirSync(dirPath).toSorted()) {
+    if (!file.endsWith(".mdx")) continue;
+    const content = fs.readFileSync(path.join(dirPath, file), "utf-8");
+    const match = content.match(/^openapi:\s*['"]?(.+?)['"]?\s*$/m);
+    if (match) {
+      const ref = match[1]!;
+      if (!openapiToFile.has(ref)) {
+        openapiToFile.set(ref, file.replace(".mdx", ""));
+      }
+    }
+  }
+  return openapiToFile;
+}
+
+function sortScore(method: string, apiPath: string): number {
+  const hasParam = apiPath.includes("{");
+  if (method === "get" && !hasParam) return 0;
+  if (method === "post" && !hasParam) return 1;
+  if (method === "get" && hasParam) return 2;
+  if (method === "put" && !hasParam) return 2.5;
+  if (method === "put" && hasParam) return 3;
+  if (method === "patch" && hasParam) return 3;
+  if (method === "post" && hasParam) return 4;
+  if (method === "delete") return 5;
+  return 6;
+}
+
+type NavPage = string | { group: string; pages: string[] };
+type Tally = { created: number; existing: number };
+type GroupEndpoint = { method: string; path: string; op: OpenAPIOperation };
+
+/**
+ * A hand-written page is named as a string, so a rename or a typo would drop it
+ * out of the sidebar silently: the same failure this generator exists to
+ * prevent. Check every one of them against the filesystem up front.
+ */
+function checkDeclaredExtras(): void {
+  const declaredExtras = [
+    ...INTRO_GROUP.pages,
+    ...ENDPOINT_GROUPS.flatMap((group) => group.extraPages ?? []),
+  ];
+  const missingExtras = declaredExtras.filter(
+    (page) => !fs.existsSync(path.join(DOCS_DIR, `${page}.mdx`)),
+  );
+  if (missingExtras.length > 0) {
+    const noun = missingExtras.length === 1 ? "page" : "pages";
+    console.error(
+      `ERROR: ${missingExtras.length} hand-written nav ${noun} named in this generator has no .mdx file:`,
+    );
+    for (const page of missingExtras.toSorted()) console.error(`  ${page}`);
+    console.error(
+      "\nCreate the file, or drop it from INTRO_GROUP / the group's extraPages in docs/scripts/generate-api-reference-pages.ts.",
+    );
+    process.exit(1);
+  }
+}
+
+function checkEveryPathOwned({
+  spec,
+  owners,
+}: {
+  spec: OpenAPISpec;
+  owners: ReturnType<typeof resolveOwners>;
+}): void {
+  const unowned = Object.keys(spec.paths).filter(
+    (apiPath) => !isSkipped(apiPath) && !owners.has(apiPath),
+  );
+  if (unowned.length > 0) {
+    const noun = unowned.length === 1 ? "spec path has" : "spec paths have";
+    console.error(
+      `ERROR: ${unowned.length} ${noun} no ENDPOINT_GROUPS entry and no SKIP_PATHS reason:`,
+    );
+    for (const apiPath of unowned.toSorted()) console.error(`  ${apiPath}`);
+    console.error(
+      "\nEvery path above needs one of two resolutions in docs/scripts/generate-api-reference-pages.ts:",
+    );
+    console.error(
+      "  1. add an ENDPOINT_GROUPS entry covering it, so the path gets a reference page, or",
+    );
+    console.error(
+      "  2. add a SKIP_PATHS entry whose reason says why it is deliberately undocumented, either a retired surface or a live surface not yet documented in the API reference.",
+    );
+    process.exit(1);
+  }
+}
+
+type OperationIndex = {
+  specOperations: Set<string>;
+  operationOwner: Map<string, EndpointGroup>;
+  groupOperations: Map<EndpointGroup, Set<string>>;
+};
+
+function indexSpecOperations({
+  spec,
+  owners,
+}: {
+  spec: OpenAPISpec;
+  owners: ReturnType<typeof resolveOwners>;
+}): OperationIndex {
+  const specOperations = new Set<string>();
+  const operationOwner = new Map<string, EndpointGroup>();
+  const groupOperations = new Map<EndpointGroup, Set<string>>(
+    ENDPOINT_GROUPS.map((group) => [group, new Set<string>()]),
+  );
+  for (const [apiPath, methods] of Object.entries(spec.paths)) {
+    const owner = owners.get(apiPath);
+    for (const method of Object.keys(methods)) {
+      if (!METHOD_ORDER.includes(method)) continue;
+      const key = `${method.toUpperCase()} ${apiPath}`;
+      specOperations.add(key);
+      if (owner) {
+        operationOwner.set(key, owner);
+        groupOperations.get(owner)?.add(key);
+      }
+    }
+  }
+  return { specOperations, operationOwner, groupOperations };
+}
+
+/** Sorts every endpointOrder key the declaring group does not own by why it sorts nothing. */
+function strayOrderKeys({ specOperations, operationOwner, groupOperations }: OperationIndex): {
+  unknownOrder: string[];
+  misownedOrder: string[];
+} {
+  const unknownOrder: string[] = [];
+  const misownedOrder: string[] = [];
+  for (const group of ENDPOINT_GROUPS) {
+    for (const key of group.endpointOrder ?? []) {
+      if (groupOperations.get(group)?.has(key)) continue;
+      if (!specOperations.has(key)) {
+        unknownOrder.push(`${group.name}: ${key}`);
+        continue;
+      }
+      const owner = operationOwner.get(key);
+      misownedOrder.push(
+        `${group.name}: ${key} (${owner ? `owned by ${owner.name}` : "excluded by SKIP_PATHS"})`,
+      );
+    }
+  }
+  return { unknownOrder, misownedOrder };
+}
+
+function checkEndpointOrder({
+  spec,
+  owners,
+}: {
+  spec: OpenAPISpec;
+  owners: ReturnType<typeof resolveOwners>;
+}): void {
+  // An `endpointOrder` key only sorts the group that declares it — a key
+  // naming an operation another group owns silently falls back to the
+  // default sort, with no diagnostic. A drifted param name, a casing slip,
+  // or a sibling group's path key all reshuffle the sidebar silently. The
+  // two failures get separate reports since their remedies differ.
+  const { unknownOrder, misownedOrder } = strayOrderKeys(indexSpecOperations({ spec, owners }));
+  if (unknownOrder.length > 0) {
+    const noun = unknownOrder.length === 1 ? "key matches" : "keys match";
+    console.error(`ERROR: ${unknownOrder.length} endpointOrder ${noun} no operation in the spec:`);
+    for (const entry of unknownOrder.toSorted()) console.error(`  ${entry}`);
+    console.error(
+      "\nSpell the METHOD and path exactly as the spec does, path parameter names and casing included, or drop the key from endpointOrder in docs/scripts/generate-api-reference-pages.ts.",
+    );
+  }
+  if (misownedOrder.length > 0) {
+    const noun = misownedOrder.length === 1 ? "key names an operation" : "keys name operations";
+    console.error(
+      `ERROR: ${misownedOrder.length} endpointOrder ${noun} the declaring group does not own, so the key sorts no entries:`,
+    );
+    for (const entry of misownedOrder.toSorted()) console.error(`  ${entry}`);
+    console.error(
+      "\nMove the key to the group that owns the path, widen that group's pathPrefixes, or drop the key from endpointOrder in docs/scripts/generate-api-reference-pages.ts. A path excluded by SKIP_PATHS gets no page at all, so it can never be ordered.",
+    );
+  }
+  if (unknownOrder.length > 0 || misownedOrder.length > 0) {
+    process.exit(1);
+  }
+}
+
+function sortGroupEndpoints({
+  group,
+  endpoints,
+}: {
+  group: EndpointGroup;
+  endpoints: GroupEndpoint[];
+}): void {
+  // A declared order wins; everything it does not name keeps the CRUD sort
+  // and follows behind, so adding a route never silently reshuffles the rest.
+  const declaredOrder = group.endpointOrder ?? [];
+  const declaredIndex = ({ method, apiPath }: { method: string; apiPath: string }): number => {
+    const at = declaredOrder.indexOf(`${method.toUpperCase()} ${apiPath}`);
+    return at === -1 ? Number.MAX_SAFE_INTEGER : at;
+  };
+
+  endpoints.sort((a, b) => {
+    const aDeclared = declaredIndex({ method: a.method, apiPath: a.path });
+    const bDeclared = declaredIndex({ method: b.method, apiPath: b.path });
+    if (aDeclared !== bDeclared) return aDeclared - bDeclared;
+    const aScore = sortScore(a.method, a.path);
+    const bScore = sortScore(b.method, b.path);
+    if (aScore !== bScore) return aScore - bScore;
+    return a.path.localeCompare(b.path);
+  });
+}
+
+function collectGroupEndpoints({
+  group,
+  spec,
+  owners,
+}: {
+  group: EndpointGroup;
+  spec: OpenAPISpec;
+  owners: ReturnType<typeof resolveOwners>;
+}): GroupEndpoint[] {
+  const endpoints: {
+    method: string;
+    path: string;
+    op: OpenAPIOperation;
+  }[] = [];
+
+  for (const [apiPath, methods] of Object.entries(spec.paths)) {
+    if (owners.get(apiPath) !== group) continue;
+
+    for (const [method, op] of Object.entries(methods)) {
+      if (!METHOD_ORDER.includes(method)) continue;
+      endpoints.push({ method, path: apiPath, op });
+    }
+  }
+  return endpoints;
+}
+
+function writeOverviewPage({
+  group,
+  dirPath,
+  tally,
+}: {
+  group: EndpointGroup;
+  dirPath: string;
+  tally: Tally;
+}): void {
+  // Write overview page
+  const overviewPath = path.join(dirPath, "overview.mdx");
+  if (!fs.existsSync(overviewPath)) {
+    fs.writeFileSync(
+      overviewPath,
+      `---\ntitle: "Overview"\ndescription: "${group.overviewDescription}"\n---\n\n## Intro\n\n${group.overviewDescription}\n`,
+    );
+    tally.created++;
+  } else {
+    tally.existing++;
+  }
+}
+
+/** The page name for one endpoint, reusing an MDX file that already points at it. */
+function endpointPage({
+  ep,
+  dirPath,
+  existingMdx,
+  usedNames,
+  tally,
+}: {
+  ep: GroupEndpoint;
+  dirPath: string;
+  existingMdx: ReturnType<typeof findExistingMdxFiles>;
+  usedNames: Set<string>;
+  tally: Tally;
+}): string {
+  const openapiRef = `${ep.method.toUpperCase()} ${ep.path}`;
+
+  // Reuse existing MDX file if one already points to this endpoint
+  const existingName = existingMdx.get(openapiRef);
+  if (existingName && !usedNames.has(existingName)) {
+    usedNames.add(existingName);
+    tally.existing++;
+    return existingName;
+  }
+
+  let fileName = generateFileName(ep.method, ep.path, ep.op);
+  if (usedNames.has(fileName)) {
+    fileName = `${ep.method}-${fileName}`;
+  }
+  if (usedNames.has(fileName)) {
+    const suffix = ep.path.split("/").pop()?.replace(/[{}]/g, "") ?? "ep";
+    fileName = `${fileName}-${suffix}`;
+  }
+  usedNames.add(fileName);
+
+  const title = generateTitle(ep.method, ep.path, ep.op);
+  const mdxPath = path.join(dirPath, `${fileName}.mdx`);
+
+  if (!fs.existsSync(mdxPath)) {
+    fs.writeFileSync(mdxPath, `---\ntitle: "${title}"\nopenapi: "${openapiRef}"\n---\n`);
+    tally.created++;
+  } else {
+    tally.existing++;
+  }
+
+  return fileName;
+}
+
+/** Writes one group's pages; answers its nav pages, or none when it owns no endpoint. */
+function writeGroupPages({
+  group,
+  spec,
+  owners,
+  tally,
+}: {
+  group: EndpointGroup;
+  spec: OpenAPISpec;
+  owners: ReturnType<typeof resolveOwners>;
+  tally: Tally;
+}): string[] {
+  const dirPath = path.join(API_REF_DIR, group.dirName);
+  fs.mkdirSync(dirPath, { recursive: true });
+  const existingMdx = findExistingMdxFiles(dirPath);
+  const endpoints = collectGroupEndpoints({ group, spec, owners });
+  // A family whose routes are not in the spec yet still keeps its hand-written pages.
+  if (endpoints.length === 0) return [...(group.extraPages ?? [])];
+  sortGroupEndpoints({ group, endpoints });
+  writeOverviewPage({ group, dirPath, tally });
+
+  const pages: string[] = [`api-reference/${group.dirName}/overview`];
+  const usedNames = new Set<string>(["overview"]);
+  for (const ep of endpoints) {
+    const name = endpointPage({ ep, dirPath, existingMdx, usedNames, tally });
+    pages.push(`api-reference/${group.dirName}/${name}`);
+  }
+  pages.push(...(group.extraPages ?? []));
+  return pages;
+}
+
+function main() {
+  const spec: OpenAPISpec = JSON.parse(fs.readFileSync(SPEC_PATH, "utf-8"));
+  const docsJson = JSON.parse(fs.readFileSync(DOCS_JSON_PATH, "utf-8"));
+
+  const allNavGroups: { group: string; pages: NavPage[] }[] = [];
+  const tally: Tally = { created: 0, existing: 0 };
+
+  const owners = resolveOwners(Object.keys(spec.paths));
+
+  checkDeclaredExtras();
+  checkEveryPathOwned({ spec, owners });
+  checkEndpointOrder({ spec, owners });
+
+  allNavGroups.push(INTRO_GROUP);
+
+  for (const group of ENDPOINT_GROUPS) {
+    const pages = writeGroupPages({ group, spec, owners, tally });
+    if (pages.length === 0) continue;
+    allNavGroups.push({ group: group.name, pages });
+
+    // Insert Built-in Evaluators (categorized) right after the Evaluators config group
+    if (group.dirName === "evaluators-config") {
+      allNavGroups.push({
+        group: "Built-in Evaluators",
+        pages: buildBuiltInEvaluatorNav(),
+      });
+    }
+  }
+  // Update docs.json navigation
+  const apiRefAnchor = docsJson.navigation.anchors.find(
+    (a: { anchor: string }) => a.anchor === "API Reference",
+  );
+  if (apiRefAnchor) {
+    apiRefAnchor.groups = allNavGroups;
+  }
+
+  fs.writeFileSync(DOCS_JSON_PATH, JSON.stringify(docsJson, null, 2) + "\n");
+
+  console.log(`Created ${tally.created} new MDX pages`);
+  console.log(`Skipped ${tally.existing} existing pages`);
+  console.log(`Updated docs.json with ${allNavGroups.length} API groups`);
+}
+
+const BUILTIN_EVALUATOR_CATEGORIES: Record<string, string[]> = {
+  "Expected Answer": [
+    "exact-match-evaluator",
+    "llm-answer-match",
+    "llm-factual-match",
+    "bleu-score",
+    "rouge-score",
+    "sql-query-equivalence",
+    "semantic-similarity-evaluator",
+  ],
+  "LLM as Judge": [
+    "llm-as-a-judge-boolean-evaluator",
+    "llm-as-a-judge-category-evaluator",
+    "llm-as-a-judge-score-evaluator",
+    "rubrics-based-scoring",
+    "custom-basic-evaluator",
+    "summarization-score",
+  ],
+  "RAG Quality": [
+    "ragas-faithfulness",
+    "ragas-response-context-precision",
+    "ragas-response-context-recall",
+    "ragas-response-relevancy",
+    "context-f1",
+    "context-precision",
+    "context-recall",
+  ],
+  "Quality Aspects": [
+    "lingua-language-detection",
+    "valid-format-evaluator",
+    "off-topic-evaluator",
+    "query-resolution",
+  ],
+  Safety: [
+    "azure-content-safety",
+    "azure-jailbreak-detection",
+    "azure-prompt-shield",
+    "openai-moderation",
+    "presidio-pii-detection",
+    "competitor-blocklist",
+    "competitor-allowlist-check",
+    "competitor-llm-check",
+  ],
+};
+
+function buildBuiltInEvaluatorNav(): (string | { group: string; pages: string[] })[] {
+  const p = (name: string) => `api-reference/evaluators/${name}`;
+  const pages: (string | { group: string; pages: string[] })[] = [p("overview")];
+
+  for (const [category, evaluators] of Object.entries(BUILTIN_EVALUATOR_CATEGORIES)) {
+    pages.push({
+      group: category,
+      pages: evaluators.map(p),
+    });
+  }
+
+  return pages;
+}
+
+main();

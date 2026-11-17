@@ -1,0 +1,93 @@
+//go:build live_bedrock
+
+package matrix
+
+import (
+	"os"
+	"testing"
+)
+
+// bedrockCell builds a resolved cell for AWS Bedrock using TEST_VK_BEDROCK
+// + BEDROCK_MODEL (defaults to the EU cross-region inference profile for
+// claude-haiku-4-5; the un-prefixed `anthropic.claude-3-5-haiku-20241022-v1:0`
+// returns "The provided model identifier is invalid" on the
+// langwatch-dev-bedrock-user IAM policy + eu-central-1 region binding,
+// per the matrix-bedrock VK's customKeys).
+//
+// TEST_VK_BEDROCK's bound ModelProvider carries only AWS_REGION_NAME: with
+// no access key on it, the gateway's bifrost adapter signs with the AWS
+// default credential chain, which in CI is the session the workflow's AWS
+// credentials step exported. A ModelProvider that does carry
+// AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY signs with those instead.
+// cmd/matrixseed mints the keyless key per run.
+func bedrockCell(t *testing.T, scenario string, body func(string) []byte, streaming bool) resolvedCell {
+	t.Helper()
+	vk := requireEnv(t, "TEST_VK_BEDROCK")
+	model := os.Getenv("BEDROCK_MODEL")
+	if model == "" {
+		model = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+	}
+	return resolvedCell{
+		cell:      cell{provider: "bedrock", scenario: scenario, body: body},
+		vk:        vk,
+		model:     model,
+		streaming: streaming,
+	}
+}
+
+func TestBedrock_SimpleCompletion(t *testing.T) {
+	runCell(t, bedrockCell(t, "simple", chatBody_Simple, false))
+}
+
+func TestBedrock_StreamedCompletion(t *testing.T) {
+	runCell(t, bedrockCell(t, "streamed", chatBody_Streamed, true))
+}
+
+func TestBedrock_ToolCalling(t *testing.T) {
+	runCell(t, bedrockCell(t, "tool_calling", chatBody_ToolCalling, false))
+}
+
+func TestBedrock_StructuredOutputs(t *testing.T) {
+	runCell(t, bedrockCell(t, "structured_outputs", chatBody_StructuredOutputs, false))
+}
+
+// @scenario "client cap verifiably bounds output on the anthropic and bedrock lanes"
+// REPRO of the production canary finding: max_tokens: 5 through the
+// bedrock lane answered with ~28 completion tokens and finish_reason
+// "stop" because the translated lane dropped the alias and the Converse
+// call went out without inferenceConfig.maxTokens. Both cap spellings,
+// sync and streamed.
+// Spec: specs/ai-gateway/openai-param-compat.feature
+func TestBedrock_MaxTokensCap(t *testing.T) {
+	runCapCell(t, bedrockCell(t, "cap_max_tokens", nil, false), "max_tokens", 16)
+}
+
+func TestBedrock_MaxTokensCapStreamed(t *testing.T) {
+	runCapCell(t, bedrockCell(t, "cap_max_tokens_streamed", nil, true), "max_tokens", 16)
+}
+
+func TestBedrock_MaxCompletionTokensCap(t *testing.T) {
+	runCapCell(t, bedrockCell(t, "cap_max_completion_tokens", nil, false), "max_completion_tokens", 16)
+}
+
+func TestBedrock_MaxCompletionTokensCapStreamed(t *testing.T) {
+	runCapCell(t, bedrockCell(t, "cap_max_completion_tokens_streamed", nil, true), "max_completion_tokens", 16)
+}
+
+func TestBedrock_Cache(t *testing.T) {
+	// Bedrock cache goes through /v1/chat/completions, NOT /v1/messages —
+	// Bifrost's bedrock adapter uses AWS's Converse API and rejects
+	// Anthropic-native /v1/messages bodies with 'Unexpected field type'.
+	// chatBody_Cache_* detects bedrock's `anthropic.claude-…` model id and
+	// emits the system block as a content-block array carrying
+	// cache_control: ephemeral, which Bifrost translates to Bedrock's
+	// cachePoint marker on Converse. Default is sonnet 4.5 (cache GA);
+	// override via BEDROCK_CACHE_MODEL once Haiku 4.5 cache opens.
+	cell := bedrockCell(t, "cache", chatBody_Cache_Prime, false)
+	if override := os.Getenv("BEDROCK_CACHE_MODEL"); override != "" {
+		cell.model = override
+	} else {
+		cell.model = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	}
+	runCacheCell(t, cell)
+}

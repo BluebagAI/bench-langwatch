@@ -1,0 +1,45 @@
+{
+  "name": "@langwatch/redis-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The shared Redis client contract: configuration resolved from a supplied environment, standalone and cluster connection construction with TLS and database-index handling, and a readiness probe the caller owns - with no connection opened as an import side effect.",
+  "license": "MIT",
+  "files": [
+    "src"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./shared-credential": {
+      "types": "./dist/shared-credential.d.ts",
+      "default": "./src/shared-credential.ts"
+    },
+    "./session-state": {
+      "types": "./dist/session-state.d.ts",
+      "default": "./src/session-state.ts"
+    },
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "GOMAXPROCS=2 GOMEMLIMIT=2GiB tsc -b",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@langwatch/secrets": "workspace:*",
+    "@langwatch/time": "workspace:*",
+    "ioredis": "catalog:"
+  },
+  "devDependencies": {
+    "@langwatch/test-harness": "workspace:*",
+    "@langwatch/vitest-config": "workspace:*",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
+  },
+  "langwatch": {
+    "group": "data"
+  }
+}

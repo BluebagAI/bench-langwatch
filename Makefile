@@ -1,0 +1,453 @@
+.PHONY: help start sync-all-openapi user-delete-dry-run user-delete es-delete-dry-run es-delete
+.PHONY: down logs clean ps quickstart quickstart-help worktree refresh-dev-s3
+.PHONY: dev-up dev-down dev-logs setup-hooks service service-watch test-scripts
+.PHONY: dogfood-langy-local dogfood-langy-hooks
+.PHONY: herrgen herrgen-check test-scripts-run lint-rules-run
+.PHONY: lint-rules lint-rules-changed lint-rules-test go-lint go-lint-slot go-lint-changed
+.PHONY: _dev-up-deprecation-warning
+
+help:
+	@echo "LangWatch dev targets:"
+	@echo ""
+	@echo "  Primary (Docker dev environment):"
+	@echo "    make quickstart                     interactive preset picker"
+	@echo "    make quickstart all-local           local CH+PG+Redis+app+workers, no NLP (fast iteration default)"
+	@echo "    make quickstart all-local-nlp       all-local + nlpgo + langevals"
+	@echo "    make quickstart dev-storage         local DBs+workers, stored-objects -> dev S3 (runtime-storage-dev)"
+	@echo "    make refresh-dev-s3                 rotate AWS SSO creds in .env (run before dev-storage)"
+	@echo "    make quickstart dev-infra           local app + redis + workers compose; shared dev for PG/CH/NLP/S3"
+	@echo "    make quickstart frontend-only       no compose; pure pnpm dev against your .env URLs"
+	@echo "    make quickstart migration           postgres + clickhouse on host ports (prisma migrate; no workers)"
+	@echo "    make quickstart full-local          kitchen-sink local (dedicated workers container + ai-server)"
+	@echo "    make quickstart-help                non-interactive preset reference"
+	@echo "    make service svc=<name>             run a Go service (e.g. aigateway)"
+	@echo ""
+	@echo "  Local dev by hostname (thuishaven):"
+	@echo "    make haven install                  go install the haven binary, then check this machine has what haven needs"
+	@echo "    make haven up                       start this worktree's stack (bootstraps itself)"
+	@echo "    make haven status                   every stack + shared-server health, one shot"
+	@echo "    make haven <cmd>                    any haven subcommand (see 'haven help')"
+	@echo "    (dashboard at https://langwatch.localhost)"
+	@echo "    make service-watch svc=<name>       run a Go service with live reload (air)"
+	@echo ""
+	@echo "  Local observability (logs/traces/metrics → Grafana for agent debugging):"
+	@echo "    make observability                  start the LGTM stack on colima, capped (OTLP :4318, Grafana :3000)"
+	@echo "    make observability-connect          mint a Grafana token + configure gcx"
+	@echo "    make observability-logs             tail the stack logs"
+	@echo "    make observability-down             stop the stack (discards all telemetry)"
+	@echo "    (once it is up, every 'pnpm dev' stack exports to it, tagged by worktree)"
+	@echo "    make worktree <issue|name>          create a git worktree for an issue/feature"
+	@echo "    make down                           stop all services"
+	@echo "    make test-scripts                   run bats unit tests under dev/scripts/__tests__/"
+	@echo "    make herrgen                        regenerate the Go error codes for TypeScript"
+	@echo "    make herrgen-check                  fail if those generated codes are stale (CI)"
+	@echo ""
+	@echo "  Lint (deterministic house rules — no AI involved):"
+	@echo "    make lint-rules                     semgrep over the whole repo (oxlint is pnpm lint)"
+	@echo "    make lint-rules-changed             ...over lines this branch changed (what CI reports)"
+	@echo "    make lint-rules-test                prove the semgrep ruleset parses"
+	@echo "    make go-lint                        golangci-lint at the pinned version CI uses"
+	@echo "    make go-lint-changed                ...uncommitted edits only"
+	@echo ""
+	@echo "  Dogfood applications (the customer application Langy works on):"
+	@echo "    make dogfood-langy-local lang=python      boot the ACME support demo (FastAPI)"
+	@echo "    make dogfood-langy-local lang=typescript  boot the ACME support demo (Hono)"
+	@echo "    make dogfood-langy-local lang=langgraph   boot the ACME checkout demo (LangGraph)"
+	@echo "    make dogfood-langy-hooks                  connect Langy itself as the agent \"langy\""
+	@echo ""
+	@echo "  Per-worktree isolated stacks (for AI agents / parallel work):"
+	@echo "    make dev-up [PROFILE=full]            start isolated containers"
+	@echo "    make dev-down                          stop isolated containers"
+	@echo "    make dev-logs                          tail isolated logs"
+	@echo ""
+	@echo "  See: dev/docs/adr/004-docker-dev-environment.md"
+
+# The demo applications keep their own Makefile; this only picks the folder
+# and forwards `lang`.
+dogfood-langy-local:
+ifeq ($(lang),langgraph)
+	@$(MAKE) -C dev/dogfood/acme-checkout dogfood-langy-local
+else
+	@$(MAKE) -C dev/dogfood/acme-support dogfood-langy-local $(if $(lang),lang=$(lang))
+endif
+
+# Langy as a connected agent with scenario hooks, in the background; see dev/dogfood/langy/README.md.
+dogfood-langy-hooks:
+	@dev/dogfood/langy/run.sh
+
+# dev/haven.mk is included at the BOTTOM of this file: its `make haven <sub>`
+# passthrough neutralises the trailing words (e.g. `down`, `install`) as no-op
+# goals, and for that override to beat the real `down` / `install` recipes it
+# must be evaluated after they are defined. See the include at end of file.
+
+# =============================================================================
+# DOCKER DEV ENVIRONMENT (dev/compose.dev.yml)
+# =============================================================================
+# All services run in Docker with resource limits.
+# App is volume-mounted for hot reload.
+
+COMPOSE = docker compose -f dev/compose.dev.yml --project-directory .
+
+# Sources dev/scripts/lib/sanitize-dev-env.sh and rewrites stale localhost-pinned
+# NEXTAUTH_URL / BASE_HOST exports to the compose-derived APP_PORT (default
+# 5560). Real overrides like tunnel URLs are left untouched. Prepended
+# to every dev `up` recipe so `make dev*` paths can't silently 403 on login
+# if a previous session leaked the env (lw#3453).
+SANITIZE_DEV_ENV = APP_PORT=$${APP_PORT:-5560} . dev/scripts/lib/sanitize-dev-env.sh && sanitize_localhost_dev_env
+
+# Every Make path into Nx carries the root scripts' prefix: no .env loaded into
+# tasks, no colour, so one cache serves `pnpm`, `make` and haven alike.
+NX := FORCE_COLOR=0 NX_LOAD_DOT_ENV_FILES=false pnpm exec nx
+
+# Install git hooks (idempotent, runs automatically before dev targets)
+setup-hooks:
+	@git config core.hooksPath .githooks 2>/dev/null || true
+
+# Run a Go service via the mono-binary.
+# Usage: make service svc=aigateway
+#
+# Sources every var from .env into the Go process's environment.
+# The gateway + control-plane intentionally share secrets (LW_GATEWAY_*,
+# LW_VIRTUAL_KEY_PEPPER etc.) — one flat .env is simpler than namespace
+# prefixes. Vars the Go service doesn't need are ignored.
+#
+# Pre-existing environment wins over .env: we snapshot the inbound env
+# (export -p), source .env (which would otherwise overwrite everything),
+# then re-apply the snapshot on top. This matches the "real env beats
+# dotenv" contract that vite.config.ts + start.ts already follow. It is
+# load-bearing for `pnpm dev` on a non-default PORT: start.sh derives
+# LW_GATEWAY_BASE_URL=localhost:$(PORT+1000) and exports it before
+# launching the gateway, but a flat `. .env` would clobber it back to
+# the hardcoded default and the gateway would hit a dead control-plane
+# port (every VK call → 401 invalid_api_key).
+#
+# For a standalone run (no pnpm dev in the ancestry, so nothing pre-derived
+# LW_GATEWAY_BASE_URL) dev/scripts/lib/derive-gateway-base-url.sh derives it
+# from PORT the same way start.sh does, once .env has had its say. Without
+# this, a bare `make service svc=aigateway` on a non-default-PORT worktree
+# silently falls through to services/aigateway/config.go's compatibility
+# default (http://localhost:5560), correct only for a single worktree on
+# the default port, and wrong everywhere else with no error anywhere: the
+# gateway still proxies LLM traffic and returns 200, it just ships spend,
+# budget and auth traffic to whichever control plane that port belongs to.
+DEV_ENV_FILE ?= .env
+# Both targets build with -tags dev, which links the simulators (cmd/service/
+# combined_dev.go); release images build untagged. SIM_CONSOLES are the
+# simulators the run hosts; any at all builds @langwatch/sims, the one app holding
+# every console (ADR-160). Nx caches the build, so unchanged consoles cost a cache hit.
+SIMULATORS = idpsim mailsim storagesim voicesim llmsim analyticssim telemetrysim outboundsim paymentsim lambdasim githubsim mcpsim
+SIM_CONSOLES = $(if $(filter combined,$(svc)),$(if $(args),$(filter $(SIMULATORS),$(args)),$(SIMULATORS)),$(filter $(SIMULATORS),$(svc)))
+BUILD_SIM_CONSOLES = $(if $(SIM_CONSOLES),$(NX) run @langwatch/sims:build --outputStyle=static || echo "@langwatch/sims did not build; each console names the fix",true)
+# pipefail needs bash; CI runners default to dash.
+service: SHELL := /bin/bash
+service:
+	@test -n "$(svc)" || (echo "usage: make service svc=<name>" && exit 1)
+	@$(BUILD_SIM_CONSOLES)
+	@_snap=$$(export -p) && \
+		{ if test -f "$(DEV_ENV_FILE)"; then \
+			. dev/scripts/lib/load-dev-env.sh && load_dev_env "$(DEV_ENV_FILE)"; \
+		else \
+			echo "$(DEV_ENV_FILE) not found — using process environment"; \
+		fi; } && \
+		eval "$$_snap" && \
+		. dev/scripts/lib/derive-gateway-base-url.sh && derive_gateway_base_url && \
+		export LOG_FORMAT=$${LOG_FORMAT:-json} && \
+		if [ -n "$$LANGWATCH_LANE" ]; then mkdir -p .bin/$(svc) && go build -tags dev -o .bin/$(svc)/$(svc) ./cmd/service \
+			&& exec .bin/$(svc)/$(svc) $(svc) $(args); else \
+			set -o pipefail; go run -tags dev ./cmd/service $(svc) $(args) 2>&1 \
+				| node dev/scripts/log-render.mjs $(svc) --color; fi
+
+# Run a Go service with live reload on file changes. A rebuild that fails
+# leaves the running process alone and prints the compile error; only a
+# successful build restarts. The quiet window before a rebuild is
+# LANGWATCH_DEV_WATCH_DEBOUNCE_MS, the same knob the Node lane debounces on.
+# include_dir names the three Go trees the service builds from: exclude_dir
+# only matches paths directly under the root, so without it air walks every
+# nested node_modules and one dangling package link ends the whole lane.
+# Usage: make service-watch svc=aigateway
+#        make service-watch svc=combined args="aigateway nlpgo"
+service-watch:
+	@test -n "$(svc)" || (echo "usage: make service-watch svc=<name>" && exit 1)
+	@test -f "$(DEV_ENV_FILE)" || (echo "$(DEV_ENV_FILE) not found — seed .env first" && exit 1)
+	@which air > /dev/null 2>&1 || (echo "Installing air..." && go install github.com/air-verse/air@latest)
+	@$(BUILD_SIM_CONSOLES)
+	@_snap=$$(export -p) && \
+		. dev/scripts/lib/load-dev-env.sh && load_dev_env "$(DEV_ENV_FILE)" && \
+		eval "$$_snap" && \
+		. dev/scripts/lib/derive-gateway-base-url.sh && derive_gateway_base_url && \
+		export LOG_FORMAT=$${LOG_FORMAT:-json} && \
+		air --build.cmd "mkdir -p .bin/$(svc) && go build -tags dev -o .bin/$(svc)/$(svc) ./cmd/service" \
+			--build.full_bin ".bin/$(svc)/$(svc) $(svc) $(args)" \
+			--build.include_ext "go" \
+			--build.delay $${LANGWATCH_DEV_WATCH_DEBOUNCE_MS:-2000} \
+			--build.include_dir "cmd,pkg,services" \
+			--build.exclude_dir ".bin,tmp,vendor,node_modules,services/langyworker/node_modules"
+
+# The dev* shim targets were removed in #4053. Use `make quickstart`
+# (interactive) or `./dev/scripts/dev.sh <preset>` directly. Preset list:
+# all-local, all-local-nlp, dev-storage, dev-infra, frontend-only,
+# migration, full-local.
+
+# Refresh AWS SSO credentials in .env so `make quickstart
+# dev-storage` can talk to runtime-storage-dev. SSO temporary tokens
+# expire ~hourly; this rotates the three S3_*_KEY/TOKEN lines in
+# .env, leaving S3_BUCKET_NAME/S3_ENDPOINT/S3_REGION alone.
+refresh-dev-s3:
+	@bash dev/scripts/refresh-dev-s3-env.sh
+
+# Run all *.unit.bats tests under dev/scripts/__tests__/. Dev-only — these
+# tests cover shell behavior of `dev.sh` / `write-dev-overrides.sh` /
+# `worktree.sh`. CI does NOT run them; the launchers
+# are local dev tools, not part of the shipped product. If you're
+# editing one of those scripts, run `make test-scripts` to verify.
+#
+# Requires `bats` (`brew install bats-core` on macOS,
+# `sudo apt-get install -y bats` on Linux).
+#
+# Globs only *.unit.bats — the *.integration.bats files shell out to
+# git / docker / external CLIs against the real filesystem and need
+# fixtures.
+test-scripts:
+	@$(NX) run workspace:test:scripts --outputStyle=static
+
+test-scripts-run:
+	@if ! command -v bats >/dev/null 2>&1; then \
+		echo "ERROR: bats not installed. Install with:" >&2; \
+		echo "  macOS:  brew install bats-core" >&2; \
+		echo "  Linux:  sudo apt-get install -y bats" >&2; \
+		exit 1; \
+	fi
+	bats dev/scripts/__tests__/*.unit.bats
+
+# Mirror the Go services' herr error codes into
+# packages/handled-error/src/codes.generated.ts, so the TypeScript control
+# plane stops compiling when a Go service gains a code with no presentation.
+# Run after adding or renaming a `herr.Code(...)` const — and after EDITING one's
+# doc comment, which the generator copies into the emitted file, so a reworded
+# sentence fails `generated` in CI exactly like a new code does.
+# `herrgen-check` is the
+# drift check, and go-ci.yaml's `generated` job calls this same target, so what
+# CI runs and what you run cannot drift apart.
+herrgen:
+	@$(NX) run go-cmd:herrgen --outputStyle=static
+
+herrgen-check:
+	@go run ./cmd/herrgen -check
+# ── Deterministic house rules ──────────────────────────────────────────────
+#
+# Every JavaScript/TypeScript house rule is a langwatch oxlint rule (`pnpm
+# lint`). The semgrep ruleset holds the two that oxlint cannot: PII in logger
+# calls (CodeRabbit loads it) and hard-coded database names in ClickHouse
+# migrations. See dev/lint/README.md.
+#
+# SEMGREP_VERSION is PINNED to what .github/workflows/coderabbit-config-check.yml
+# uses — rule-matching behaviour is version-sensitive. Bump both together.
+SEMGREP_VERSION  := 1.164.0
+GOLANGCI_VERSION := v2.14.0
+
+# uvx runs the pinned version without installing it globally, so a developer
+# with a different semgrep on PATH still gets the CI behaviour.
+SEMGREP := $(shell if command -v semgrep >/dev/null 2>&1 && semgrep --version 2>/dev/null | grep -q "$(SEMGREP_VERSION)"; then echo semgrep; else echo "uvx --from semgrep==$(SEMGREP_VERSION) semgrep"; fi)
+
+lint-rules:
+	@$(NX) run workspace:lint:rules --outputStyle=static
+
+lint-rules-run:
+	@echo "==> semgrep (dev/lint/semgrep/langwatch.yml)"
+	@$(SEMGREP) --config dev/lint/semgrep/langwatch.yml --quiet --error --exclude platform .
+
+# What CI reports on: findings on lines this branch changed.
+lint-rules-changed:
+	@echo "==> semgrep over lines changed since origin/main"
+	@$(SEMGREP) --config dev/lint/semgrep/langwatch.yml --quiet --error \
+		--baseline-commit "$$(git merge-base HEAD origin/main)" .
+
+lint-rules-test:
+	@$(SEMGREP) --validate --config dev/lint/semgrep/langwatch.yml
+
+# golangci-lint's config is version: "2"; a v1 binary refuses it outright,
+# which is why "run the Go checks before pushing" quietly stopped happening.
+# Always resolve the pinned version rather than trusting PATH: a PATH binary built
+# with an older Go cannot read this toolchain's export data. Build the local one with
+# GOBIN=.bin/golangci-lint go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+GOLANGCI_BIN := $(CURDIR)/.bin/golangci-lint/golangci-lint
+GOLANGCI := $(shell if $(GOLANGCI_BIN) --version 2>/dev/null | grep -q "$(patsubst v%,%,$(GOLANGCI_VERSION)) built with $$(go env GOVERSION)"; then echo $(GOLANGCI_BIN); else echo "go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)"; fi)
+# The workspace modules golangci-lint covers (go.work also holds the SDK and the
+# ClickHouse operator, linted by their own workflows). Each runs in its module.
+GO_LINT_MODULES ?= cmd pkg services tools
+
+# golangci-lint reads package export data through whatever `go` it finds, and
+# the pinned linter (built with Go 1.25, upstream ships "latest-1") cannot
+# read the format a Go newer than go.work's emits. CI never sees this because
+# it installs from go-version-file: go.work; a laptop ahead of the repo does.
+# Pinning GOTOOLCHAIN to go.work's version makes both environments identical.
+GO_MOD_TOOLCHAIN := go$(shell awk '$$1 == "go" {print $$2; exit}' go.work)
+
+# A slot bounds how many runs, not how many cores each takes: locally the linter
+# and its `go list` builds get 2 cores, CI (CI=true) every core. Override: GO_LINT_JOBS=8.
+GO_LINT_JOBS ?= $(if $(CI),$(shell getconf _NPROCESSORS_ONLN),2)
+GO_LINT_ENV := env GOTOOLCHAIN=$(GO_MOD_TOOLCHAIN) GOMAXPROCS=$(GO_LINT_JOBS) GOFLAGS="$(GOFLAGS) -p=$(GO_LINT_JOBS)"
+
+# golangci-lint saturates cores the same way a whole-tree typecheck does, so it
+# takes a slot from the same machine-wide counter (`haven machine slot run`) before it
+# runs, and queues behind a typecheck already running rather than piling onto
+# it. go-lint-changed stays direct: it scans only the packages of uncommitted
+# edits, not the whole tree, and is not the cost this queue exists for.
+go-lint-slot:
+	@echo "==> golangci-lint $(GOLANGCI_VERSION) (queued through haven machine slot run)"
+	@$(HAVEN) machine slot run --label golangci-lint --timeout 10m -- sh -c 'rc=0; for m in $(GO_LINT_MODULES); do \
+		(cd "$$m" && $(GO_LINT_ENV) $(GOLANGCI) run --concurrency $(GO_LINT_JOBS) --allow-serial-runners ./...) || rc=1; done; exit $$rc'
+
+go-lint:
+	@$(NX) run-many -t lint:go --outputStyle=static
+
+# Lints only the packages of uncommitted .go edits (untracked included) and
+# reports only issues on those lines; it never diffs against a branch. Each
+# module's packages are linted from inside that module, in one slot.
+go-lint-changed:
+	@dirs=$$( { git diff --name-only HEAD -- '*.go'; git ls-files -o --exclude-standard -- '*.go'; } \
+		| grep -E '^(services/(aigateway|analyticssim|idpsim|langyagent|llmsim|mailsim|nlpgo|scenariorunner|storagesim|telemetrysim|voicesim)|pkg|cmd|tools)/' | grep -v '/testdata/' \
+		| xargs -n1 dirname | sort -u | while read -r d; do [ -d "$$d" ] && echo "$$d"; done); \
+	if [ -z "$$dirs" ]; then echo "==> no changed Go packages"; exit 0; fi; \
+	echo "==> golangci-lint $(GOLANGCI_VERSION) ($$(echo "$$dirs" | wc -l | tr -d ' ') packages)"; \
+	$(HAVEN) machine slot run --label golangci-lint --timeout 10m -- sh -c 'rc=0; for m in $(GO_LINT_MODULES); do \
+		pkgs=$$(echo "$$0" | sed -n "s#^$$m/#./#p"); [ -z "$$pkgs" ] && continue; \
+		(cd "$$m" && $(GO_LINT_ENV) $(GOLANGCI) run --concurrency $(GO_LINT_JOBS) --allow-serial-runners --new-from-rev=HEAD $$pkgs) || rc=1; \
+	done; exit $$rc' "$$dirs"
+
+# Stop all services
+down:
+ifneq (haven,$(firstword $(MAKECMDGOALS)))
+	$(COMPOSE) --profile full down
+else
+	@:
+endif
+
+# Tail logs
+logs:
+	$(COMPOSE) --profile full logs -f
+
+# Show running services
+ps:
+	$(COMPOSE) --profile full ps
+
+# Remove volumes (reset all data)
+clean:
+	$(COMPOSE) --profile full down -v
+
+# =============================================================================
+# LEGACY COMMANDS (run services locally, not in Docker)
+# =============================================================================
+
+# Guarded so `make haven install` (which go-installs the haven CLI via the
+# `haven` target in dev/haven.mk) doesn't ALSO run pnpm install: when `haven`
+# is the first goal this recipe is a no-op. Plain `make install` is unaffected.
+install:
+ifneq (haven,$(firstword $(MAKECMDGOALS)))
+	pnpm install
+else
+	@:
+endif
+
+# The whole local stack in one terminal: the three applications (ui, api,
+# workers) plus the Go aigateway and nlpgo engines. `pnpm dev` starts all five
+# itself now — dev/scripts/dev-stack.sh derives every port and skips a Go lane
+# that is already listening — so this target is one line pointing at it, kept
+# because `make start` is in the README and in muscle memory.
+start:
+	pnpm dev
+
+start/postgres:
+	@echo "Starting Postgres..."
+	@docker compose -f infra/compose.yml --project-directory . up -d postgres
+
+# A watching typecheck of one application (default apps/api):
+#   make tsc-watch app=apps/ui
+# It never takes a check-queue slot — a `--watch` run would hold one for the
+# whole session, which is exactly what the queue exists to prevent.
+tsc-watch:
+	pnpm exec tsc --noEmit --watch --preserveWatchOutput -p $(or $(app),apps/api)/tsconfig.json
+
+# Single entry point — interactive launcher or non-interactive mode runner.
+# (#3860 AC#1, AC#2). Positional usage via MAKECMDGOALS:
+#   make quickstart                  # interactive prompt
+#   make quickstart frontend-only    # no compose, fastest
+#   make quickstart backend-shared   # postgres + redis + clickhouse + app
+#   make quickstart migration        # postgres + clickhouse on host ports
+#   make quickstart nlp              # backend + nlp + langevals
+#   make quickstart full-local       # --profile full
+ifeq (quickstart,$(firstword $(MAKECMDGOALS)))
+  QUICKSTART_ARG := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  # The eval below silently overrides whatever name the user passed with a
+  # no-op recipe. If they pass an existing target name (e.g. `help`, `down`,
+  # `logs`), make would happily overwrite the real recipe and run the empty
+  # one — so we error out explicitly with a hint instead.
+  ifneq ($(filter $(QUICKSTART_ARG),help dev dev-up dev-down dev-logs dev-nlp dev-scenarios dev-test dev-full down logs clean ps quickstart quickstart-help worktree start),)
+    $(error 'make quickstart $(QUICKSTART_ARG)' collides with target '$(QUICKSTART_ARG)' — use `make quickstart-help` for the mode reference, or pass a mode like `frontend-only` / `backend-shared` / `nlp` / `migration` / `full-local`)
+  endif
+  ifneq ($(QUICKSTART_ARG),)
+    $(eval $(QUICKSTART_ARG):;@:)
+  endif
+endif
+quickstart:
+	@./dev/scripts/dev.sh $(QUICKSTART_ARG)
+
+# Non-interactive mode reference (#3860 AC#8). Use `make quickstart-help` —
+# `make quickstart help` collides with the existing `help` target.
+quickstart-help:
+	@./dev/scripts/dev.sh help
+
+# =============================================================================
+# ISOLATED DEV INSTANCES (for AI agents / parallel worktrees)
+# =============================================================================
+# Each worktree gets its own containers, volumes, and ports.
+# Port info saved to .dev-port for agent/skill discovery.
+
+# Deprecation warning for dev-up / dev-down / dev-logs (#3860 AC#9).
+_dev-up-deprecation-warning:
+	@printf '\033[33m[deprecated] make %s → make quickstart (single entry point)\033[0m\n' "$(MAKECMDGOALS)" >&2
+
+# Start isolated instance (detached). Usage: make dev-up [PROFILE=scenarios]
+dev-up: _dev-up-deprecation-warning
+	@./dev/scripts/dev-up.sh $(PROFILE)
+
+# Stop isolated instance
+dev-down: _dev-up-deprecation-warning
+	@./dev/scripts/dev-down.sh
+
+# Tail logs for isolated instance
+dev-logs: _dev-up-deprecation-warning
+	@if [ -f .dev-port ]; then . ./.dev-port && COMPOSE_PROJECT_NAME=$$COMPOSE_PROJECT_NAME VOLUME_PREFIX=$$VOLUME_PREFIX docker compose -f dev/compose.dev.yml --project-directory . --profile full logs -f; \
+	else echo "No .dev-port found. Is the instance running?"; fi
+
+# Create a git worktree from issue number or feature name
+# Usage: make worktree 1663  or  make worktree add-dark-mode
+ifeq (worktree,$(firstword $(MAKECMDGOALS)))
+  WORKTREE_ARG := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+  $(eval $(WORKTREE_ARG):;@:)
+endif
+worktree:
+	@./dev/scripts/worktree.sh $(WORKTREE_ARG)
+
+# Regenerate everything the OpenAPI document feeds.
+#
+# The document is generated from the api's route declarations and never
+# committed (specs/api-reference/openapi-document.json is gitignored). What is
+# generated from it IS committed: the three SDK clients and the docs site copy
+# with its api-reference pages. Each step below writes the document first, and
+# CI runs this same target and fails on a diff (the `openapi-clients` job).
+#
+# Go is named explicitly because it was once missing from this target and
+# drifted eight spec commits behind while TypeScript and Python stayed current.
+# GOWORK=off because sdks/go/client is its own module and is deliberately
+# absent from the repo-root go.work.
+sync-all-openapi:
+	@cd sdks/typescript && pnpm run generate:openapi-types
+	@cd sdks/python && make generate/api-client
+	@cd sdks/go/client && GOWORK=off go generate ./...
+	@cd docs && make sync-api-spec && make generate-api-reference
+
+# Included last on purpose (see the dev/haven.mk note after `dogfood-langy-local`): the
+# `make haven <sub>` passthrough must define its no-op goals after the real
+# `down` / `install` targets so its override wins.
+include dev/haven.mk

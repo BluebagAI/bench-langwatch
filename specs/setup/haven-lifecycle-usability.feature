@@ -1,0 +1,248 @@
+Feature: haven lifecycle usability
+  Day-to-day up/down/restart ergonomics: down keeps data unless --destroy, up on an
+  already-running stack reconciles instead of refusing, one service can be
+  bounced without tearing the stack down, and stale databases are reclaimed
+  in the background instead of at teardown time. The full v2 surface is
+  specced in haven-cli-surface.feature (ADR-064).
+
+  Background:
+    Given a worktree with a registered haven stack
+
+  @unit
+  Scenario: Down keeps the databases unless it is told to destroy
+    Given the stack's launcher is running
+    When the developer runs "haven down"
+    Then the launcher is stopped and the routes and registry entry are removed
+    And the stack's ClickHouse and Postgres databases still exist
+    And only "haven down --destroy" drops them (see haven-cli-surface.feature) — fresh data in place is "haven db reset"
+
+  @unit
+  Scenario: Down --force kills hard
+    Given the stack's launcher is running
+    When the developer runs "haven down --force"
+    Then the launcher's process group is SIGKILLed with no graceful wait
+    And the databases still exist
+
+  @unit
+  Scenario: The daemon prunes databases idle past the TTL
+    Given a slug whose databases were last used longer ago than the idle TTL
+    And no stack is registered for that slug
+    When the daemon runs its background hygiene
+    Then that slug's ClickHouse and Postgres databases are dropped
+    And the protected main database is never dropped
+    And a slug with a registered stack is never pruned
+
+  @unit
+  Scenario: Up on an already-running stack reconciles
+    Given the stack's launcher is running
+    When the developer runs "haven up" in the same worktree
+    Then a matching selection is a friendly no-op and the stack is left in place
+    And a changed selection replaces the stack in place with the new one
+    And "haven up --force" restarts even a matching stack
+    And there is never a refusal
+
+  @unit
+  Scenario: A stack whose launcher died gives its hostnames up
+    Given the stack's launcher was killed by the operating system
+    When the daemon runs its ten-second reconciliation
+    Then every hostname the stack could own is deregistered
+    And the registry entry is dropped
+    And the hostname refuses instead of resolving to another worktree's process
+    And haven never restarts a stack it did not start: "haven up" is the recovery
+
+  @unit
+  Scenario: Up deregisters a dead stack's hostnames before it provisions
+    Given a registered stack whose launcher is gone
+    When the developer runs "haven up" in that worktree
+    Then the dead entry's routes are removed with the entry
+    And provisioning proceeds
+
+  @unit
+  Scenario: Status separates no stack from a dead stack
+    When a script runs "haven status --json"
+    Then "stacks" is always a list, empty when nothing is registered
+    And each stack states whether its launcher is live
+    And each service states whether anything is listening on its port
+
+  @unit
+  Scenario: Status shows the shared check budget and who holds it
+    Given two typecheck runs hold 2 units each of an 8-unit budget at green
+    When a person runs "haven status"
+    Then a slots line reads "4/8 units (green)" with the units per class
+    And each holder has one line with its class, units, pid, worktree, label and time held
+    And "haven status --json" carries the same under "slots"
+
+  @unit
+  Scenario: Status lists waiting runs in queue order
+    Given a test run queued before a typecheck run
+    When a person runs "haven status"
+    Then the test run is waiting #1 and the typecheck run waiting #2, each with its class, units and time waited
+
+  @unit
+  Scenario: Status caps the slot lines at ten
+    Given twelve runs hold a unit each and twelve wait
+    When a person runs "haven status"
+    Then ten holder lines and ten waiter lines show, each list ending in "+2 more"
+
+  @unit
+  Scenario: Status warns when a launcher uses a fallback lock folder
+    Given "~/.cache/langwatch/tsc-slots" holds one entry
+    When a person runs "haven status"
+    Then a warn line names tsc-slots as a run outside the shared budget
+
+  @unit
+  Scenario: Restarting one service bounces only that service
+    Given the stack's launcher is running
+    When the developer runs "haven restart nlp"
+    Then only the nlp service's process group is terminated
+    And the supervisor restarts it
+
+  @unit
+  Scenario: Restarting with no service named bounces every supervised child
+    When the developer runs "haven restart"
+    Then every locally-run service is bounced
+    And baseline fallbacks and the shared database servers are untouched
+
+  @unit
+  Scenario: Up in a terminal never holds the stack hostage
+    When the developer runs "haven up" in a terminal
+    Then the stack runs in the background and an interactive log view attaches
+    And quitting the view (q, esc, or Ctrl-C) detaches — the stack keeps running
+    And "haven down" is what stops it
+
+  @unit
+  Scenario: Switching between service log groups is a keypress
+    Given the attached log view is open
+    Then arrow keys, tab, or a digit switch between "all" and each service's own log
+    And the lines are coloured by service with warnings and errors highlighted
+
+  # Tab one of the attached view (haven up and haven pr --throwaway alike) is a live
+  # session dashboard, not a log stream: an ASCII harbour, the stack's status,
+  # and per-service actions. The log groups follow it. Behaviour is in
+  # app/session.go (the cheap live snapshot) and cmd/upviewer.go (the dashboard
+  # tab), bound by app/session_test.go and cmd/upviewer_test.go.
+  @unit
+  Scenario: The session dashboard is the first thing haven up shows
+    Given the attached view is open
+    Then tab one is a status dashboard, ahead of the "all" and per-service log tabs
+    And it shows the stack's liveness, RAM, and every service with an up/down dot
+    And a log-only view (no wired actions) still opens straight on "all"
+
+  @unit
+  Scenario: The dashboard reports every service and shared server
+    Then each routed service is listed in its CLI spelling, langy not langyagent
+    And a service this worktree runs itself is marked restartable
+    And a baseline fallback or shared database server is not
+    And the proxy, the daemon, and the managed databases are reported as shared machinery
+
+  @unit
+  Scenario: Arrow keys move the cursor and open a service's logs
+    Given the dashboard tab is showing
+    When the developer moves the cursor with the arrow keys and presses enter on a service
+    Then the view jumps to that service's own log tab
+    And a service with no capture of its own opens the combined "all" stream instead
+
+  @unit
+  Scenario: Restarting a service from the dashboard bounces just that one
+    Given the dashboard tab is showing with a restartable service under the cursor
+    When the developer presses "r"
+    Then only that service is bounced, without printing into the alt-screen
+    And "a" bounces every service
+    And a managed service refuses with a toast instead of a restart
+
+  # The attached viewer takes the alt-screen, so it can only ever be for a human
+  # terminal. Everything else streams plainly, and because that path never
+  # backgrounds the launcher the stack is this process's own children.
+  # Bound by cmd/uplifecycle_test.go.
+  @unit
+  Scenario: A piped up streams in the foreground
+    When "haven up" runs with output piped (make haven up | tee)
+    Then it streams plainly in the foreground and Ctrl-C stops the stack
+    And agent mode streams the same way even from a terminal
+
+  # A human's up detaches on purpose: closing the terminal leaves the stack
+  # for `haven down`. The foreground run an agent or a pipe gets has no such
+  # handover — whoever launched it is its only owner, and signals are the only
+  # goodbye it ever gets. A launcher killed by pid says none. Observed: a
+  # foreground `haven up --agent` still supervising a full stack, two days
+  # after the session that ran it was gone. So the foreground run watches the
+  # process group it was launched into, the same way the old dev supervisor did, and
+  # shuts down as if interrupted when that group loses its leader.
+  @unit
+  Scenario: A foreground up goes down with the group that launched it
+    Given a foreground "haven up" launched from a shell's process group
+    When that group's leader dies without signalling anything
+    Then the run shuts down as if interrupted, stack and routes included
+
+  @unit
+  Scenario: A run that leads its own process group watches nothing
+    Given "haven up" running as its own process-group leader, the shape of an interactive job
+    Then no launcher watch is armed, because the terminal already owns its lifetime
+
+  # Attached and detached run the identical backgrounded child — the viewer is
+  # only attached on top — so there is no second logging path to keep in step.
+  # Bound by cmd/uplifecycle_test.go.
+  @unit
+  Scenario: A detached up logs the same as an attached one
+    When the developer runs "haven up --detach"
+    Then the stack starts in the background
+    And "haven logs -f" follows it exactly as it would an attached stack
+    And the detach flag itself is never passed to the backgrounded child
+    And "haven down" stops it
+
+  # Bound by app/switch_test.go.
+  @unit
+  Scenario: Switching to a worktree by name
+    Given shell integration from "haven self shell-init" is installed
+    When the developer runs "haven switch" with a unique name prefix
+    Then the shell changes directory to that worktree
+    And a prefix matching several worktrees names them all rather than picking one
+    And a name matching none lists what there is
+
+  @unit
+  Scenario: Status masks this worktree's overlay credentials by default
+    Given the caller's own worktree has a running stack
+    When "haven status --json" runs without --reveal
+    Then the overlay's credentials are masked and its plain deployment facts, like the slug, are not
+    And with --reveal the credentials print in clear
+
+  # The daemon is the one place that starts a keeper (ruling D-S4c-1): `haven up`
+  # writes the plan, then asks over POST /api/stacks/{slug}/start. Bound by
+  # app/keeper_process_test.go and adapters/dashboard/actions_test.go.
+  @integration
+  Scenario: Up hands its stack to a keeper the daemon starts
+    Given the haven daemon is running
+    And the up has provisioned the stack and written its plan
+    When the up asks the daemon to start the stack's keeper
+    Then the daemon starts "haven keep" for that stack
+    And the up returns once the keeper holds the stack's record
+
+  @integration
+  Scenario: Up starts the daemon first when none is running
+    Given no haven daemon is running
+    When the up hands its provisioned stack over
+    Then it starts the daemon in the background
+    And that daemon starts the stack's keeper
+
+  @integration
+  Scenario: Up's hand-over survives the daemon restarting after a rebuild
+    Given the haven daemon answers the hand-over with 404 unknown stack while it restarts
+    When the up hands its provisioned stack over
+    Then the up keeps asking the daemon that runs now, starting one if none does
+    And the successor daemon starts the stack's keeper
+
+  @unit
+  Scenario: The daemon refuses to start a keeper for a stack it does not know
+    When the start route names a slug with no registered stack
+    Then it answers 404 and starts nothing
+
+  @unit
+  Scenario: The daemon starts a keeper only for a stack waiting to be handed over
+    Given a stack whose record names a launcher other than its plan's live provisioner
+    When the start route names that stack
+    Then the daemon refuses and starts no keeper
+
+  @unit
+  Scenario: A page on the app's origin cannot start a keeper
+    When a page on the stack's app origin posts to the start route
+    Then the daemon answers 403 and starts nothing

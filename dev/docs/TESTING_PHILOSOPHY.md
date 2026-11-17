@@ -1,0 +1,412 @@
+# Testing Philosophy
+
+## Core Principles
+
+### Test Behavior, Not Implementation
+
+Focus on **what** the code does, not **how** it does it. Tests should validate user-visible outcomes and contracts, enabling refactoring without rewriting tests.
+
+### No "Should" in Test Names
+
+Use present tense, active voice. Describe expected behavior directly.
+
+| Avoid                          | Prefer                        |
+| ------------------------------ | ----------------------------- |
+| `it("should sign up a user")`  | `it("signs up a user")`       |
+| `it("should redirect guests")` | `it("redirects guest users")` |
+
+### Describe Block Naming
+
+Use MDN-style naming for the unit under test:
+
+| Type      | Format      | Example                              |
+| --------- | ----------- | ------------------------------------ |
+| Function  | `name()`    | `describe("transformData()", ...)`   |
+| Class     | `Name`      | `describe("Analytics", ...)`         |
+| Component | `<Name/>`   | `describe("<DatePicker/>", ...)`     |
+| Hook      | `useName()` | `describe("useUiDeployment()", ...)` |
+
+### Nested Describe for Context
+
+Use nested `describe` blocks to group tests by context/condition. The outer `describe` names the unit under test, inner `describe` blocks specify the "when" condition, and `it` blocks describe the behavior.
+
+```typescript
+describe("useUiDeployment()", () => {
+  describe("when the deployment is SaaS", () => {
+    it("reports isSaaS as true", () => {
+      // ...
+    });
+  });
+
+  describe("when the deployment is self-hosted", () => {
+    it("reports isSaaS as false", () => {
+      // ...
+    });
+  });
+});
+```
+
+See [bettertests.js.org](https://bettertests.js.org/) for more patterns.
+
+### Single Expectation Per Test
+
+Isolating assertions makes failures immediately clear. When multiple behaviors need testing, create separate tests.
+
+### BDD-Style Test Structure
+
+Use nested `describe` blocks to express Given/When/Then structure:
+
+```typescript
+describe("ClassName", () => {
+  describe("methodName", () => {
+    describe("given some precondition", () => {
+      beforeEach(() => {
+        /* setup context */
+      });
+
+      describe("when some action occurs", () => {
+        it("produces expected result", () => {
+          /* assertion */
+        });
+        it("also does this other thing", () => {
+          /* assertion */
+        });
+      });
+    });
+
+    describe("given different precondition", () => {
+      describe("when same action occurs", () => {
+        it("produces different result", () => {
+          /* assertion */
+        });
+      });
+    });
+  });
+});
+```
+
+Benefits:
+
+- **Grouping**: Related tests share setup in `beforeEach`
+- **Readability**: Test output reads like a spec: "ClassName > methodName > given X > when Y > does Z"
+- **Organization**: Clear separation of context (given) from action (when) from expectation (it)
+
+Avoid flat structures with Given/When/Then only in comments:
+
+```typescript
+// Avoid: comments don't provide grouping or shared setup
+it("does X when Y given Z", () => {
+  // Given: Z
+  // When: Y
+  // Then: X
+});
+```
+
+## Stories, acceptance criteria, and feature files
+
+Issues are authored as Scrum stories (As a / I want / so that) with acceptance criteria (Given/When/Then) and a separate Definition of Done. When picked up, the story becomes the Feature narrative and each AC becomes one Scenario in `specs/**/*.feature`, bound to tests via `/** @scenario` JSDoc. See `specs/README.md` for complete binding details.
+
+## Coverage is Mandatory
+
+Every change ships with tests. No exceptions. This is not aspirational — it is a hard requirement.
+
+- **Bug fixes** must include a regression test that fails without the fix and passes with it. Tag with `@regression`.
+- **New features** must have integration and/or unit tests covering all acceptance criteria from the feature spec.
+- **Refactors** must not reduce existing test coverage.
+
+Target near-100% coverage via integration + unit tests. E2E tests are deprioritized (see below).
+
+## Test Hierarchy
+
+Avoid overlap. Each level has a distinct purpose.
+
+| Level                    | Purpose                                                 | Mocking                  | Quantity                            |
+| ------------------------ | ------------------------------------------------------- | ------------------------ | ----------------------------------- |
+| **E2E**                  | Catastrophic regression detection for stable core flows | None                     | 5-10 total (deprioritized)          |
+| **Browser Verification** | Interactive feature validation during development       | None                     | Per-feature, not persisted as tests |
+| **Integration**          | Edge cases, error handling, component rendering         | External boundaries only | As many as needed                   |
+| **Unit**                 | Pure logic, branches                                    | Everything               | As many as needed                   |
+
+### E2E Tests: Deprioritized
+
+E2E tests are expensive and brittle. The app's UI and API surface changes too fast for e2e tests to keep up — they break frequently and take too long to run, providing poor ROI.
+
+We maintain a **minimal stable suite** (5-10 tests) that covers core happy paths of established features — sign in, view traces, run an evaluation. These run on a schedule or before releases, not per PR.
+
+We do **not** generate E2E tests per feature. Interactive browser verification (`/browser-test`) provides development-time confidence without the maintenance burden. Integration and unit tests are the primary coverage mechanism. See [ADR-010](adr/010-e2e-testing-strategy.md) for the full rationale.
+
+### Language-Specific Patterns
+
+| Language   | E2E             | Integration             | Unit             | Location     |
+| ---------- | --------------- | ----------------------- | ---------------- | ------------ |
+| TypeScript | `*.e2e.test.ts` | `*.integration.test.ts` | `*.unit.test.ts` | `__tests__/` |
+| Python     | `test_*_e2e.py` | `test_*_integration.py` | `test_*.py`      | `tests/`     |
+| Go         | `*_e2e_test.go` | `*_integration_test.go` | `*_test.go`      | same package |
+
+## Mocking Strategy
+
+**Prefer stubs and environment simulation over mocks.**
+
+Mocks test implementation details. When you refactor internals, mock-heavy tests break even though behavior is unchanged. Instead:
+
+- Use stubs for external services (nock, msw, miragejs)
+- Use real implementations where practical
+- Mock only at external boundaries (APIs, databases, file systems)
+
+## Test Data
+
+**Create minimal, context-specific data.**
+
+Only generate data needed for the specific test. Comprehensive setup obscures what's actually being tested.
+
+```typescript
+// Avoid: kitchen-sink fixtures
+const user = createFullUser({ name, email, address, preferences, ... })
+
+// Prefer: minimal data for the test
+const user = { id: "1", role: "guest" }
+```
+
+## Feature File Parity
+
+Feature specs in `specs/` define what tests must exist. **Every scenario in a feature file must have a corresponding test implementation.** This is enforced — not aspirational.
+
+### Convention
+
+| Feature file                              | Test file                                                                                                                            |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `specs/analytics/chart-rendering.feature` | the owning feature package's own `__tests__/chart-rendering.integration.test.ts`, e.g. `modules/analytics/process/src/**/__tests__/` |
+| `specs/langy/langy-panel-layout.feature`  | `modules/langy/browser/src/model/__tests__/langy-panel-layout.unit.test.ts`                                                          |
+
+The scenario title in the feature file should match the `it()` description in the test. Use `describe("Feature: <feature name>")` as the outer block.
+
+### Tags
+
+| Tag            | Meaning                                        | Use when                                      |
+| -------------- | ---------------------------------------------- | --------------------------------------------- |
+| `@unit`        | Pure logic test                                | Testing functions, utilities, transformations |
+| `@integration` | Component/boundary test                        | Testing rendering, API calls, DB queries      |
+| `@regression`  | Prevents a previously-fixed bug from recurring | Bug fix scenarios — must fail without the fix |
+| `@e2e`         | Stable core flow (deprioritized)               | Only for the 5-10 stable happy-path tests     |
+
+Bug-fix feature specs should use `@regression` (alongside `@unit` or `@integration` for pyramid level):
+
+```gherkin
+@regression @integration
+Scenario: Analytics chart shows error state when ClickHouse query fails
+  Given an analytics dashboard with a configured chart
+  When the ClickHouse query returns a memory limit error
+  Then the chart displays an error badge with a retry option
+```
+
+### Binding scenarios to tests
+
+The parity checker (`packages/architecture-enforcer/src/tools/check-feature-parity.ts`, run in CI as `pnpm check:feature-parity`) matches every `@unit` / `@integration` scenario to at least one test via a `@scenario "<title>"` JSDoc annotation placed directly above an `it(...)` / `test(...)` call:
+
+```ts
+/** @scenario Analytics chart shows error state when ClickHouse query fails */
+it("renders error badge on ClickHouse memory limit", () => {
+  // ...
+});
+```
+
+Shell behavior tested with [bats](https://github.com/bats-core/bats-core) (e.g. `dev/scripts/__tests__/*.bats`) uses the same `@scenario` token, expressed as a hash-comment directly above the `@test` line:
+
+```bash
+# @scenario "all-local overrides only DATABASE_URL, REDIS_URL, CLICKHOUSE_URL"
+@test "all-local rewrites DATABASE_URL, REDIS_URL, CLICKHOUSE_URL only" {
+  # ...
+}
+```
+
+Titles must match verbatim. Annotations that reference a title not present in any feature file fail CI as `unknownAnnotations` — typos and stale bindings are caught immediately rather than silently rotting.
+
+### Polarity: enforce-all, with `LEGACY_UNBOUND`
+
+Every `.feature` file under `specs/**` is enforced by default. A small `LEGACY_UNBOUND` deny-list in the checker tolerates files whose scenarios are still being bound as part of the parity migration — those files still parse and surface in the `legacy` block of `--json` output and in the CI log, but unbound scenarios do not fail CI.
+
+The direction is one-way: drive `LEGACY_UNBOUND` to empty. Every removal from the list means one of:
+
+- A new `@scenario` binding was added to a test.
+- The scenario was flagged `@unimplemented` in the feature file (tracking issue filed for the missing test).
+- The scenario was removed from the feature file as aspirational.
+
+Two invariants prevent the list from rotting:
+
+- **Stale entries fail CI.** If a file in `LEGACY_UNBOUND` no longer has any unbound scenarios (because bindings were added), CI fails until the entry is removed. Fully-bound files must not sit on the deny-list.
+- **Unknown paths fail CI.** Every entry must resolve to an existing `.feature` file under `specs/`. Rename or delete a feature, update the list in the same commit.
+
+Adding a new entry to `LEGACY_UNBOUND` should require justification — prefer binding, flagging, or removing over widening the deny-list.
+
+### `@unimplemented`
+
+When a scenario in a legacy feature file describes behavior that has no matching test _and_ the test has not yet been written, tag the scenario `@unimplemented` alongside its pyramid tag (`@unit` / `@integration`) and file a tracking issue for the missing test. The parity checker treats `@unimplemented` as a non-binding signal — scenarios so tagged are not expected to resolve to a `@scenario` annotation.
+
+`@unimplemented` is a lightweight promise that the gap is tracked, not ignored. Every removal of an `@unimplemented` tag must land with either a new `@scenario` binding or a feature-file edit that removes the scenario entirely.
+
+## Use-proof
+
+A use-proof is a concrete, observable demonstration that the feature works as intended. It can be:
+
+- A screenshot of the rendered UI showing the feature in action
+- A command-line output demonstrating the API response
+- A browser-test report with screenshots of the full workflow
+- A trace or log showing the expected behavior occurred
+
+Use-proofs are embedded in PR descriptions or linked from the PR body, providing visual evidence that every acceptance criterion was validated before merge.
+
+## Workflow
+
+See `specs/README.md` for detailed BDD guidance.
+
+1. **Spec first**: Write a `.feature` file in `specs/`. Use tags: `@integration`, `@unit`, `@regression`.
+2. **Challenge**: LLM/reviewer challenges missing edge cases before implementation.
+3. **Implement**: Outside-in TDD. Red -> Green -> Refactor.
+4. **Browser verify**: Use `/browser-test` to validate the feature works in a real browser.
+
+## Decision Tree
+
+Apply in order. Stop at first match.
+
+```text
+Is this a core happy path of a stable, established feature?
+  -> @e2e (only if not already covered by the stable suite)
+
+Is this testing UI elements exist? (form fields, buttons, layout)
+  -> @integration
+
+Is this testing navigation/routing only?
+  -> @integration
+
+Is this testing error handling or edge cases?
+  -> @integration (mock boundaries)
+
+Is this a complete user workflow for a new/changing feature?
+  -> @integration + /browser-test for visual verification
+
+Is this pure logic in isolation?
+  -> @unit
+
+Is this a regression from production?
+  -> Add at LOWEST sufficient level (unit > integration > e2e)
+```
+
+### When to Use Each Approach
+
+| Situation                                | Approach                                     |
+| ---------------------------------------- | -------------------------------------------- |
+| New feature during development           | `/browser-test` for interactive verification |
+| Bug fix verification                     | `/browser-test` to confirm the fix works     |
+| Core sign-in/dashboard/traces flow broke | Stable E2E suite catches this                |
+| Form renders correct fields              | `@integration` test                          |
+| API returns correct data                 | `@unit` or `@integration` test               |
+
+Use `/test-review` to validate pyramid placement.
+
+## Scenario Design
+
+Each scenario should test **one invariant**. When deciding whether to extend an existing scenario or create a new one:
+
+- **Extend** (add `And`/`But`): The new assertion is a natural consequence of the same behavior
+- **New scenario**: The assertion tests a distinct invariant that could fail independently
+
+Example: "Cache returns stale data" and "Cache key includes version" are orthogonal invariants — separate scenarios. If one fails, you immediately know which contract broke.
+
+## What We Don't Test
+
+- Type definitions
+- Simple pass-throughs with no logic
+- Third-party library internals
+- Constants/config (unless dynamic)
+
+## Regression Policy
+
+Edge cases not covered upfront are handled via regression tests. When a bug is found:
+
+1. Reproduce with a failing test
+2. Add test at the lowest sufficient level
+3. Fix and verify green
+
+This keeps the suite lean while ensuring real failures never recur.
+
+## E2E Patterns (Playwright)
+
+The stable E2E suite lives in `dev/tests/agentic-e2e/`. These tests cover core happy paths only.
+
+| Pattern            | Convention                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------- |
+| Sidebar navigation | Always use `{ name: 'X', exact: true }`                                               |
+| Dialogs (Chakra)   | Use `.last()` to handle duplicate renders                                             |
+| Auth state         | Stored in `.auth/user.json`, reused across tests                                      |
+| Test naming        | Action-based, no "should" (see `CLAUDE.md`)                                           |
+| Test credentials   | `browser-test@langwatch.ai` / `BrowserTest123!` (consistent across scripts and tests) |
+
+See `dev/tests/agentic-e2e/README.md` for setup and running tests.
+
+## Browser Verification
+
+Interactive browser verification (`/browser-test`) replaces per-feature E2E test generation. An AI agent drives a real browser, walks through scenarios, takes screenshots, and reports results.
+
+Artifacts are saved to `browser-tests/<feature-name>/<YYYY-MM-DD>/` with screenshots and a report. These are committed to the branch and linked in PR descriptions.
+
+See `.claude/skills/browser-test/SKILL.md` for the full workflow and `browser-tests/proof-of-concept/` for an example run.
+
+## Green pieces do not make a working product
+
+Recorded 2026-09-06, out of the strict feature layout migration.
+
+A move carries its unit and component tests, and each of those tests mocks the
+boundary it sits on: a host adapter test fakes the session port, a route test
+fakes the service, a service test fakes the repository. All of them stay green
+while the product does not work. Measured examples from one day:
+
+- The browser entry never imported the global stylesheet, so fonts, the CSS
+  reset and link underlines were gone. No test reads the entry file.
+- Every settings page wrapped itself in a second settings layout, because the
+  page wrapper and the navigation shell were each tested alone.
+- Twenty-two host adapters rendered a spinner for ever on a refused
+  organization graph, because their tests covered `isLoading` only.
+- A bare `setQuery: route.setQuery` hand-off lost its receiver and threw on the
+  first click. Three more hosts did the same with `feedback.succeeded`.
+- A code evaluator could not be attached to a monitor, and an evaluation
+  recorded on a span came back empty, each because two correct halves disagreed
+  at a seam nothing exercised end to end.
+
+So a feature that spans a process boundary needs a test that crosses it. See
+ADR-010's 2026-09-06 amendment for the four suites that do.
+
+## Test doubles drift, and the check that would catch them is drowned
+
+A double that still spells a method the real interface renamed fails at run
+time with `X is not a function`. Six turned up in one pass, all the same shape.
+
+Do not cite "tests are outside the typecheck" as the reason. `pnpm typecheck`
+runs every package's own `typecheck` script, and each of those is `tsc -b`
+against a project that includes its tests wherever the script names a test
+config, so it does cover this drift. The accurate reason is that the check is
+red for unrelated reasons: at
+1,817 errors across 487 files, a new drift adds one line and is invisible
+whether or not anyone runs it.
+
+Two rules follow. **Drive the count down rather than the individual drifts.**
+Below some threshold the check becomes a finder and the rest fall out in one
+pass. **A "does this exist anywhere" sweep must match declaration forms**, not
+the export keyword. Two members reported as deleted were written as
+`abstract ensureInternal(...)` on a contract class and `async summary(...)` on
+an implementation. Both existed. The tests were reaching through the wrong
+object, which is a far smaller problem than a missing capability.
+
+Count only lines carrying an `error TSxxxx` code. `tsc` also emits indented
+related-information lines naming other files, and counting those inflates both
+the per-file totals and the file count.
+
+## A move that re-authors is not a move
+
+When a move re-authors rather than renames, diff the two files by behaviour, not
+by size. The tell is a constant or a state field that travelled while the
+control that drove it did not: a setter with no caller outside its own unit
+tests, or a grouping constant exported from a component that never groups.
+
+A suite that cannot load hides its own drifts completely. It fails at import and
+never reaches the assertion that would have named the method, so it also stops
+being maintained. Repoint it or delete it. Do not leave it unloadable.

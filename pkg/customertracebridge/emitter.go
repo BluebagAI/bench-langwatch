@@ -1,0 +1,1254 @@
+package customertracebridge
+
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/tidwall/gjson"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/langwatch/langwatch/pkg/aitrace"
+	"github.com/langwatch/langwatch/pkg/contexts"
+	"github.com/langwatch/langwatch/pkg/otelsetup"
+)
+
+const (
+	attrProjectID      = attribute.Key("langwatch.project_id")
+	attrTotalUsage     = attribute.Key("gen_ai.usage.total_tokens")
+	attrCost           = attribute.Key("gen_ai.usage.cost")
+	attrInputMessages  = attribute.Key("gen_ai.input.messages")
+	attrOutputMessages = attribute.Key("gen_ai.output.messages")
+	// attrDrop marks a span the gateway started but does not want exported
+	// (zero-cost, no-output probe calls). dropFilterExporter omits these.
+	attrDrop = attribute.Key("langwatch.reserved.drop")
+	// attrMirrorTier / attrMirrorSourceOrg are internal signaling set by
+	// EndSpan and consumed by mirrorExporter (ADR-061). They are stripped from
+	// BOTH the customer copy and the mirror copy before export — a reserved
+	// marker must never reach either project.
+	attrMirrorTier      = attribute.Key("langwatch.reserved.mirror_tier")
+	attrMirrorSourceOrg = attribute.Key("langwatch.reserved.mirror_source_org")
+	// attrOrgID names the SOURCE organization on the mirror copy — the same
+	// ADR-053 Track A key convention the gateway's own tracer uses.
+	attrOrgID = attribute.Key("langwatch.organization_id")
+)
+
+// Mirror tier values (ADR-061), mirroring services/langyagent/aitrace.MirrorTier.
+const (
+	mirrorTierContent    = "content"
+	mirrorTierStructural = "structural"
+	mirrorTierSkip       = "skip"
+)
+
+// OriginLangy is the langwatch.origin value the Langy relay stamps on a turn's
+// spans in the customer's project, and the one this emitter stamps on the
+// gen_ai span it retells for a Langy call, so the turn's trace reads as
+// Langy's from whichever span folds first. The gateway keeps its own origin on
+// the resource, and on every span it retells for ordinary customer traffic.
+const OriginLangy = "langy"
+
+// Emitter uses a private (non-global) OTel TracerProvider to construct spans
+// and export them to the customer's OTLP endpoint. The TP's resource carries
+// ONLY the langwatch.origin marker, so customers see the instrumentation scope
+// and the trace's origin — never the gateway's service identity or topology.
+type Emitter struct {
+	tp         *sdktrace.TracerProvider
+	tracer     trace.Tracer
+	propagator propagation.TextMapPropagator
+}
+
+// dropFilterExporter omits spans the emitter marked with attrDrop (zero-cost,
+// no-output probe calls) before they reach the customer's OTLP endpoint. The
+// span is still started + ended in-process (so there is no span leak); it is
+// simply not exported. Keeping the decision at export time avoids fighting the
+// OTel span lifecycle, which has no way to cancel an already-started span.
+type dropFilterExporter struct {
+	inner sdktrace.SpanExporter
+}
+
+func (d dropFilterExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	// Own slice, never spans[:0]: compacting in place writes into the batch
+	// processor's backing array, which the SpanExporter contract does not permit
+	// an exporter to mutate.
+	kept := make([]sdktrace.ReadOnlySpan, 0, len(spans))
+	for _, s := range spans {
+		drop := false
+		for _, a := range s.Attributes() {
+			if a.Key == attrDrop && a.Value.AsBool() {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			kept = append(kept, s)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	return d.inner.ExportSpans(ctx, kept)
+}
+
+func (d dropFilterExporter) Shutdown(ctx context.Context) error {
+	return d.inner.Shutdown(ctx)
+}
+
+// resourceScrubExporter rebuilds every span's resource under the service's
+// Policy before it reaches the wire. The provider's own resource cannot be
+// trusted: sdktrace.WithResource silently merges the configured resource over
+// resource.Environment() (OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME) with
+// no opt-out, which is exactly how the pod's k8s topology leaked onto
+// customer spans in production. Scrubbing at the export boundary holds
+// regardless of how the provider was built.
+//
+// It also removes the reserved ADR-061 mirror markers. This exporter is in the
+// chain whether or not a mirror is armed, so the markers never reach a project
+// even on an install with no mirror (the self-hosted default).
+//
+// tracetest is imported in production code deliberately: ReadOnlySpan is a
+// sealed interface, and SpanStub is the SDK's only public way to reconstruct
+// one with a chosen resource.
+type resourceScrubExporter struct {
+	inner  sdktrace.SpanExporter
+	policy Policy
+}
+
+func (r resourceScrubExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	scrubbed := make([]sdktrace.ReadOnlySpan, 0, len(spans))
+	for _, s := range spans {
+		stub := tracetest.SpanStubFromReadOnlySpan(s)
+		stub.Resource = r.policy.ApplyResource(s.Resource())
+		stub.Attributes = withoutMirrorMarkers(stub.Attributes)
+		scrubbed = append(scrubbed, stub.Snapshot())
+	}
+	return r.inner.ExportSpans(ctx, scrubbed)
+}
+
+func (r resourceScrubExporter) Shutdown(ctx context.Context) error {
+	return r.inner.Shutdown(ctx)
+}
+
+// EmitterOptions configures the Emitter.
+type EmitterOptions struct {
+	Registry     *Registry
+	BatchTimeout time.Duration
+	MaxQueueSize int
+	// Policy governs the customer-visible resource. The service supplies its
+	// own — including its langwatch.origin stamp, which is service identity
+	// this package must not decide. The zero value allows nothing and stamps
+	// nothing (fail closed).
+	Policy Policy
+	// Mirror, when set, turns on the ADR-061 mirror leg: a gen_ai span whose
+	// EndSpan carried a non-skip mirror tier is DUPLICATED into the mirror
+	// project (content gated by the tier), alongside the customer's own copy.
+	// The zero value leaves the leg off — the emitter behaves exactly as before.
+	Mirror MirrorConfig
+}
+
+// MirrorConfig points the emitter's mirror leg at the mirror project (ADR-061).
+// All three must be set for the leg to arm; any empty field disarms it.
+type MirrorConfig struct {
+	// Endpoint is the base URL of the LangWatch deployment holding the mirror
+	// project ("/v1/traces" is appended by the router).
+	Endpoint string
+	// Key is the mirror project's static API key, sent as a Bearer token.
+	Key string
+	// ProjectID is the mirror project's id — the value the mirror copy carries
+	// as langwatch.project_id so the router delivers it there.
+	ProjectID string
+}
+
+func (m MirrorConfig) armed() bool {
+	return m.Endpoint != "" && m.Key != "" && m.ProjectID != ""
+}
+
+// NewEmitter creates a customer trace bridge backed by a private TracerProvider.
+func NewEmitter(ctx context.Context, opts EmitterOptions) (*Emitter, error) {
+	if opts.Registry == nil {
+		opts.Registry = NewRegistry()
+	}
+
+	// The export chain, outermost first: drop probe spans, THEN (ADR-061)
+	// duplicate mirror-marked spans into the mirror project, THEN scrub the
+	// resource, THEN route by project id. Mirror sits inside drop (a dropped
+	// span is never mirrored) and outside scrub (both copies get the same
+	// resource treatment and reach the router together).
+	var inner sdktrace.SpanExporter = resourceScrubExporter{
+		inner: newRouterExporter(ctx, opts.Registry), policy: opts.Policy,
+	}
+	if opts.Mirror.armed() {
+		// Register the mirror project once so the router can deliver the mirror
+		// copy. A later per-request SetFromBundle for the mirror project's own
+		// traffic may re-point it at the project's own OTLP token — the same
+		// destination, an equally valid credential — so the collision is benign.
+		if err := opts.Registry.Set(opts.Mirror.ProjectID, opts.Mirror.Endpoint,
+			map[string]string{"Authorization": "Bearer " + opts.Mirror.Key}); err != nil {
+			return nil, fmt.Errorf("register mirror project: %w", err)
+		}
+		inner = mirrorExporter{inner: inner, mirrorProjectID: opts.Mirror.ProjectID}
+	}
+	router := dropFilterExporter{inner: inner}
+
+	batchTimeout := opts.BatchTimeout
+	if batchTimeout == 0 {
+		batchTimeout = 5 * time.Second
+	}
+	queueSize := opts.MaxQueueSize
+	if queueSize == 0 {
+		queueSize = 8192
+	}
+
+	// The provider resource is irrelevant to what customers see: every span is
+	// rebuilt with customerResource by resourceScrubExporter on its way out.
+	// otel-go's WithResource silently merges the given resource OVER
+	// resource.Environment() (OTEL_RESOURCE_ATTRIBUTES / OTEL_SERVICE_NAME)
+	// with no opt-out, so scrubbing at the export boundary — the last hop
+	// before customer data leaves the process — is the only construction that
+	// cannot leak, no matter what the pod environment holds.
+	// AlwaysSample: the gateway never drops customer spans regardless of
+	// the gateway's own sample ratio setting.
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithResource(resource.Empty()),
+		sdktrace.WithBatcher(router,
+			sdktrace.WithBatchTimeout(batchTimeout),
+			sdktrace.WithMaxQueueSize(queueSize),
+		),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+
+	svcCtx := contexts.MustGetServiceInfo(ctx)
+
+	return &Emitter{
+		tp:         tp,
+		tracer:     tp.Tracer(svcCtx.Service, trace.WithInstrumentationVersion(svcCtx.Version)),
+		propagator: propagation.TraceContext{},
+	}, nil
+}
+
+// BeginSpan starts a customer-facing span that nests under the customer's
+// inbound traceparent. It returns an enriched context (carrying the open span)
+// and a W3C traceparent string representing the new span.
+func (e *Emitter) BeginSpan(ctx context.Context, projectID string, reqType aitrace.RequestType) (context.Context, string) {
+	tp := TraceParent(ctx)
+	spanCtx := e.customerSpanContext(tp)
+
+	//nolint:spancheck // span lifecycle is split across BeginSpan/EndSpan via activeSpan context key by design.
+	spanCtx, span := e.tracer.Start(spanCtx, "gen_ai."+string(reqType),
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attrProjectID.String(projectID),
+			semconv.GenAIOperationNameKey.String(string(reqType)),
+		),
+	)
+
+	// Store the span in request context so EndSpan can retrieve it.
+	ctx = withActiveSpan(ctx, span)
+
+	// Format the span's context as a W3C traceparent for the response header.
+	sc := span.SpanContext()
+	traceparent := formatTraceparent(sc)
+
+	_ = spanCtx // span lifecycle managed via activeSpan context key
+	//nolint:spancheck // span ends in EndSpan, retrieved via activeSpan context key.
+	return ctx, traceparent
+}
+
+// EndSpan retrieves the span started by BeginSpan, sets final attributes, and
+// ends it. If no span is found in context this is a no-op.
+func (e *Emitter) EndSpan(ctx context.Context, params aitrace.Params) {
+	span := activeSpanFrom(ctx)
+	if span == nil {
+		return
+	}
+
+	// When the request failed upstream, the provider's HTTP status + error
+	// class are stamped so the trace renders as an error instead of silently
+	// dropping (previously the span was never ended on error).
+	isError := params.UpstreamStatusCode >= 400 || params.UpstreamErrorType != ""
+	span.SetAttributes(endSpanAttributes(ctx, params)...)
+
+	if input := extractInputMessages(params.RequestBody, params.RequestType); input != "" {
+		span.SetAttributes(attrInputMessages.String(input))
+	}
+	output := extractOutputMessages(params.ResponseBody, params.RequestType)
+	if output != "" {
+		span.SetAttributes(attrOutputMessages.String(output))
+	}
+
+	stampMirrorMarkers(ctx, span, params)
+
+	if isError {
+		span.SetStatus(codes.Error, params.UpstreamErrorType)
+	}
+
+	if isEmptyProbe(params, isError, output) || isOrphanLangyCall(ctx, params) {
+		span.SetAttributes(attrDrop.Bool(true))
+	}
+
+	span.End()
+}
+
+// isMirroredTier reports whether a mirror tier is a non-skip (Langy) tier.
+func isMirroredTier(tier string) bool {
+	return tier == mirrorTierContent || tier == mirrorTierStructural
+}
+
+// endSpanAttributes builds the final model, usage, routing and error
+// attributes of a gateway span.
+func endSpanAttributes(ctx context.Context, params aitrace.Params) []attribute.KeyValue {
+	// PromptTokens includes any cached tokens; the span reports the fresh,
+	// non-cached input separately from the cache-read/cache-write counts so the
+	// cost calc prices each bucket once. The spend record reports the same
+	// remainder from the same helper, which is what keeps a trace and its bill
+	// on one number.
+	freshInput := params.Usage.BillableInputTokens()
+
+	attrs := []attribute.KeyValue{
+		semconv.GenAIProviderNameKey.String(string(params.ProviderID)),
+		semconv.GenAIRequestModelKey.String(canonicalModelID(params.ProviderID, params.Model)),
+		semconv.GenAIUsageInputTokensKey.Int(freshInput),
+		semconv.GenAIUsageOutputTokensKey.Int(params.Usage.CompletionTokens),
+		attrTotalUsage.Int(params.Usage.TotalTokens),
+		attrCost.Int64(params.Usage.CostMicroUSD),
+	}
+	attrs = append(attrs, usageAttributes(params)...)
+	attrs = append(attrs, attributionAttributes(ctx, params)...)
+	if params.UpstreamStatusCode >= 400 {
+		attrs = append(attrs, semconv.HTTPResponseStatusCodeKey.Int(params.UpstreamStatusCode))
+	}
+	if params.UpstreamErrorType != "" {
+		attrs = append(attrs, semconv.ErrorTypeKey.String(params.UpstreamErrorType))
+	}
+	return attrs
+}
+
+// usageAttributes stamps every positive side-channel usage count.
+//
+// Audio and image tokens ride beside the text totals, not inside them, so the
+// cost pipeline can price them at their own rate: reporting them inside
+// gen_ai.usage.input_tokens priced an eight-times-dearer token at the text
+// rate, which is why a trace and its budget disagreed on every audio call.
+// The image count is what a per-image price is applied to. TTS reports the
+// characters synthesized and STT the seconds transcribed: character- and
+// duration-priced audio models have no token usage, so these attrs are what
+// the cost pipeline prices them from.
+func usageAttributes(params aitrace.Params) []attribute.KeyValue {
+	u := params.Usage
+	counts := []struct {
+		key   string
+		value int
+	}{
+		{AttrGenAIUsageInputAudioTokens, u.InputAudioTokens},
+		{AttrGenAIUsageOutputAudioTokens, u.OutputAudioTokens},
+		{AttrGenAIUsageInputImageTokens, u.InputImageTokens},
+		{AttrGenAIUsageOutputImageTokens, u.OutputImageTokens},
+		{AttrGenAIUsageImageCount, u.ImageCount},
+		{AttrGenAIUsageCacheRead, u.CacheReadTokens},
+		{AttrGenAIUsageCacheCreate, u.CacheCreationTokens},
+		{AttrGenAIUsageCacheCreate1h, u.CacheCreation1hTokens},
+		{AttrGenAIUsageInputChars, u.InputChars},
+	}
+	var attrs []attribute.KeyValue
+	for _, c := range counts {
+		if c.value > 0 {
+			attrs = append(attrs, attribute.Int(c.key, c.value))
+		}
+	}
+	if u.AudioSeconds > 0 {
+		attrs = append(attrs, attribute.Float64(AttrGenAIUsageAudioSeconds, u.AudioSeconds))
+	}
+	return attrs
+}
+
+// attributionAttributes stamps the non-empty routing and attribution ids.
+//
+//   - VK id + request id let the control plane's trace-processing pipeline
+//     identify gateway traces and fold idempotent budget debits into
+//     ClickHouse (specs/ai-gateway/_shared/contract.md §4.5).
+//   - The model provider id is the provider actually dispatched to; the trace
+//     fold matches it against each budget's provider filter.
+//   - The requested model is the caller's own spelling, before resolution.
+//   - The session id is the wrapped tool's own conversation id, so multi-turn
+//     gateway traces group under a stable thread.
+//   - The end-user id: the header-resolved id (middleware) wins, else the
+//     OpenAI `user` body param; attributed-user budget buckets key on it.
+//   - The request metadata is the caller's echo, validated at the edge and
+//     round-tripped verbatim into billing spend events as their join key.
+func attributionAttributes(ctx context.Context, params aitrace.Params) []attribute.KeyValue {
+	values := []struct {
+		key   string
+		value string
+	}{
+		{AttrRequestedModel, params.RequestedModel},
+		{AttrVirtualKeyID, params.VirtualKeyID},
+		{AttrGatewayReqID, params.GatewayRequestID},
+		{AttrModelProviderID, params.ModelProviderID},
+		{AttrGenAIConversationID, clientSessionID(ctx, params)},
+		{AttrEndUserID, endUserID(ctx, params)},
+		{AttrRequestMetadata, RequestMetadataJSON(ctx)},
+	}
+	var attrs []attribute.KeyValue
+	for _, v := range values {
+		if v.value != "" {
+			attrs = append(attrs, attribute.String(v.key, v.value))
+		}
+	}
+	// VK tags become the trace's labels: the ingestion pipeline maps the
+	// langwatch.labels attribute into metadata.labels, the field the Trace
+	// Explorer filters as "Label".
+	if len(params.VKTags) > 0 {
+		attrs = append(attrs, attribute.StringSlice(AttrLabels, params.VKTags))
+	}
+	return attrs
+}
+
+// stampMirrorMarkers sets the ADR-061 mirror markers: internal signaling for
+// mirrorExporter, stripped from every exported copy. Only stamped for a
+// non-skip tier (Langy VKs), so ordinary customer traffic never grows a
+// mirror copy.
+//
+// A Langy turn's model call is Langy's, not the customer's, and this span is
+// the first piece of the turn to reach the customer's project: the worker
+// spans and the langy.turn root only land when the turn ends, many seconds
+// later. Stamped with the gateway's own origin, the span folded a "gateway"
+// trace first, which marked a fresh project as integrated before the langy
+// root could rank the trace as Langy's. Naming the origin here, on the span,
+// settles the trace's origin from its first span. The resource keeps the
+// gateway's identity. A call whose turn withholds the mirror stays a Langy
+// call and only loses the markers that make the mirror copy.
+func stampMirrorMarkers(ctx context.Context, span trace.Span, params aitrace.Params) {
+	if !isMirroredTier(params.MirrorTier) {
+		return
+	}
+	span.SetAttributes(attribute.String(otelsetup.AttrLangWatchOrigin, OriginLangy))
+	if MirrorWithheld(ctx) {
+		return
+	}
+	span.SetAttributes(attrMirrorTier.String(params.MirrorTier))
+	if params.MirrorSourceOrgID != "" {
+		span.SetAttributes(attrMirrorSourceOrg.String(params.MirrorSourceOrgID))
+	}
+}
+
+// isEmptyProbe reports a zero-cost, no-output, successful CHAT-SHAPED span:
+// claude-code's internal probe calls (system-reminder / skills-list pings)
+// that return no usage and no assistant content, so they'd otherwise clutter
+// the trace list with empty $0 rows. Anything with output OR cost OR an error
+// is kept. The drop marker is honored by dropFilterExporter at export time.
+// PATH-A ONLY: Path B (claude-code direct OTLP) does not route through the
+// gateway, so its probes are not affected here.
+//
+// Gated to chat/messages because that is the only shape probes have.
+// Applying it to every type silently swallowed legitimate successful calls
+// that structurally never carry completion tokens or extracted output: TTS
+// spans (binary audio response), duration-priced STT spans (scribe reports
+// seconds, not tokens), and embeddings. Audio tokens count as output here
+// even though they are carried out of the completion total: an audio-native
+// model answers entirely in audio tokens, so reading the completion field
+// alone would drop a real answer as an empty probe.
+func isEmptyProbe(params aitrace.Params, isError bool, output string) bool {
+	answeredTokens := params.Usage.CompletionTokens + params.Usage.OutputAudioTokens
+	isProbeShape := params.RequestType == aitrace.RequestTypeChat ||
+		params.RequestType == aitrace.RequestTypeMessages
+	return !isError && isProbeShape && answeredTokens == 0 && params.Usage.CostMicroUSD == 0 && output == ""
+}
+
+// isOrphanLangyCall reports a Langy model call that arrived WITHOUT the
+// turn's traceparent (a relay gap, or a call outside any turn). Its span
+// would root a standalone trace that duplicates the turn in the customer's
+// trace explorer; the worker's own spans already show the call, so the copy
+// adds nothing but a second row with the same cost. It is dropped, errors
+// included: the turn span carries the failure. A Langy call is recognized by
+// its mirror tier, which the control plane resolves to non-skip ONLY for
+// Langy virtual keys, so ordinary gateway traffic (playground, customer API
+// keys) never carries one and its standalone root is untouched. attrDrop sits
+// outermost in the export chain, so the unjoinable span's mirror copy is
+// suppressed with it.
+func isOrphanLangyCall(ctx context.Context, params aitrace.Params) bool {
+	return isMirroredTier(params.MirrorTier) && TraceParent(ctx) == ""
+}
+
+// canonicalModelID reports the model under the platform's provider-prefixed
+// spelling ("anthropic/claude-haiku-4-5"): the id the selectors, the cost
+// registry, the playground and the NLP executions all carry. Model resolution
+// strips the prefix for provider routing, and stamping the stripped name made
+// the gateway the one surface reporting bare wire-names: a Langy turn's
+// Models filter listed the SAME model twice, once bare (this span), once
+// prefixed (the worker's own span). Resolution cuts the prefix at the first slash, so a model
+// with slashes of its own ("Qwen/Qwen2.5-32B-Instruct") still gets its
+// provider, as nlpgo does. A model whose provider is unknown (implicit
+// resolution never fills it) or that already starts with its provider is
+// reported as requested.
+func canonicalModelID(provider aitrace.ProviderID, model string) string {
+	if provider == "" || model == "" || strings.HasPrefix(model, string(provider)+"/") {
+		return model
+	}
+	return string(provider) + "/" + model
+}
+
+// Shutdown flushes pending spans to customer endpoints.
+func (e *Emitter) Shutdown(ctx context.Context) error {
+	if e.tp != nil {
+		return e.tp.Shutdown(ctx)
+	}
+	return nil
+}
+
+// customerSpanContext builds a context with the customer's trace/span IDs as
+// the parent, using a fresh context.Background() — never the request context.
+func (e *Emitter) customerSpanContext(traceparent string) context.Context {
+	if traceparent == "" {
+		// No customer traceparent — span will be a new root trace.
+		return context.Background()
+	}
+
+	// Use the W3C propagator to extract into a clean context.
+	carrier := propagation.MapCarrier{"traceparent": traceparent}
+	return e.propagator.Extract(context.Background(), carrier)
+}
+
+// formatTraceparent formats a SpanContext as a W3C traceparent header value.
+func formatTraceparent(sc trace.SpanContext) string {
+	if !sc.IsValid() {
+		return ""
+	}
+	flags := "00"
+	if sc.IsSampled() {
+		flags = "01"
+	}
+	return fmt.Sprintf("00-%s-%s-%s", sc.TraceID().String(), sc.SpanID().String(), flags)
+}
+
+// parseTraceparent extracts trace ID and parent span ID from a W3C traceparent
+// header: "00-<traceID>-<spanID>-<flags>"
+func parseTraceparent(tp string) (traceID []byte, spanID []byte) {
+	if tp == "" {
+		return nil, nil
+	}
+	parts := strings.Split(tp, "-")
+	if len(parts) < 4 {
+		return nil, nil
+	}
+	tid, err := hex.DecodeString(parts[1])
+	if err != nil || len(tid) != 16 {
+		return nil, nil
+	}
+	sid, err := hex.DecodeString(parts[2])
+	if err != nil || len(sid) != 8 {
+		return nil, nil
+	}
+	return tid, sid
+}
+
+// endUserID resolves the external end-user id for attribution: the
+// middleware-lifted header value wins (already sanitized), else the OpenAI
+// `user` body param on the request shapes that carry one. Both paths land in
+// SanitizeEndUserID so the stamped value is source-independent.
+func endUserID(ctx context.Context, params aitrace.Params) string {
+	if id := EndUserID(ctx); id != "" {
+		return id
+	}
+	switch params.RequestType {
+	case aitrace.RequestTypeChat, aitrace.RequestTypeEmbeddings,
+		aitrace.RequestTypeResponses, aitrace.RequestTypeSpeech,
+		aitrace.RequestTypeImageGeneration, aitrace.RequestTypeImageEdit:
+		return EndUserIDFromBody(params.RequestBody)
+	case aitrace.RequestTypeDecisions:
+		return DecisionsEndUserIDFromBody(params.RequestBody)
+	case aitrace.RequestTypeMessages, aitrace.RequestTypePassthrough,
+		aitrace.RequestTypeTranscription, aitrace.RequestTypeRealtimeSession:
+		// No OpenAI-wire `user` field to read on these shapes: the Anthropic
+		// messages body carries attribution under metadata.user_id, passthrough
+		// bodies are provider-shaped and forwarded verbatim, transcription
+		// arrives as multipart form data rather than JSON, and a realtime mint
+		// declares a socket rather than a completion. The image edit route is
+		// also multipart and still reads the field above, because its
+		// synthesized body states it.
+	}
+	return ""
+}
+
+// EndUserIDFromBody reads the OpenAI-wire top-level `user` string (the
+// abuse-attribution param, forwarded upstream unchanged) and sanitizes it.
+// Shared by the span emitter and the spend emitter so both attribute the
+// same request to the same id.
+func EndUserIDFromBody(body []byte) string {
+	if user := gjson.GetBytes(body, "user").String(); user != "" {
+		return SanitizeEndUserID(user)
+	}
+	return ""
+}
+
+// DecisionsEndUserIDFromBody reads the Decisions API's `safety_identifier`,
+// its end-user field, through the same sanitizer as EndUserIDFromBody.
+func DecisionsEndUserIDFromBody(body []byte) string {
+	if id := gjson.GetBytes(body, "safety_identifier").String(); id != "" {
+		return SanitizeEndUserID(id)
+	}
+	return ""
+}
+
+// clientSessionID resolves the wrapped tool's own session / conversation id.
+// Header first (stashed on the context by the gateway middleware: claude-code
+// X-Claude-Code-Session-Id, opencode X-Session-Affinity, codex Session-Id),
+// then a request-body fallback for the two tools that also echo it inline so
+// the id survives even if a future middleware change stops forwarding the
+// header. Empty when the tool sends no per-conversation id on the gateway wire
+// (gemini-cli, which only emits its conversation id via direct OTLP / Path B).
+func clientSessionID(ctx context.Context, params aitrace.Params) string {
+	if id := ClientSessionID(ctx); id != "" {
+		return id
+	}
+	switch params.RequestType {
+	case aitrace.RequestTypeMessages:
+		// claude-code: body.metadata.user_id is a JSON string carrying session_id.
+		if userID := gjson.GetBytes(params.RequestBody, "metadata.user_id").String(); userID != "" {
+			if sid := gjson.Get(userID, "session_id").String(); sid != "" {
+				return sid
+			}
+		}
+	case aitrace.RequestTypeResponses:
+		// codex: body.prompt_cache_key is the per-session cache key == session id.
+		if sid := gjson.GetBytes(params.RequestBody, "prompt_cache_key").String(); sid != "" {
+			return sid
+		}
+	case aitrace.RequestTypeChat, aitrace.RequestTypeEmbeddings, aitrace.RequestTypePassthrough,
+		aitrace.RequestTypeSpeech, aitrace.RequestTypeTranscription,
+		aitrace.RequestTypeImageGeneration, aitrace.RequestTypeImageEdit,
+		aitrace.RequestTypeRealtimeSession, aitrace.RequestTypeDecisions:
+		// No inline session id on these request shapes (audio and image bodies
+		// carry no session field at all, and a realtime mint's session id is
+		// the one the gateway itself hands back); the header lifted above
+		// (when present) is the only source.
+	}
+	return ""
+}
+
+// extractInputMessages returns the JSON-encoded messages array from the request body.
+// jsonString renders s as a JSON string literal. fmt's %q follows Go escape
+// rules, not JSON: a vertical tab becomes \v, which JSON parsers reject, so
+// every message array built in this file must marshal through encoding/json.
+func jsonString(s string) string {
+	b, _ := json.Marshal(s) // marshaling a string never fails
+	return string(b)
+}
+
+func extractInputMessages(body []byte, reqType aitrace.RequestType) string {
+	if len(body) == 0 {
+		return ""
+	}
+	switch reqType {
+	case aitrace.RequestTypeDecisions:
+		// Never captured: decision inputs are often private messages under
+		// review, so the span keeps model, usage and cost only.
+		return ""
+	case aitrace.RequestTypePassthrough:
+		// Gemini-native /v1beta bodies carry `contents` not `messages`.
+		// Convert to a synthetic chat-completion `messages` shape so the
+		// LangWatch trace viewer renders the conversation the same way
+		// it does for the OpenAI / Anthropic surfaces.
+		return geminiContentsAsMessages(body)
+	case aitrace.RequestTypeResponses:
+		// OpenAI Responses API (used by codex): `input` is either a
+		// string (single user turn) OR an array of messages. Both shapes
+		// are normalised to a chat-style messages array so downstream
+		// rendering matches the other surfaces.
+		return responsesInputAsMessages(body)
+	case aitrace.RequestTypeMessages:
+		// Anthropic /v1/messages: the system prompt lives in a
+		// top-level `system` field, not inside `messages`, so reading
+		// only `messages` drops it from the trace. Prepend it as a
+		// system message and keep the caller's messages verbatim.
+		return anthropicBodyAsMessages(body)
+	case aitrace.RequestTypeImageGeneration, aitrace.RequestTypeImageEdit:
+		// Images: the prompt is the meaningful input, rendered as a single
+		// user message so the trace viewer shows it like any chat. The source
+		// images of an edit stay out: they are megabytes of binary that no
+		// span should carry.
+		return firstFieldAsMessage(body, "user", "prompt")
+	case aitrace.RequestTypeSpeech:
+		// TTS: the synthesized text is the meaningful input. Rendered as a
+		// single user message so the trace viewer shows it like any chat.
+		// Two field names because two wires reach this shape: the OpenAI one
+		// calls it input, and ElevenLabs' own route calls it text.
+		return firstFieldAsMessage(body, "user", "input", "text")
+	default:
+		return gjson.GetBytes(body, "messages").Raw
+	}
+}
+
+// responsesInputAsMessages normalises OpenAI Responses API `input` into
+// a chat-style `[{role, content}, …]` array. The Responses API accepts
+// `input` as either a bare string ("hello") or as a typed message array
+// ([{role:"user", content:[{type:"input_text", text:"..."}]}]). Both
+// shapes land here and get flattened to the same renderable form so
+// codex traces show the same input cell as OpenAI chat / Anthropic.
+// The system prompt travels in a top-level `instructions` field, so it
+// is prepended as a system message; reading `input` alone drops it.
+func responsesInputAsMessages(body []byte) string {
+	var msgs []string
+	if instr := gjson.GetBytes(body, "instructions"); instr.Type == gjson.String && instr.String() != "" {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"system","content":%s}`, jsonString(instr.String())))
+	}
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() {
+		if len(msgs) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(msgs, ",") + "]"
+	}
+	if input.Type == gjson.String {
+		msgs = append(msgs, fmt.Sprintf(`{"role":"user","content":%s}`, jsonString(input.String())))
+		return "[" + strings.Join(msgs, ",") + "]"
+	}
+	if !input.IsArray() {
+		if len(msgs) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(msgs, ",") + "]"
+	}
+	input.ForEach(func(_, m gjson.Result) bool {
+		role := m.Get("role").String()
+		if role == "" {
+			role = "user"
+		}
+		content := m.Get("content")
+		if !content.Exists() {
+			return true
+		}
+		if content.Type == gjson.String {
+			msgs = append(msgs, fmt.Sprintf(`{"role":%s,"content":%s}`, jsonString(role), jsonString(content.String())))
+			return true
+		}
+		if !content.IsArray() {
+			return true
+		}
+		var text strings.Builder
+		content.ForEach(func(_, part gjson.Result) bool {
+			if t := part.Get("text"); t.Exists() {
+				if text.Len() > 0 {
+					text.WriteByte('\n')
+				}
+				text.WriteString(t.String())
+			}
+			return true
+		})
+		if text.Len() > 0 {
+			msgs = append(msgs, fmt.Sprintf(`{"role":%s,"content":%s}`, jsonString(role), jsonString(text.String())))
+		}
+		return true
+	})
+	if len(msgs) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(msgs, ",") + "]"
+}
+
+// anthropicBodyAsMessages renders an Anthropic /v1/messages request as
+// a chat-style messages array. When the top-level `system` field is
+// present it becomes a leading {"role":"system"} message; the caller's
+// `messages` array is kept verbatim either way.
+func anthropicBodyAsMessages(body []byte) string {
+	msgs := gjson.GetBytes(body, "messages")
+	sys := anthropicSystemText(body)
+	if sys == "" {
+		if !msgs.Exists() {
+			return ""
+		}
+		return msgs.Raw
+	}
+	sysMsg := fmt.Sprintf(`{"role":"system","content":%s}`, jsonString(sys))
+	if !msgs.Exists() || !msgs.IsArray() {
+		return "[" + sysMsg + "]"
+	}
+	inner := strings.TrimSpace(msgs.Raw)
+	inner = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(inner, "["), "]"))
+	if inner == "" {
+		return "[" + sysMsg + "]"
+	}
+	return "[" + sysMsg + "," + inner + "]"
+}
+
+// anthropicSystemText flattens Anthropic's top-level `system` field to
+// plain text. The wire accepts a bare string or an array of content
+// blocks (used when the caller sets cache_control on the prompt); the
+// blocks' `text` parts join with newlines, mirroring joinGeminiPartsText.
+func anthropicSystemText(body []byte) string {
+	sys := gjson.GetBytes(body, "system")
+	if !sys.Exists() {
+		return ""
+	}
+	if sys.Type == gjson.String {
+		return sys.String()
+	}
+	if !sys.IsArray() {
+		return ""
+	}
+	var out strings.Builder
+	sys.ForEach(func(_, blk gjson.Result) bool {
+		if t := blk.Get("text"); t.Exists() {
+			if out.Len() > 0 {
+				out.WriteByte('\n')
+			}
+			out.WriteString(t.String())
+		}
+		return true
+	})
+	return out.String()
+}
+
+// geminiContentsAsMessages flattens Gemini's `systemInstruction` +
+// `contents[]` into a chat-style `[{role, content}, …]` array. Gemini's
+// roles are "user" / "model"; the latter maps to "assistant" so the
+// downstream trace viewer doesn't render an unknown role badge.
+func geminiContentsAsMessages(body []byte) string {
+	var msgs []string
+	if sys := gjson.GetBytes(body, "systemInstruction"); sys.Exists() {
+		text := joinGeminiPartsText(sys.Get("parts"))
+		if text != "" {
+			msgs = append(msgs, fmt.Sprintf(`{"role":"system","content":%s}`, jsonString(text)))
+		}
+	}
+	contents := gjson.GetBytes(body, "contents")
+	if !contents.Exists() {
+		if len(msgs) == 0 {
+			return ""
+		}
+		return "[" + strings.Join(msgs, ",") + "]"
+	}
+	contents.ForEach(func(_, v gjson.Result) bool {
+		role := v.Get("role").String()
+		if role == "model" {
+			role = "assistant"
+		}
+		if role == "" {
+			role = "user"
+		}
+		text := joinGeminiPartsText(v.Get("parts"))
+		if text == "" {
+			return true
+		}
+		msgs = append(msgs, fmt.Sprintf(`{"role":%s,"content":%s}`, jsonString(role), jsonString(text)))
+		return true
+	})
+	if len(msgs) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(msgs, ",") + "]"
+}
+
+// joinGeminiPartsText concatenates all `parts[].text` fields, ignoring
+// non-text part types (functionCall / functionResponse / inlineData) for
+// the trace-viewer string rendering.
+func joinGeminiPartsText(parts gjson.Result) string {
+	if !parts.Exists() || !parts.IsArray() {
+		return ""
+	}
+	var out strings.Builder
+	parts.ForEach(func(_, p gjson.Result) bool {
+		if t := p.Get("text"); t.Exists() {
+			if out.Len() > 0 {
+				out.WriteByte('\n')
+			}
+			out.WriteString(t.String())
+		}
+		return true
+	})
+	return out.String()
+}
+
+// extractOutputMessages returns the JSON-encoded assistant message(s)
+// from the response body. The body may be either a single JSON object
+// (sync /v1/messages /v1/chat/completions /v1/responses /v1beta..:generateContent
+// response) or the concatenated SSE chunks from the streaming variant
+// (the trace stream wrapper accumulates every chunk into one buffer
+// then hands it here). For streamed bodies the JSON-first parse falls
+// through and the SSE walker reassembles the assistant text out of the
+// provider-native delta event shape.
+func extractOutputMessages(body []byte, reqType aitrace.RequestType) string {
+	if len(body) == 0 {
+		return ""
+	}
+	// The streamed-body extractors below walk the response via
+	// walkStreamEvents, which handles both wire framings the trace
+	// accumulator can hold: SSE `data: …` lines (raw-framed providers
+	// like Anthropic messages and Gemini passthrough) AND bare
+	// concatenated JSON objects (OpenAI Responses + Chat, whose Bifrost
+	// adapter decodes the upstream stream and re-emits objects the
+	// gateway only re-frames with `data:` at the client edge). Try the
+	// stream extractor first for every type, then fall back to the
+	// single-object JSON shape for non-streamed (sync) responses.
+	switch reqType {
+	case aitrace.RequestTypeDecisions:
+		// Never captured, for the same reason as the input.
+		return ""
+	case aitrace.RequestTypeChat:
+		return streamedOrSync(body, openAIChatOutputFromSSE, openAIChatOutputFromJSON)
+	case aitrace.RequestTypeMessages:
+		return streamedOrSync(body, anthropicOutputFromSSE, anthropicOutputFromJSON)
+	case aitrace.RequestTypeResponses:
+		return streamedOrSync(body, responsesOutputFromSSE, responsesOutputFromJSON)
+	case aitrace.RequestTypePassthrough:
+		return streamedOrSync(body, geminiOutputFromSSE, geminiOutputFromJSON)
+	case aitrace.RequestTypeTranscription:
+		// STT: the transcript is the meaningful output. It arrives as JSON
+		// with a text field, as SSE, or as the body itself for the text, srt
+		// and vtt formats.
+		if text := transcriptText(body); text != "" {
+			return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(text))
+		}
+		return ""
+	case aitrace.RequestTypeImageGeneration, aitrace.RequestTypeImageEdit:
+		// Images: the response body is base64 image data, megabytes of it,
+		// which must never land on a span. The model's rewritten prompt is
+		// the one renderable part, when the provider states one.
+		return firstFieldAsMessage(body, "assistant", "data.0.revised_prompt")
+	default:
+		// RequestTypeSpeech lands here on purpose: the response body is
+		// binary audio, which has no renderable message form.
+		return ""
+	}
+}
+
+// streamedOrSync tries the stream extractor first and falls back to the
+// single-object JSON shape of a non-streamed response.
+func streamedOrSync(body []byte, fromSSE, fromJSON func([]byte) string) string {
+	if out := fromSSE(body); out != "" {
+		return out
+	}
+	return fromJSON(body)
+}
+
+// firstFieldAsMessage renders the first non-empty string field among paths
+// as a one-message array spoken by role, or "" when none is set.
+func firstFieldAsMessage(body []byte, role string, paths ...string) string {
+	for _, path := range paths {
+		if v := gjson.GetBytes(body, path); v.Exists() && v.String() != "" {
+			return fmt.Sprintf(`[{"role":%q,"content":%s}]`, role, jsonString(v.String()))
+		}
+	}
+	return ""
+}
+
+// looksLikeSSE returns true if the body's leading non-whitespace bytes
+// match SSE framing rather than a JSON object. Both the streaming and
+// non-streaming paths land in extractOutputMessages with the same byte
+// slice; the dispatch has to detect which shape it is. SSE always opens
+// with one of `event:`, `data:`, or `:` (comment); JSON always opens
+// with `{` or `[`. Using a leading-prefix test (not a substring scan)
+// keeps the check cheap on multi-MB streamed buffers.
+func looksLikeSSE(body []byte) bool {
+	for i, b := range body {
+		switch b {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '{', '[':
+			return false
+		default:
+			rest := body[i:]
+			return strings.HasPrefix(string(rest), "event:") ||
+				strings.HasPrefix(string(rest), "data:") ||
+				strings.HasPrefix(string(rest), ":")
+		}
+	}
+	return false
+}
+
+// transcriptText reads the transcript out of a transcription response in any
+// of the shapes the route returns.
+func transcriptText(body []byte) string {
+	switch {
+	case looksLikeSSE(body):
+		return transcriptFromSSE(body)
+	case gjson.ValidBytes(body):
+		return gjson.GetBytes(body, "text").String()
+	default:
+		return strings.TrimSpace(string(body))
+	}
+}
+
+// transcriptFromSSE reads the transcript out of a streamed transcription:
+// the text on transcript.text.done, or the deltas joined when the stream was
+// cut before that event.
+func transcriptFromSSE(body []byte) string {
+	var deltas strings.Builder
+	final := ""
+	walkStreamEvents(body, func(data []byte) {
+		switch gjson.GetBytes(data, "type").String() {
+		case "transcript.text.done":
+			final = gjson.GetBytes(data, "text").String()
+		case "transcript.text.delta":
+			deltas.WriteString(gjson.GetBytes(data, "delta").String())
+		}
+	})
+	if final != "" {
+		return final
+	}
+	return deltas.String()
+}
+
+func openAIChatOutputFromJSON(body []byte) string {
+	choices := gjson.GetBytes(body, "choices")
+	if !choices.Exists() || !choices.IsArray() {
+		return ""
+	}
+	var msgs []string
+	choices.ForEach(func(_, v gjson.Result) bool {
+		msg := v.Get("message")
+		if msg.Exists() {
+			msgs = append(msgs, msg.Raw)
+		}
+		return true
+	})
+	if len(msgs) == 0 {
+		return ""
+	}
+	return "[" + strings.Join(msgs, ",") + "]"
+}
+
+// openAIChatOutputFromSSE walks OpenAI's chat-completion SSE deltas
+// (data: {"choices":[{"delta":{"content":"…"}}]}) and concatenates the
+// content fragments. Tool-call deltas are ignored for the human-readable
+// trace cell; we only need the assistant text.
+func openAIChatOutputFromSSE(body []byte) string {
+	var text strings.Builder
+	walkStreamEvents(body, func(data []byte) {
+		delta := gjson.GetBytes(data, "choices.0.delta.content")
+		if delta.Exists() && delta.Type == gjson.String {
+			text.WriteString(delta.String())
+		}
+	})
+	if text.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(text.String()))
+}
+
+func anthropicOutputFromJSON(body []byte) string {
+	content := gjson.GetBytes(body, "content")
+	if !content.Exists() || !content.IsArray() {
+		return ""
+	}
+	return `[{"role":"assistant","content":` + content.Raw + `}]`
+}
+
+// anthropicOutputFromSSE walks Anthropic's streaming wire (event: …
+// data: …\n\n) reassembling the assistant text. The shape is a flat
+// stream of content_block_start / content_block_delta(text_delta) /
+// content_block_stop / message_delta events; we only need the
+// text_delta payloads concatenated in order to recover what the
+// assistant said.
+func anthropicOutputFromSSE(body []byte) string {
+	var text strings.Builder
+	walkStreamEvents(body, func(data []byte) {
+		eventType := gjson.GetBytes(data, "type").String()
+		if eventType != "content_block_delta" {
+			return
+		}
+		deltaType := gjson.GetBytes(data, "delta.type").String()
+		if deltaType != "text_delta" {
+			return
+		}
+		if t := gjson.GetBytes(data, "delta.text"); t.Exists() {
+			text.WriteString(t.String())
+		}
+	})
+	if text.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":[{"type":"text","text":%s}]}]`, jsonString(text.String()))
+}
+
+func responsesOutputFromJSON(body []byte) string {
+	// OpenAI Responses API sync: `output` is an array of items, each a
+	// message whose `content` is an array of parts with `text` fields.
+	output := gjson.GetBytes(body, "output")
+	if !output.Exists() || !output.IsArray() {
+		return ""
+	}
+	var text strings.Builder
+	output.ForEach(func(_, item gjson.Result) bool {
+		if item.Get("type").String() != "message" {
+			return true
+		}
+		parts := item.Get("content")
+		if !parts.Exists() || !parts.IsArray() {
+			return true
+		}
+		parts.ForEach(func(_, p gjson.Result) bool {
+			if t := p.Get("text"); t.Exists() {
+				if text.Len() > 0 {
+					text.WriteByte('\n')
+				}
+				text.WriteString(t.String())
+			}
+			return true
+		})
+		return true
+	})
+	if text.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(text.String()))
+}
+
+// responsesOutputFromSSE walks Responses-API SSE
+// (response.output_text.delta events carry .delta string fragments;
+// response.completed carries the final .response.output array). Prefer
+// the completed snapshot if present, otherwise concatenate deltas.
+func responsesOutputFromSSE(body []byte) string {
+	var completedSnapshot string
+	var deltas strings.Builder
+	walkStreamEvents(body, func(data []byte) {
+		t := gjson.GetBytes(data, "type").String()
+		switch t {
+		case "response.completed":
+			if r := gjson.GetBytes(data, "response.output"); r.Exists() {
+				// Wrap in the same shape as sync responsesOutputFromJSON
+				// by re-running the JSON helper against a synthetic body.
+				synth := []byte(`{"output":` + r.Raw + `}`)
+				if out := responsesOutputFromJSON(synth); out != "" {
+					completedSnapshot = out
+				}
+			}
+		case "response.output_text.delta":
+			if d := gjson.GetBytes(data, "delta"); d.Exists() && d.Type == gjson.String {
+				deltas.WriteString(d.String())
+			}
+		}
+	})
+	if completedSnapshot != "" {
+		return completedSnapshot
+	}
+	if deltas.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(deltas.String()))
+}
+
+func geminiOutputFromJSON(body []byte) string {
+	text := joinGeminiPartsText(gjson.GetBytes(body, "candidates.0.content.parts"))
+	if text == "" {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(text))
+}
+
+// geminiOutputFromSSE concatenates candidates[0].content.parts[*].text
+// across every SSE data event. Each chunk carries a delta block whose
+// parts array holds the new tokens for that step; the full assistant
+// turn is the in-order concatenation across all chunks.
+func geminiOutputFromSSE(body []byte) string {
+	var text strings.Builder
+	walkStreamEvents(body, func(data []byte) {
+		parts := gjson.GetBytes(data, "candidates.0.content.parts")
+		if !parts.Exists() || !parts.IsArray() {
+			return
+		}
+		parts.ForEach(func(_, p gjson.Result) bool {
+			if t := p.Get("text"); t.Exists() {
+				text.WriteString(t.String())
+			}
+			return true
+		})
+	})
+	if text.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf(`[{"role":"assistant","content":%s}]`, jsonString(text.String()))
+}
+
+// walkStreamEvents yields each per-event JSON payload from a streamed
+// response body regardless of how the trace accumulator captured it.
+//
+// The accumulator (traceStreamWrapper) stores the pre-client-framing
+// chunks, and those arrive in two shapes depending on the provider's
+// Bifrost adapter:
+//   - SSE-framed `data: {…}\n\n` lines — raw-framed providers (Anthropic
+//     messages, Gemini passthrough) whose chunks already carry the wire
+//     framing, forwarded verbatim to the client.
+//   - bare concatenated `{…}{…}` JSON objects — OpenAI Responses + Chat,
+//     whose adapter decodes the upstream stream and re-emits objects; the
+//     gateway only wraps them in `data:` at the client edge (writeSSE), so
+//     the captured body has no framing at all.
+//
+// Dispatching on looksLikeSSE lets every per-event extractor consume both
+// shapes uniformly. Without this, a bare-object responses body fails the
+// SSE check, is handed to the single-object JSON extractor, which reads
+// only the first object (`response.created`, no `output`) and returns "".
+func walkStreamEvents(body []byte, fn func(data []byte)) {
+	if looksLikeSSE(body) {
+		walkSSEData(body, fn)
+		return
+	}
+	walkConcatenatedJSON(body, fn)
+}
+
+// walkConcatenatedJSON invokes fn with each top-level JSON value in a
+// buffer of adjacent (un-separated) objects, e.g. the bare event stream
+// `{"type":"response.created"}{"type":"response.output_text.delta"}…`.
+// json.Decoder reads successive values from one reader, so a stream of
+// concatenated objects decodes one at a time. A decode error (EOF, or a
+// final object truncated at the 8 MiB body cap) ends the walk best-effort
+// with whatever was parsed so far.
+func walkConcatenatedJSON(body []byte, fn func(obj []byte)) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	for {
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return
+		}
+		if len(raw) > 0 {
+			fn(raw)
+		}
+	}
+}
+
+// walkSSEData iterates every `data: …` line in the body, invoking fn
+// with the raw JSON bytes that follow `data: `. Lines starting with
+// `event:` / blank lines / `data: [DONE]` are skipped. Multi-line data
+// blocks (rare in LLM SSE) are joined with newlines per the SSE spec.
+func walkSSEData(body []byte, fn func(data []byte)) {
+	var buf strings.Builder
+	flush := func() {
+		if buf.Len() == 0 {
+			return
+		}
+		payload := strings.TrimSpace(buf.String())
+		buf.Reset()
+		if payload == "" || payload == "[DONE]" {
+			return
+		}
+		fn([]byte(payload))
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if line == "" || line == "\r" {
+			flush()
+			continue
+		}
+		if strings.HasPrefix(line, "data:") {
+			rest := strings.TrimPrefix(line, "data:")
+			rest = strings.TrimPrefix(rest, " ")
+			if buf.Len() > 0 {
+				buf.WriteByte('\n')
+			}
+			buf.WriteString(strings.TrimRight(rest, "\r"))
+			continue
+		}
+		// Any non-data line (event: / id: / retry: / comment) flushes
+		// the pending block so the next data line starts fresh.
+		flush()
+	}
+	flush()
+}

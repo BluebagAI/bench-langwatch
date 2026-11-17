@@ -1,0 +1,1250 @@
+// Managed-Bedrock dispatch over a customer-owned PrivateLink VPC endpoint.
+//
+// Bifrost hardcodes the public bedrock-runtime.<region>.amazonaws.com host and
+// signs SigV4 over it. Managed-Bedrock customers reach Bedrock through a
+// customer-owned VPCE whose IAM policy only authorizes bedrock:InvokeModel when
+// the request arrives via that endpoint, so the bifrost-signed call misses the
+// VPCE and gets a 403. For Bedrock credentials carrying a runtime endpoint we
+// dispatch through the official aws-sdk-go-v2 bedrockruntime client with
+// aws.Config.BaseEndpoint set to the VPCE: the SDK signs SigV4 over that host
+// and handles the eventstream for streaming. Every other Bedrock request and
+// every other provider stays on bifrost.
+package providers
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	brdocument "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
+	brtypes "github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+
+	"github.com/bytedance/sonic"
+	bfanthropic "github.com/maximhq/bifrost/core/providers/anthropic"
+	bfproviderutils "github.com/maximhq/bifrost/core/providers/utils"
+	bfschemas "github.com/maximhq/bifrost/core/schemas"
+
+	"github.com/langwatch/langwatch/pkg/herr"
+	"github.com/langwatch/langwatch/services/aigateway/domain"
+)
+
+// bedrockRuntimeEndpoint returns the customer's Bedrock runtime VPC endpoint
+// from the credential's Extra map. Two nlpgo paths name the key differently, so
+// we accept both. Returns "" when no endpoint is configured (the common
+// non-managed Bedrock case, which stays on bifrost). A generic base_url (a
+// stand-in such as llmsim) names the runtime host the same way.
+func bedrockRuntimeEndpoint(cred domain.Credential) string {
+	return credExtra(cred, "bedrock_runtime_endpoint", "aws_bedrock_runtime_endpoint", "base_url")
+}
+
+// credExtra reads the first non-empty value among the given Extra keys.
+// The two nlpgo entry points name AWS credential fields differently: the
+// dispatcheradapter (Studio / workflows) translates litellm_params to the
+// Bifrost-canonical access_key / secret_key / session_token / region, while
+// the gatewayproxy (/go/proxy) keeps the litellm aws_* names. Accepting both
+// keeps the VPCE dispatch correct regardless of which route built the cred.
+func credExtra(cred domain.Credential, keys ...string) string {
+	for _, k := range keys {
+		if v := cred.Extra[k]; v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// newBedrockRuntimeClient builds an aws-sdk-go-v2 bedrockruntime client pinned
+// to the VPC endpoint, using the static AWS credentials carried on the
+// credential's Extra map.
+func newBedrockRuntimeClient(cred domain.Credential, endpoint string) *bedrockruntime.Client {
+	cfg := aws.Config{
+		Region: bedrockRegion(cred),
+		Credentials: credentials.NewStaticCredentialsProvider(
+			credExtra(cred, "access_key", "aws_access_key_id"),
+			credExtra(cred, "secret_key", "aws_secret_access_key"),
+			credExtra(cred, "session_token", "aws_session_token"),
+		),
+		// endpoint already includes scheme, e.g. "https://vpce-....amazonaws.com".
+		BaseEndpoint: aws.String(endpoint),
+	}
+	return bedrockruntime.NewFromConfig(cfg)
+}
+
+// validateBedrockEndpoint guards the customer-supplied runtime endpoint before
+// it is used as the SDK BaseEndpoint. The endpoint reaches the gateway from
+// credential Extra (set per-request by the nlpgo adapters), so an unconstrained
+// value would let a request steer the gateway's outbound call at an arbitrary
+// host — an SSRF surface. Public Bedrock (bedrock-runtime.<region>.amazonaws.com)
+// and PrivateLink VPC endpoints (vpce-*.vpce.amazonaws.com) both live under the
+// AWS-controlled amazonaws.com domain, so the endpoint must be an http/https URL
+// whose host is within .amazonaws.com, or a host the operator put on the
+// customer-endpoint allowlist (ALLOWED_PROXY_HOSTS); anything else is rejected.
+func validateBedrockEndpoint(endpoint string, policy customerEndpointPolicy) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("bedrock vpce: invalid runtime endpoint %q: %w", endpoint, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("bedrock vpce: runtime endpoint scheme must be http or https, got %q", u.Scheme)
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return fmt.Errorf("bedrock vpce: runtime endpoint %q has no host", endpoint)
+	}
+	if _, allowlisted := policy.allowedHosts[normalizeEndpointHost(host)]; allowlisted {
+		return nil
+	}
+	if !strings.HasSuffix(host, ".amazonaws.com") {
+		return fmt.Errorf("bedrock vpce: runtime endpoint host %q is not an amazonaws.com endpoint", host)
+	}
+	// Plaintext http is only acceptable for PrivateLink VPC endpoints
+	// (vpce-*.vpce.amazonaws.com), which front the customer's NLB without TLS.
+	// Public Bedrock (bedrock-runtime.<region>.amazonaws.com) must stay https
+	// so prompts/responses are never downgraded onto plaintext transport.
+	if u.Scheme == "http" && !strings.HasSuffix(host, ".vpce.amazonaws.com") {
+		return fmt.Errorf("bedrock vpce: plaintext http is only allowed for PrivateLink (.vpce.amazonaws.com) hosts, got %q", host)
+	}
+	return nil
+}
+
+// bedrockVPCEEndpoint is the admission gate for the managed-Bedrock VPCE path.
+// It returns the runtime endpoint to dispatch through when the credential is a
+// Bedrock credential carrying a valid endpoint, "" to stay on the bifrost path,
+// or an error when an endpoint is present but fails validation (fail closed, so
+// an untrusted endpoint is rejected rather than silently routed elsewhere).
+func bedrockVPCEEndpoint(cred domain.Credential, policy customerEndpointPolicy) (string, error) {
+	if cred.ProviderID != domain.ProviderBedrock {
+		return "", nil
+	}
+	endpoint := bedrockRuntimeEndpoint(cred)
+	if endpoint == "" {
+		return "", nil
+	}
+	if err := validateBedrockEndpoint(endpoint, policy); err != nil {
+		return "", err
+	}
+	return endpoint, nil
+}
+
+// bedrockConverseEndpoint decides which Bedrock requests leave bifrost for
+// the SDK Converse lane, and the endpoint that lane dispatches through. A
+// credential carrying a runtime VPC endpoint always goes through it. Without
+// one, OpenAI models (gpt-5.x via the global.openai.* inference profiles,
+// gpt-oss) still take the Converse lane over the public regional runtime
+// host: bifrost sends every model id containing "gpt-" to the separate
+// bedrock-mantle endpoint, which needs the bedrock-mantle:CreateInference
+// permission, while a Bedrock credential is normally granted
+// bedrock:InvokeModel only. Converse serves the same models with that grant.
+// Returns "" to stay on bifrost.
+func bedrockConverseEndpoint(cred domain.Credential, model string, policy customerEndpointPolicy) (string, error) {
+	endpoint, err := bedrockVPCEEndpoint(cred, policy)
+	if err != nil || endpoint != "" {
+		return endpoint, err
+	}
+	if cred.ProviderID != domain.ProviderBedrock || !bedrockMantleModel(bedrockModelID(model, cred)) {
+		return "", nil
+	}
+	public := "https://bedrock-runtime." + bedrockRegion(cred) + ".amazonaws.com"
+	if err := validateBedrockEndpoint(public, policy); err != nil {
+		return "", err
+	}
+	return public, nil
+}
+
+// bedrockMantleModel mirrors bifrost's isMantleModel: the model ids bifrost
+// routes to the bedrock-mantle endpoint instead of bedrock-runtime.
+func bedrockMantleModel(model string) bool {
+	return strings.Contains(model, "gpt-")
+}
+
+// bedrockRegion is the credential's AWS region, us-east-1 when unset (the
+// same default bifrost applies).
+func bedrockRegion(cred domain.Credential) string {
+	if region := credExtra(cred, "region", "aws_region_name"); region != "" {
+		return region
+	}
+	return "us-east-1"
+}
+
+// bedrockModelID resolves the public model id to the provider-specific
+// deployment / inference-profile id when the credential carries a mapping.
+func bedrockModelID(model string, cred domain.Credential) string {
+	if v := cred.DeploymentMap[model]; v != "" {
+		return v
+	}
+	return model
+}
+
+// dispatchBedrockVPCE handles a non-streaming chat request through the official
+// Bedrock Converse API over the customer's VPC endpoint.
+func (r *BifrostRouter) dispatchBedrockVPCE(
+	ctx context.Context,
+	req *domain.Request,
+	provider bfschemas.ModelProvider,
+	model string,
+	cred domain.Credential,
+	endpoint string,
+) (*domain.Response, error) {
+	input, dropped, err := r.buildConverseInput(ctx, req, provider, model, cred)
+	if err != nil {
+		return nil, err
+	}
+
+	client := newBedrockRuntimeClient(cred, endpoint)
+	out, err := client.Converse(ctx, input)
+	if err != nil {
+		return nil, wrapBedrockError(ctx, err)
+	}
+
+	bfResp := converseOutputToBifrost(out, model)
+	body, _ := sonic.Marshal(bfResp)
+	body = injectParamsDropped(body, dropped)
+	return &domain.Response{
+		Body:       body,
+		StatusCode: 200,
+		Usage:      bedrockUsage(out.Usage),
+	}, nil
+}
+
+// dispatchBedrockVPCEStream handles a streaming chat request through the
+// official Bedrock ConverseStream API over the customer's VPC endpoint. Each
+// SDK event is mapped to an OpenAI-shaped chat.completion.chunk so the SSE the
+// gateway emits downstream is identical in shape to the bifrost streaming path.
+func (r *BifrostRouter) dispatchBedrockVPCEStream(
+	ctx context.Context,
+	req *domain.Request,
+	provider bfschemas.ModelProvider,
+	model string,
+	cred domain.Credential,
+	endpoint string,
+) (domain.StreamIterator, error) {
+	input, dropped, err := r.buildConverseInput(ctx, req, provider, model, cred)
+	if err != nil {
+		return nil, err
+	}
+
+	streamInput := converseStreamInput(input)
+
+	client := newBedrockRuntimeClient(cred, endpoint)
+	out, err := client.ConverseStream(ctx, streamInput)
+	if err != nil {
+		return nil, wrapBedrockError(ctx, err)
+	}
+
+	return &bedrockStreamIterator{
+		ctx:           ctx,
+		stream:        out.GetStream(),
+		model:         model,
+		paramsDropped: dropped,
+	}, nil
+}
+
+// converseStreamInput carries a built Converse request onto the streaming
+// API, additional model fields included: they hold the thinking block and the
+// structured-output schema.
+func converseStreamInput(input *bedrockruntime.ConverseInput) *bedrockruntime.ConverseStreamInput {
+	return &bedrockruntime.ConverseStreamInput{
+		ModelId:                      input.ModelId,
+		Messages:                     input.Messages,
+		System:                       input.System,
+		InferenceConfig:              input.InferenceConfig,
+		ToolConfig:                   input.ToolConfig,
+		AdditionalModelRequestFields: input.AdditionalModelRequestFields,
+	}
+}
+
+// buildConverseInput reuses the gateway's existing OpenAI->Bifrost parser and
+// then maps the normalized BifrostChatRequest to a Bedrock ConverseInput.
+func (r *BifrostRouter) buildConverseInput(
+	ctx context.Context,
+	req *domain.Request,
+	provider bfschemas.ModelProvider,
+	model string,
+	cred domain.Credential,
+) (*bedrockruntime.ConverseInput, []string, error) {
+	bfReq, dispatchCtx, err := buildChatRequest(ctx, req, provider, model)
+	if err != nil {
+		return nil, nil, classifyRequestBuildError(ctx, err)
+	}
+	dropped := paramsDroppedFrom(dispatchCtx)
+	stampParamsDropped(ctx, dropped)
+
+	system, messages, err := mapBedrockMessages(bfReq.Input)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// The family checks read the id the request is dispatched as, the same
+	// one bedrockConverseEndpoint routed on, so a deployment alias of an
+	// OpenAI model maps like the model itself.
+	additional, err := mapBedrockAdditionalFields(ctx, bfReq.Params, bedrockModelID(model, cred))
+	if err != nil {
+		return nil, nil, err
+	}
+	input := &bedrockruntime.ConverseInput{
+		ModelId:                      aws.String(bedrockModelID(model, cred)),
+		Messages:                     messages,
+		System:                       system,
+		InferenceConfig:              mapBedrockInferenceConfig(bfReq.Params),
+		ToolConfig:                   mapBedrockToolConfig(bfReq.Params),
+		AdditionalModelRequestFields: additional,
+	}
+	return input, dropped, nil
+}
+
+// mapBedrockAdditionalFields maps the neutral params the Converse API only
+// accepts through additionalModelRequestFields: extended thinking
+// (reasoning_effort / reasoning.max_tokens) and json_schema structured
+// output. Wire shapes mirror bifrost's own bedrock translator exactly
+// (providers/bedrock/utils.go), and the budget math reuses bifrost's
+// helpers so the two bedrock paths cannot drift apart. Returns nil when
+// neither feature is requested.
+//
+// One deliberate divergence from bifrost: when the caller sent no output
+// cap, the thinking budget is computed against the model's default
+// maximum WITHOUT writing that default into inferenceConfig.maxTokens.
+// Converse applies the same default on its own, so forcing the field adds
+// nothing except an output cap the caller never asked for.
+func mapBedrockAdditionalFields(ctx context.Context, params *bfschemas.ChatParameters, model string) (brdocument.Interface, error) {
+	if params == nil {
+		return nil, nil
+	}
+	fields := map[string]any{}
+
+	mapper := bedrockFieldMapper{fields: fields, params: params, model: model}
+	if err := mapper.applyReasoning(ctx); err != nil {
+		return nil, err
+	}
+	if err := mapper.applyResponseFormat(ctx); err != nil {
+		return nil, err
+	}
+
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	return brdocument.NewLazyDocument(fields), nil
+}
+
+// bedrockFieldMapper builds one request's additionalModelRequestFields.
+type bedrockFieldMapper struct {
+	fields map[string]any
+	params *bfschemas.ChatParameters
+	model  string
+}
+
+// applyReasoning writes the thinking block for a reasoning request.
+// Non-Anthropic families reach here only if the parameter policy allowed
+// them (Nova); this endpoint serves Anthropic inference profiles, so keep
+// the honest refusal rather than guessing a mapping bifrost implements
+// differently per family.
+func (m bedrockFieldMapper) applyReasoning(ctx context.Context) error {
+	if m.params.Reasoning == nil {
+		return nil
+	}
+	if !bfschemas.IsAnthropicModel(m.model) {
+		return herr.New(ctx, domain.ErrUnsupportedParameter, herr.M{
+			"message": fmt.Sprintf("refusing to drop 'reasoning_effort' for bedrock/%s: the managed Bedrock endpoint maps reasoning for Anthropic models only. Remove it, or use an Anthropic model", m.model),
+			"fault":   "customer",
+		})
+	}
+	if m.params.Reasoning.MaxTokens != nil {
+		return m.applyExplicitThinkingBudget(ctx)
+	}
+	return m.applyThinkingEffort(ctx)
+}
+
+// applyExplicitThinkingBudget honors a caller-sent reasoning.max_tokens.
+// The sentinel -1 means "the minimum the provider accepts".
+func (m bedrockFieldMapper) applyExplicitThinkingBudget(ctx context.Context) error {
+	budget := *m.params.Reasoning.MaxTokens
+	if budget == -1 {
+		budget = anthropicMinimumThinkingBudget
+	}
+	if budget < anthropicMinimumThinkingBudget {
+		return herr.New(ctx, domain.ErrBadRequest, herr.M{
+			"reason": fmt.Sprintf("reasoning.max_tokens must be >= %d for anthropic", anthropicMinimumThinkingBudget),
+		})
+	}
+	m.fields["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	return nil
+}
+
+// applyThinkingEffort derives the thinking budget from reasoning_effort:
+// adaptive-thinking models take the effort natively, the rest get a budget
+// computed against the caller's output cap.
+func (m bedrockFieldMapper) applyThinkingEffort(ctx context.Context) error {
+	effort := ""
+	if m.params.Reasoning.Effort != nil {
+		effort = *m.params.Reasoning.Effort
+	}
+	if effort == "" || effort == "none" {
+		return nil
+	}
+	if bfanthropic.SupportsAdaptiveThinking(m.model) {
+		m.fields["thinking"] = map[string]any{"type": "adaptive"}
+		setOutputConfig(m.fields, "effort", bfanthropic.MapBifrostEffortToAnthropic(effort))
+		return nil
+	}
+	maxTokens := bfproviderutils.GetMaxOutputTokensOrDefault(m.model, bedrockDefaultCompletionMaxTokens)
+	if m.params.MaxCompletionTokens != nil {
+		maxTokens = *m.params.MaxCompletionTokens
+	}
+	budget, err := bfproviderutils.GetBudgetTokensFromReasoningEffort(effort, anthropicMinimumThinkingBudget, maxTokens)
+	if err != nil {
+		return herr.New(ctx, domain.ErrBadRequest, herr.M{"reason": err.Error()})
+	}
+	m.fields["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	return nil
+}
+
+// applyResponseFormat writes the output_config block for a json_schema
+// request, refusing the families this endpoint cannot enforce it for.
+func (m bedrockFieldMapper) applyResponseFormat(ctx context.Context) error {
+	schema, name, ok := jsonSchemaFromResponseFormat(m.params.ResponseFormat)
+	if !ok {
+		return nil
+	}
+	if bedrockOpenAIStructuredOutputModel(m.model) {
+		// OpenAI models on Converse take the Responses API shape,
+		// text.format. The chat-completions response_format is ignored by
+		// gpt-5.5 and refused by gpt-6 as an unknown parameter.
+		if name == "" {
+			name = "response"
+		}
+		format := map[string]any{"type": "json_schema", "name": name, "schema": schema}
+		if strict, isBool := jsonSchemaStrict(m.params.ResponseFormat); isBool {
+			format["strict"] = strict
+		}
+		m.fields["text"] = map[string]any{"format": format}
+		return nil
+	}
+	if !bfschemas.IsAnthropicModel(m.model) {
+		return herr.New(ctx, domain.ErrUnsupportedParameter, herr.M{
+			"message": fmt.Sprintf("refusing to drop 'response_format' for bedrock/%s: this model does not enforce a json_schema on Bedrock (Anthropic models and OpenAI GPT-5 and later do; gpt-oss does not). Remove it, or use one of those models", m.model),
+			"fault":   "customer",
+		})
+	}
+	// Anthropic's output_config carries type + schema only, same as bifrost,
+	// so the schema name the caller sent has nowhere to go.
+	setOutputConfig(m.fields, "format", map[string]any{"type": "json_schema", "schema": schema})
+	return nil
+}
+
+// bedrockOpenAIStructuredOutputModel reports whether an OpenAI model on
+// Bedrock enforces a json_schema sent as text.format. gpt-oss answers it
+// with free text around the JSON, so it is not one of them.
+func bedrockOpenAIStructuredOutputModel(model string) bool {
+	return bedrockMantleModel(model) && !strings.Contains(model, "gpt-oss")
+}
+
+// jsonSchemaStrict reads json_schema.strict when the caller set it.
+func jsonSchemaStrict(rf *interface{}) (bool, bool) {
+	js, isMap := responseFormatJSONSchema(rf)
+	if !isMap {
+		return false, false
+	}
+	strict, isBool := js["strict"].(bool)
+	return strict, isBool
+}
+
+// anthropicMinimumThinkingBudget and bedrockDefaultCompletionMaxTokens
+// mirror bifrost's anthropic.MinimumReasoningMaxTokens (1024) and
+// bedrock.DefaultCompletionMaxTokens (4096); the constants are not
+// exported in a shared place, so they are pinned here and by the policy
+// tests.
+const (
+	anthropicMinimumThinkingBudget    = 1024
+	bedrockDefaultCompletionMaxTokens = 4096
+)
+
+// setOutputConfig upserts a key under additionalModelRequestFields'
+// output_config object, preserving siblings (effort and format coexist on
+// adaptive-thinking structured-output requests).
+func setOutputConfig(fields map[string]any, key string, value any) {
+	cfg, _ := fields["output_config"].(map[string]any)
+	if cfg == nil {
+		cfg = map[string]any{}
+	}
+	cfg[key] = value
+	fields["output_config"] = cfg
+}
+
+// jsonSchemaFromResponseFormat extracts the schema object (and name) from
+// an OpenAI response_format of type json_schema. Returns ok false for
+// absent response_format or other types (json_object never reaches this
+// mapper: the parameter policy refuses it on the bedrock lane).
+func jsonSchemaFromResponseFormat(rf *interface{}) (schema any, name string, ok bool) {
+	js, isMap := responseFormatJSONSchema(rf)
+	if !isMap {
+		return nil, "", false
+	}
+	name, _ = js["name"].(string)
+	schema, hasSchema := js["schema"]
+	if !hasSchema {
+		return nil, "", false
+	}
+	return schema, name, true
+}
+
+// responseFormatJSONSchema returns the json_schema object of a json_schema
+// response format.
+func responseFormatJSONSchema(rf *interface{}) (map[string]interface{}, bool) {
+	if rf == nil {
+		return nil, false
+	}
+	m, isMap := (*rf).(map[string]interface{})
+	if !isMap || m["type"] != "json_schema" {
+		return nil, false
+	}
+	js, isMap := m["json_schema"].(map[string]interface{})
+	return js, isMap
+}
+
+// mapBedrockMessages splits the neutral Bifrost message list into Bedrock's
+// system prompt blocks and conversation messages.
+//
+// Converse only allows user and assistant roles, and it requires them to
+// alternate. A tool-role message becomes a ToolResultBlock on the user side,
+// and every block that lands on the same side as the message before it joins
+// that message: the results of parallel tool calls answer one assistant turn,
+// so they must sit in one user message (Converse rejects the turn otherwise,
+// "Expected toolResult blocks at messages.N.content"), and user text sent
+// right after them joins that message too. System and developer messages are
+// hoisted to the system prompt wherever they appear, and a message with no
+// content is dropped, which can leave two same-side messages adjacent; they
+// merge the same way.
+func mapBedrockMessages(in []bfschemas.ChatMessage) ([]brtypes.SystemContentBlock, []brtypes.Message, error) {
+	var system []brtypes.SystemContentBlock
+	var messages []brtypes.Message
+
+	for _, m := range in {
+		if m.Role == bfschemas.ChatMessageRoleSystem || m.Role == bfschemas.ChatMessageRoleDeveloper {
+			for _, text := range messageTexts(m) {
+				system = append(system, &brtypes.SystemContentBlockMemberText{Value: text})
+			}
+			continue
+		}
+		role, content, err := converseTurn(m)
+		if err != nil {
+			return nil, nil, err
+		}
+		messages = appendConverseTurn(messages, role, content)
+	}
+
+	return system, messages, nil
+}
+
+// converseTurn maps one non-system message to the Converse side it lands on
+// and the content blocks it carries there.
+func converseTurn(m bfschemas.ChatMessage) (brtypes.ConversationRole, []brtypes.ContentBlock, error) {
+	switch m.Role {
+	case bfschemas.ChatMessageRoleTool:
+		return brtypes.ConversationRoleUser, toolResultBlocks(m), nil
+	case bfschemas.ChatMessageRoleUser:
+		return brtypes.ConversationRoleUser, userContentBlocks(m), nil
+	case bfschemas.ChatMessageRoleAssistant:
+		return brtypes.ConversationRoleAssistant, assistantContentBlocks(m), nil
+	default:
+		return "", nil, fmt.Errorf("unsupported chat message role %q", m.Role)
+	}
+}
+
+// appendConverseTurn adds content to the conversation, joining the last
+// message when it is on the same side so the roles keep alternating. Empty
+// content adds nothing.
+func appendConverseTurn(messages []brtypes.Message, role brtypes.ConversationRole, content []brtypes.ContentBlock) []brtypes.Message {
+	if len(content) == 0 {
+		return messages
+	}
+	if last := len(messages) - 1; last >= 0 && messages[last].Role == role {
+		messages[last].Content = append(messages[last].Content, content...)
+		return messages
+	}
+	return append(messages, brtypes.Message{Role: role, Content: content})
+}
+
+// messageTexts returns the plain-text fragments of a message content
+// (the ContentStr scalar or the text of each text content block).
+func messageTexts(m bfschemas.ChatMessage) []string {
+	if m.Content == nil {
+		return nil
+	}
+	if m.Content.ContentStr != nil {
+		s := *m.Content.ContentStr
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	}
+	var out []string
+	for _, b := range m.Content.ContentBlocks {
+		if b.Type == bfschemas.ChatContentBlockTypeText && b.Text != nil && *b.Text != "" {
+			out = append(out, *b.Text)
+		}
+	}
+	return out
+}
+
+// userContentBlocks maps a user message's text into Bedrock content blocks.
+func userContentBlocks(m bfschemas.ChatMessage) []brtypes.ContentBlock {
+	var blocks []brtypes.ContentBlock
+	for _, text := range messageTexts(m) {
+		blocks = append(blocks, &brtypes.ContentBlockMemberText{Value: text})
+	}
+	return blocks
+}
+
+// assistantContentBlocks maps an assistant message's text + tool calls into
+// Bedrock content blocks. Tool call arguments (a JSON string) are parsed into a
+// document so Bedrock receives structured tool input.
+func assistantContentBlocks(m bfschemas.ChatMessage) []brtypes.ContentBlock {
+	var blocks []brtypes.ContentBlock
+	for _, text := range messageTexts(m) {
+		blocks = append(blocks, &brtypes.ContentBlockMemberText{Value: text})
+	}
+	if m.ChatAssistantMessage == nil {
+		return blocks
+	}
+	for _, tc := range m.ToolCalls {
+		use := brtypes.ToolUseBlock{
+			Input: brdocument.NewLazyDocument(parseToolArguments(tc.Function.Arguments)),
+		}
+		if tc.ID != nil {
+			use.ToolUseId = tc.ID
+		}
+		if tc.Function.Name != nil {
+			use.Name = tc.Function.Name
+		}
+		blocks = append(blocks, &brtypes.ContentBlockMemberToolUse{Value: use})
+	}
+	return blocks
+}
+
+// toolResultBlocks maps a tool-role message into a Bedrock ToolResult content
+// block. The tool call id is read from the embedded ChatToolMessage and the
+// result text from the message content.
+func toolResultBlocks(m bfschemas.ChatMessage) []brtypes.ContentBlock {
+	var toolUseID string
+	if m.ChatToolMessage != nil && m.ToolCallID != nil {
+		toolUseID = *m.ToolCallID
+	}
+	var resultContent []brtypes.ToolResultContentBlock
+	for _, text := range messageTexts(m) {
+		resultContent = append(resultContent, &brtypes.ToolResultContentBlockMemberText{Value: text})
+	}
+	if len(resultContent) == 0 && toolUseID == "" {
+		return nil
+	}
+	if len(resultContent) == 0 {
+		resultContent = []brtypes.ToolResultContentBlock{&brtypes.ToolResultContentBlockMemberText{Value: ""}}
+	}
+	return []brtypes.ContentBlock{
+		&brtypes.ContentBlockMemberToolResult{
+			Value: brtypes.ToolResultBlock{
+				ToolUseId: aws.String(toolUseID),
+				Content:   resultContent,
+			},
+		},
+	}
+}
+
+// mapBedrockInferenceConfig maps the neutral chat params to Bedrock's
+// InferenceConfiguration. Returns nil when no inference knobs are set.
+func mapBedrockInferenceConfig(params *bfschemas.ChatParameters) *brtypes.InferenceConfiguration {
+	if params == nil {
+		return nil
+	}
+	cfg := &brtypes.InferenceConfiguration{}
+	set := false
+	if params.MaxCompletionTokens != nil {
+		cfg.MaxTokens = int32Ptr(*params.MaxCompletionTokens)
+		set = true
+	}
+	if params.Temperature != nil {
+		cfg.Temperature = float32Ptr(*params.Temperature)
+		set = true
+	}
+	if params.TopP != nil {
+		cfg.TopP = float32Ptr(*params.TopP)
+		set = true
+	}
+	if len(params.Stop) > 0 {
+		cfg.StopSequences = params.Stop
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return cfg
+}
+
+// mapBedrockToolConfig maps the neutral tool list to Bedrock's
+// ToolConfiguration. Returns nil when no tools are present.
+//
+// Forwards the caller's tool_choice directive to Bedrock when set. Without
+// this, customer 2026-05-31 dogfood: nlpgo translates response_format to
+// tools + tool_choice(forced) for structured outputs on bedrock+anthropic
+// (executor.go shouldUseToolUseForStructuredOutput); the public-bedrock
+// path through bifrost honors that, but the VPCE intercept here dropped
+// tool_choice silently. Model received the synthetic lw_so_* tool with no
+// pin → free to ignore it and reply with text → engine prose-fallback
+// dumped the entire reasoning into the first declared output field.
+func mapBedrockToolConfig(params *bfschemas.ChatParameters) *brtypes.ToolConfiguration {
+	if params == nil || len(params.Tools) == 0 {
+		return nil
+	}
+	var tools []brtypes.Tool
+	for i := range params.Tools {
+		t := &params.Tools[i]
+		if t.Function == nil {
+			continue
+		}
+		spec := brtypes.ToolSpecification{
+			Name: aws.String(t.Function.Name),
+			InputSchema: &brtypes.ToolInputSchemaMemberJson{
+				Value: brdocument.NewLazyDocument(toolSchemaDocument(t.Function.Parameters)),
+			},
+		}
+		if t.Function.Description != nil {
+			spec.Description = t.Function.Description
+		}
+		tools = append(tools, &brtypes.ToolMemberToolSpec{Value: spec})
+	}
+	if len(tools) == 0 {
+		return nil
+	}
+	return &brtypes.ToolConfiguration{
+		Tools:      tools,
+		ToolChoice: mapBedrockToolChoice(params.ToolChoice),
+	}
+}
+
+// mapBedrockToolChoice maps the OpenAI/bifrost-shape tool_choice union to
+// the Bedrock Converse ToolChoice union. Returns nil when no choice was
+// specified (bedrock defaults to auto). Specific-tool pins are required
+// for the structured-output rewrite path (forced lw_so_<schema> call);
+// only Anthropic Claude 3+ and Amazon Nova models honor specific-tool
+// per the bedrockruntime SDK docs, other model families silently fall
+// back to auto.
+func mapBedrockToolChoice(tc *bfschemas.ChatToolChoice) brtypes.ToolChoice {
+	if tc == nil {
+		return nil
+	}
+	if tc.ChatToolChoiceStr != nil {
+		switch strings.ToLower(*tc.ChatToolChoiceStr) {
+		case "any", "required":
+			return &brtypes.ToolChoiceMemberAny{}
+		case "auto":
+			return &brtypes.ToolChoiceMemberAuto{}
+		default:
+			// "none" or anything unrecognized: don't pin. Bedrock's
+			// "none" semantics aren't a first-class Converse value; the
+			// caller can omit tools entirely to achieve the same.
+			return nil
+		}
+	}
+	if tc.ChatToolChoiceStruct == nil {
+		return nil
+	}
+	s := tc.ChatToolChoiceStruct
+	switch s.Type {
+	case bfschemas.ChatToolChoiceTypeAny, bfschemas.ChatToolChoiceTypeRequired:
+		return &brtypes.ToolChoiceMemberAny{}
+	case bfschemas.ChatToolChoiceTypeAuto:
+		return &brtypes.ToolChoiceMemberAuto{}
+	case bfschemas.ChatToolChoiceTypeFunction:
+		if s.Function == nil || s.Function.Name == "" {
+			return nil
+		}
+		return &brtypes.ToolChoiceMemberTool{
+			Value: brtypes.SpecificToolChoice{Name: aws.String(s.Function.Name)},
+		}
+	default:
+		return nil
+	}
+}
+
+// converseOutputToBifrost maps a Bedrock Converse response back to the
+// OpenAI-shaped BifrostChatResponse the gateway emits downstream.
+func converseOutputToBifrost(out *bedrockruntime.ConverseOutput, model string) *bfschemas.BifrostChatResponse {
+	var text string
+	var toolCalls []bfschemas.ChatAssistantMessageToolCall
+
+	if msg, ok := out.Output.(*brtypes.ConverseOutputMemberMessage); ok {
+		var idx uint16
+		for _, block := range msg.Value.Content {
+			switch b := block.(type) {
+			case *brtypes.ContentBlockMemberText:
+				text += b.Value
+			case *brtypes.ContentBlockMemberToolUse:
+				toolCalls = append(toolCalls, bedrockToolUseToToolCall(b.Value, idx))
+				idx++
+			}
+		}
+	}
+
+	assistant := &bfschemas.ChatAssistantMessage{}
+	if len(toolCalls) > 0 {
+		assistant.ToolCalls = toolCalls
+	}
+
+	finishReason := mapStopReason(out.StopReason)
+	return &bfschemas.BifrostChatResponse{
+		ID:      "",
+		Object:  "chat.completion",
+		Model:   model,
+		Created: int(time.Now().Unix()),
+		Choices: []bfschemas.BifrostResponseChoice{
+			{
+				Index:        0,
+				FinishReason: &finishReason,
+				ChatNonStreamResponseChoice: &bfschemas.ChatNonStreamResponseChoice{
+					Message: &bfschemas.ChatMessage{
+						Role: bfschemas.ChatMessageRoleAssistant,
+						Content: &bfschemas.ChatMessageContent{
+							ContentStr: &text,
+						},
+						ChatAssistantMessage: assistant,
+					},
+				},
+			},
+		},
+		Usage: bedrockLLMUsage(out.Usage),
+	}
+}
+
+// bedrockToolUseToToolCall maps a Bedrock ToolUseBlock to an OpenAI-shaped tool
+// call. The structured input document is re-serialized to a JSON arguments
+// string, matching OpenAI's tool-call wire format.
+func bedrockToolUseToToolCall(use brtypes.ToolUseBlock, index uint16) bfschemas.ChatAssistantMessageToolCall {
+	toolType := "function"
+	call := bfschemas.ChatAssistantMessageToolCall{
+		Index: index,
+		Type:  &toolType,
+		ID:    use.ToolUseId,
+		Function: bfschemas.ChatAssistantMessageToolCallFunction{
+			Name:      use.Name,
+			Arguments: documentToJSONString(use.Input),
+		},
+	}
+	return call
+}
+
+// mapStopReason maps Bedrock stop reasons onto OpenAI finish reasons.
+func mapStopReason(reason brtypes.StopReason) string {
+	switch reason {
+	case brtypes.StopReasonToolUse:
+		return "tool_calls"
+	case brtypes.StopReasonMaxTokens:
+		return "length"
+	case brtypes.StopReasonEndTurn, brtypes.StopReasonStopSequence:
+		return "stop"
+	default:
+		return "stop"
+	}
+}
+
+// bedrockUsage maps Bedrock TokenUsage to the gateway's neutral usage struct.
+func bedrockUsage(usage *brtypes.TokenUsage) domain.Usage {
+	if usage == nil {
+		return domain.Usage{}
+	}
+	return domain.Usage{
+		PromptTokens:     int32Value(usage.InputTokens),
+		CompletionTokens: int32Value(usage.OutputTokens),
+		TotalTokens:      int32Value(usage.TotalTokens),
+	}
+}
+
+// bedrockLLMUsage maps Bedrock TokenUsage onto the Bifrost response usage block.
+func bedrockLLMUsage(usage *brtypes.TokenUsage) *bfschemas.BifrostLLMUsage {
+	if usage == nil {
+		return nil
+	}
+	return &bfschemas.BifrostLLMUsage{
+		PromptTokens:     int32Value(usage.InputTokens),
+		CompletionTokens: int32Value(usage.OutputTokens),
+		TotalTokens:      int32Value(usage.TotalTokens),
+	}
+}
+
+// wrapBedrockError turns a Bedrock SDK error into the error the gateway
+// surfaces. An error Bedrock answered is forwarded as an UpstreamError under
+// Bedrock's own status and exception name, so a terminal 400
+// (ValidationException) reaches the client as a 400 and is neither retried nor
+// failed over, while a 429 or 5xx stays retryable. A request the SDK refused
+// to send (a required field missing) is a deterministic bad request. Anything
+// else never got an answer and stays a retryable provider_error.
+func wrapBedrockError(ctx context.Context, err error) error {
+	var respErr *smithyhttp.ResponseError
+	if errors.As(err, &respErr) && respErr.Response != nil && respErr.Response.Response != nil &&
+		respErr.Response.StatusCode > 0 {
+		ue := &domain.UpstreamError{
+			StatusCode: respErr.Response.StatusCode,
+			Message:    err.Error(),
+			Provider:   string(domain.ProviderBedrock),
+			Headers:    forwardableUpstreamHeaders(bedrockResponseHeaders(respErr.Response.Header)),
+		}
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			ue.ErrorType = apiErr.ErrorCode()
+			ue.ErrorCode = apiErr.ErrorCode()
+			if msg := apiErr.ErrorMessage(); msg != "" {
+				ue.Message = msg
+			}
+		}
+		return ue
+	}
+	var invalid *smithy.InvalidParamsError
+	if errors.As(err, &invalid) {
+		return herr.New(ctx, domain.ErrBadRequest, herr.M{
+			"message": err.Error(),
+		})
+	}
+	return herr.New(ctx, domain.ErrProviderError, herr.M{
+		"message": err.Error(),
+	})
+}
+
+// bedrockStreamError is the error a ConverseStream ends with mid-stream.
+// Bedrock reports these as typed exception events (ThrottlingException,
+// ValidationException, ModelStreamErrorException) on a stream already answered
+// 200. The exception name rides as the error type so the SSE error frame names
+// it, and the status Bedrock gives that exception on a plain call rides as the
+// status so the trace classifies it.
+func bedrockStreamError(err error) error {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return fmt.Errorf("bedrock stream error: %w", err)
+	}
+	msg := apiErr.ErrorMessage()
+	if msg == "" {
+		msg = err.Error()
+	}
+	return &domain.UpstreamError{
+		StatusCode: bedrockExceptionStatus[apiErr.ErrorCode()],
+		Message:    msg,
+		ErrorType:  apiErr.ErrorCode(),
+		ErrorCode:  apiErr.ErrorCode(),
+		Provider:   string(domain.ProviderBedrock),
+	}
+}
+
+// bedrockExceptionStatus is the HTTP status Bedrock Runtime answers each
+// ConverseStream exception with when it is not inside a stream.
+var bedrockExceptionStatus = map[string]int{
+	"ValidationException":         http.StatusBadRequest,
+	"ThrottlingException":         http.StatusTooManyRequests,
+	"ServiceUnavailableException": http.StatusServiceUnavailable,
+	"ModelStreamErrorException":   http.StatusFailedDependency,
+	"InternalServerException":     http.StatusInternalServerError,
+}
+
+// bedrockResponseHeaders flattens the HTTP response headers of a Bedrock SDK
+// error for forwardableUpstreamHeaders.
+func bedrockResponseHeaders(header http.Header) map[string]string {
+	out := make(map[string]string, len(header))
+	for k := range header {
+		out[k] = header.Get(k)
+	}
+	return out
+}
+
+// --- stream iterator ---
+
+// bedrockStreamIterator pumps Bedrock ConverseStream events and exposes them as
+// the gateway's OpenAI-shaped chat.completion.chunk stream. It tracks per-tool
+// call index so streamed tool-use input deltas reassemble correctly downstream.
+type bedrockStreamIterator struct {
+	ctx     context.Context
+	stream  *bedrockruntime.ConverseStreamEventStream
+	model   string
+	current []byte
+	usage   domain.Usage
+	err     error
+	done    bool
+	// paramsDropped is the parameter-policy drop list; injected into the
+	// usage-bearing final chunk, mirroring the bifrost stream iterator.
+	paramsDropped []string
+
+	// toolIndex maps a Bedrock content-block index to the OpenAI tool-call
+	// index so multi-tool streams keep stable per-call indices in the deltas.
+	toolIndex map[int32]uint16
+	nextTool  uint16
+}
+
+func (it *bedrockStreamIterator) Next(ctx context.Context) bool {
+	resp, ok := it.nextTyped(ctx)
+	if !ok {
+		return false
+	}
+	data, _ := sonic.Marshal(resp)
+	if resp.Usage != nil {
+		// The usage-bearing final chunk carries the policy drop signal,
+		// mirroring extra_fields.params_dropped on sync responses and the
+		// bifrost stream iterator.
+		data = injectParamsDropped(data, it.paramsDropped)
+	}
+	it.current = data
+	return true
+}
+
+// nextTyped pulls the next mappable Bedrock event as a typed chat chunk. The
+// translated /v1/messages VPCE lane consumes this seam directly, feeding the
+// chunks through the chat-to-Responses conversion instead of the OpenAI wire
+// shape Next serializes.
+func (it *bedrockStreamIterator) nextTyped(ctx context.Context) (*bfschemas.BifrostChatResponse, bool) {
+	if it.done {
+		return nil, false
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			it.err = ctx.Err()
+			it.done = true
+			return nil, false
+		case event, ok := <-it.stream.Events():
+			if !ok {
+				if err := it.stream.Err(); err != nil {
+					it.err = bedrockStreamError(err)
+				}
+				it.done = true
+				return nil, false
+			}
+			chunk, emit := it.mapEvent(event)
+			if !emit {
+				continue
+			}
+			return chunk, true
+		}
+	}
+}
+
+// mapEvent maps a single Bedrock stream event to a typed chat chunk. The
+// second return reports whether the event produced a chunk worth emitting
+// (metadata/start events that carry no delta are absorbed silently).
+func (it *bedrockStreamIterator) mapEvent(event brtypes.ConverseStreamOutput) (*bfschemas.BifrostChatResponse, bool) {
+	switch e := event.(type) {
+	case *brtypes.ConverseStreamOutputMemberContentBlockStart:
+		// Tool-use blocks announce id+name here; text content has no start
+		// payload. Emit the tool-call header chunk (empty arguments).
+		start := e.Value.Start
+		if tu, ok := start.(*brtypes.ContentBlockStartMemberToolUse); ok {
+			idx := it.assignToolIndex(e.Value.ContentBlockIndex)
+			return it.chunkWithToolCall(bfschemas.ChatAssistantMessageToolCall{
+				Index: idx,
+				Type:  strPtr("function"),
+				ID:    tu.Value.ToolUseId,
+				Function: bfschemas.ChatAssistantMessageToolCallFunction{
+					Name:      derefStr(tu.Value.Name),
+					Arguments: "",
+				},
+			}), true
+		}
+		return nil, false
+
+	case *brtypes.ConverseStreamOutputMemberContentBlockDelta:
+		switch d := e.Value.Delta.(type) {
+		case *brtypes.ContentBlockDeltaMemberText:
+			return it.chunkWithText(d.Value), true
+		case *brtypes.ContentBlockDeltaMemberToolUse:
+			if d.Value.Input == nil {
+				return nil, false
+			}
+			idx := it.assignToolIndex(e.Value.ContentBlockIndex)
+			return it.chunkWithToolCall(bfschemas.ChatAssistantMessageToolCall{
+				Index: idx,
+				Type:  strPtr("function"),
+				Function: bfschemas.ChatAssistantMessageToolCallFunction{
+					Arguments: *d.Value.Input,
+				},
+			}), true
+		default:
+			return nil, false
+		}
+
+	case *brtypes.ConverseStreamOutputMemberMessageStop:
+		finish := mapStopReason(e.Value.StopReason)
+		return it.chunkWithFinish(finish), true
+
+	case *brtypes.ConverseStreamOutputMemberMetadata:
+		// Final usage rides on the metadata event; record it and emit a
+		// usage-only chunk so cost enrichment downstream sees token totals.
+		if e.Value.Usage != nil {
+			it.usage = bedrockUsage(e.Value.Usage)
+			return it.usageChunk(), true
+		}
+		return nil, false
+
+	default:
+		return nil, false
+	}
+}
+
+// assignToolIndex returns a stable OpenAI tool-call index for a Bedrock content
+// block index, allocating a new one on first sight.
+func (it *bedrockStreamIterator) assignToolIndex(blockIdx *int32) uint16 {
+	if it.toolIndex == nil {
+		it.toolIndex = map[int32]uint16{}
+	}
+	key := int32Value(blockIdx)
+	if v, ok := it.toolIndex[int32(key)]; ok {
+		return v
+	}
+	v := it.nextTool
+	it.toolIndex[int32(key)] = v
+	it.nextTool++
+	return v
+}
+
+func (it *bedrockStreamIterator) chunkWithText(text string) *bfschemas.BifrostChatResponse {
+	return it.buildChunk(&bfschemas.ChatStreamResponseChoiceDelta{Content: &text}, nil, nil)
+}
+
+func (it *bedrockStreamIterator) chunkWithToolCall(call bfschemas.ChatAssistantMessageToolCall) *bfschemas.BifrostChatResponse {
+	return it.buildChunk(&bfschemas.ChatStreamResponseChoiceDelta{
+		ToolCalls: []bfschemas.ChatAssistantMessageToolCall{call},
+	}, nil, nil)
+}
+
+func (it *bedrockStreamIterator) chunkWithFinish(finish string) *bfschemas.BifrostChatResponse {
+	return it.buildChunk(&bfschemas.ChatStreamResponseChoiceDelta{}, &finish, nil)
+}
+
+func (it *bedrockStreamIterator) usageChunk() *bfschemas.BifrostChatResponse {
+	return it.buildChunk(&bfschemas.ChatStreamResponseChoiceDelta{}, nil, bedrockLLMUsage(usagePtr(it.usage)))
+}
+
+// buildChunk assembles a chat.completion.chunk carrying the given delta +
+// optional finish reason + optional usage, matching the bifrost streaming
+// shape. Next serializes it; the typed VPCE messages lane consumes it as-is.
+func (it *bedrockStreamIterator) buildChunk(
+	delta *bfschemas.ChatStreamResponseChoiceDelta,
+	finish *string,
+	usage *bfschemas.BifrostLLMUsage,
+) *bfschemas.BifrostChatResponse {
+	resp := &bfschemas.BifrostChatResponse{
+		Object:  "chat.completion.chunk",
+		Model:   it.model,
+		Created: int(time.Now().Unix()),
+		Choices: []bfschemas.BifrostResponseChoice{
+			{
+				Index:        0,
+				FinishReason: finish,
+				ChatStreamResponseChoice: &bfschemas.ChatStreamResponseChoice{
+					Delta: delta,
+				},
+			},
+		},
+		Usage: usage,
+	}
+	return resp
+}
+
+func (it *bedrockStreamIterator) Chunk() []byte       { return it.current }
+func (it *bedrockStreamIterator) Usage() domain.Usage { return it.usage }
+func (it *bedrockStreamIterator) Err() error          { return it.err }
+
+func (it *bedrockStreamIterator) Close() error {
+	if it.stream != nil {
+		return it.stream.Close()
+	}
+	return nil
+}
+
+// --- helpers ---
+
+// parseToolArguments parses an OpenAI-style JSON arguments string into a map for
+// Bedrock's structured tool input. A non-JSON or empty string yields an empty
+// object so the SDK always sends a valid document.
+func parseToolArguments(arguments string) map[string]any {
+	if arguments == "" {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := sonic.Unmarshal([]byte(arguments), &out); err != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+// toolSchemaDocument marshals the neutral tool parameter schema into a generic
+// map so it can be wrapped in a Bedrock JSON input-schema document. A nil schema
+// yields a minimal object schema (Bedrock requires a top-level object).
+func toolSchemaDocument(params *bfschemas.ToolFunctionParameters) map[string]any {
+	if params == nil {
+		return map[string]any{"type": "object"}
+	}
+	raw, err := sonic.Marshal(params)
+	if err != nil {
+		return map[string]any{"type": "object"}
+	}
+	var out map[string]any
+	if err := sonic.Unmarshal(raw, &out); err != nil || out == nil {
+		return map[string]any{"type": "object"}
+	}
+	return out
+}
+
+// documentToJSONString serializes a Bedrock input document into a JSON string,
+// matching OpenAI's stringified tool-call arguments format.
+func documentToJSONString(doc brdocument.Interface) string {
+	if doc == nil {
+		return "{}"
+	}
+	var decoded any
+	if err := doc.UnmarshalSmithyDocument(&decoded); err != nil {
+		return "{}"
+	}
+	b, err := sonic.Marshal(decoded)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+func int32Ptr(v int) *int32 {
+	n := int32(v)
+	return &n
+}
+
+func float32Ptr(v float64) *float32 {
+	n := float32(v)
+	return &n
+}
+
+func int32Value(p *int32) int {
+	if p == nil {
+		return 0
+	}
+	return int(*p)
+}
+
+func strPtr(s string) *string { return &s }
+
+func derefStr(p *string) *string {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+// usagePtr packs a neutral usage struct back into the int32-pointer shape the
+// Bedrock TokenUsage mapper expects, so the streaming usage chunk reuses the
+// same conversion as the non-streaming path.
+func usagePtr(u domain.Usage) *brtypes.TokenUsage {
+	return &brtypes.TokenUsage{
+		InputTokens:  int32Ptr(u.PromptTokens),
+		OutputTokens: int32Ptr(u.CompletionTokens),
+		TotalTokens:  int32Ptr(u.TotalTokens),
+	}
+}

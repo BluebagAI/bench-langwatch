@@ -1,0 +1,100 @@
+---
+title: Migrate from Portkey
+description: Map Portkey virtual keys, API keys, configs, caching, guardrails and metadata to their LangWatch AI Gateway equivalents and move an application over with a base URL change.
+sidebarTitle: Migrate from Portkey
+---
+
+## What maps to what
+
+| Portkey                                                        | LangWatch AI Gateway                                                                                                                                                                                                |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Virtual key (a stored provider credential)                     | A row under **Settings > Model Providers**. See [Providers](/ai-gateway/providers/overview).                                                                                                                        |
+| API key sent as `x-portkey-api-key`                            | A [virtual key](/ai-gateway/virtual-keys), sent as `Authorization: Bearer vk-lw-...`.                                                                                                                               |
+| `x-portkey-virtual-key` or `x-portkey-provider` on the request | The `provider/` prefix on the model name, for example `openai/gpt-6-luna`. See [Model naming](/ai-gateway/model-naming).                                                                                            |
+| Config with `strategy.mode: "fallback"` and ordered `targets`  | A [routing policy](/ai-gateway/governance/routing-policies): an ordered list of provider rows a key tries.                                                                                                          |
+| `retry.attempts` in a config                                   | `fallback.maxAttempts` in the key configuration, default 3. The gateway decides which failures move to the next provider; that list is not configurable.                                                            |
+| `cache.mode: "simple"`                                         | Provider prompt caching passes through, and [cache rules](/ai-gateway/cache-control) force or disable it per model, key or tag.                                                                                     |
+| Guardrails                                                     | [Guardrails](/ai-gateway/guardrails): a LangWatch evaluator attached to the key, run on the request, the response or each stream chunk.                                                                             |
+| `x-portkey-metadata`                                           | `X-LangWatch-Metadata`, a JSON object copied onto the spend event, and `X-LangWatch-End-User-Id` for the end user. See [Billing and spend events](/ai-gateway/billing-events#attribution-what-the-request-carries). |
+| Budgets and rate limits on an API key                          | [Budgets](/ai-gateway/budgets) on the key, the project, the team, the organization, a person or an end user, and [rate limits](/ai-gateway/rate-limits) on the key.                                                 |
+| Logs                                                           | A trace per request in Trace Explorer and a [spend event](/ai-gateway/billing-events) per request.                                                                                                                  |
+
+Two Portkey features have no equivalent: `strategy.mode: "loadbalance"` with weights across targets, and `cache.mode: "semantic"`. The gateway tries providers in order and caches only what the provider caches.
+
+The gateway reads no `x-portkey-*` header. Remove them from the request.
+
+## 1. Move the credentials
+
+For each Portkey virtual key, add a row under **Settings > Model Providers** with the same provider key. Rows can belong to the organization, a team or a project.
+
+## 2. Turn each config into a routing policy
+
+A Portkey config with fallback targets becomes a routing policy that lists the same providers in the same order. Open **AI Gateway > Routing policies**, create the policy, and pick it under **Routing** when you create the virtual key.
+
+<CodeGroup>
+
+```json Portkey config
+{
+  "strategy": { "mode": "fallback" },
+  "targets": [{ "virtual_key": "openai-prod" }, { "virtual_key": "azure-eu" }],
+  "retry": { "attempts": 3 }
+}
+```
+
+```text LangWatch routing policy
+Providers, in order: OpenAI (openai-prod), Azure OpenAI (azure-eu)
+Virtual key: Routing = that policy
+```
+
+</CodeGroup>
+
+Model aliases on the policy map a name your code sends to the model each provider serves, for example `gpt-6-luna` to `azure/acme-mini-eu`. See [Model aliases](/ai-gateway/model-aliases).
+
+## 3. Create the virtual keys
+
+One virtual key per application, team or person, with its budget and routing policy. See [Virtual keys](/ai-gateway/virtual-keys#create-a-virtual-key).
+
+## 4. Change the client
+
+<CodeGroup>
+
+```python Before
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://api.portkey.ai/v1",
+    api_key="dummy",
+    default_headers={
+        "x-portkey-api-key": PORTKEY_API_KEY,
+        "x-portkey-virtual-key": "openai-prod",
+        "x-portkey-metadata": '{"_user": "cust_8841"}',
+    },
+)
+```
+
+```python After
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="https://gateway.langwatch.ai/v1",
+    api_key=LANGWATCH_VIRTUAL_KEY,
+)
+response = client.chat.completions.create(
+    model="openai/gpt-6-luna",
+    messages=[...],
+    user="cust_8841",
+    extra_headers={"X-LangWatch-Metadata": '{"plan": "pro"}'},
+)
+```
+
+</CodeGroup>
+
+The Anthropic SDK takes `base_url="https://gateway.langwatch.ai"` and the virtual key as `api_key`. See [Python](/ai-gateway/sdks/python) and [TypeScript](/ai-gateway/sdks/typescript).
+
+## 5. Verify
+
+Send one request and check that the response carries `X-LangWatch-Gateway-Request-Id`. Open **Trace Explorer** in the key's project for the trace, and **AI Gateway > Usage** for the spend. A response with `X-LangWatch-Fallback-Count` went through more than one provider.
+
+## What the application sees on a breach
+
+A `block` budget at its limit answers `402 budget_exceeded`; a `warn` budget adds `X-LangWatch-Budget-Warning` and serves the request. See [Budgets](/ai-gateway/budgets#block-and-warn) and [Errors](/ai-gateway/api/errors).

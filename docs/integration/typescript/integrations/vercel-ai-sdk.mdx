@@ -1,0 +1,119 @@
+---
+title: Vercel AI SDK
+description: Integrate the Vercel AI SDK with LangWatch for TypeScript-based tracing, token tracking, and real-time agent testing.
+sidebarTitle: Vercel AI SDK
+keywords: vercel ai sdk, langwatch, tracing, observability, vercel, ai, sdk
+---
+
+import TypeScriptIntro from "/snippets/typescript-intro.mdx";
+
+<Tip>
+  **Quick setup?** Instead of following these steps manually, [copy a prompt](/skills/directory) into your coding agent and it will set this up for you automatically.
+</Tip>
+
+<TypeScriptIntro />
+
+## Installation
+
+<CodeGroup>
+```bash npm
+npm i langwatch ai @ai-sdk/openai
+```
+
+```bash pnpm
+pnpm add langwatch ai @ai-sdk/openai
+```
+
+```bash yarn
+yarn add langwatch ai @ai-sdk/openai
+```
+
+```bash bun
+bun add langwatch ai @ai-sdk/openai
+```
+
+</CodeGroup>
+
+## Usage
+
+<Info>
+  The LangWatch API key is configured by default via the `LANGWATCH_API_KEY` environment variable.
+</Info>
+
+Set up observability and enable telemetry on your Vercel AI SDK calls:
+
+```typescript
+import { setupObservability } from "langwatch/observability/node";
+import { generateText } from "ai";
+import { openai } from "@ai-sdk/openai";
+
+setupObservability({ serviceName: "<project_name>" });
+
+async function main(message: string): Promise<string> {
+  const response = await generateText({
+    model: openai("gpt-6-luna"),
+    prompt: message,
+    experimental_telemetry: { isEnabled: true },
+  });
+  return response.text;
+}
+
+console.log(await main("Hey, tell me a joke"));
+```
+
+The Vercel AI SDK automatically sends traces to LangWatch when `experimental_telemetry.isEnabled` is set to `true`. For Next.js applications, configure OpenTelemetry in your `instrumentation.ts` file using `LangWatchExporter`.
+
+## Metadata
+
+Pass `experimental_telemetry.metadata` to tag the call. LangWatch reads these
+keys from it:
+
+| Key           | What it does                                                                      |
+| ------------- | --------------------------------------------------------------------------------- |
+| `labels`      | An array of labels. Filter the trace list by them.                                |
+| `thread_id`   | Groups the call into a conversation with every other call that sends the same id. |
+| `user_id`     | The end user the call belongs to.                                                 |
+| `customer_id` | The customer or tenant the call belongs to.                                       |
+
+Any other key becomes custom metadata on the trace, filterable by its own name.
+
+```typescript
+const response = await generateText({
+  model: openai("gpt-6-luna"),
+  prompt: message,
+  experimental_telemetry: {
+    isEnabled: true,
+    metadata: {
+      labels: ["checkout", "beta"],
+      thread_id: "conversation-8f21",
+      user_id: "user-42",
+      tenant: "eu-west",
+    },
+  },
+});
+```
+
+`experimental_telemetry` is the AI SDK's own experimental API, and its shape
+can change between AI SDK versions.
+
+It accepts strings, numbers, booleans and arrays of them as metadata values. It
+does not accept a nested object, so flatten anything deeper into separate keys.
+A `null` inside a `labels` array is dropped.
+
+A `thread_id`, `user_id`, `customer_id` or `metadata.<key>` you also set as a
+span attribute wins over the one you pass here. Labels are the exception: the
+two sets are combined, so the trace keeps both. See
+[Capturing Metadata and Attributes](/integration/typescript/tutorials/capturing-metadata)
+for the attribute names.
+
+## Check it worked
+
+Run the example. The SDK flushes pending spans when the process exits. Then open your project in LangWatch: a new trace appears in the traces list within a few seconds. Open it to see the `generateText` call and its model request as spans.
+
+If no trace appears, check that `LANGWATCH_API_KEY` is set in the environment the process runs in.
+
+## Related
+
+- [Capturing RAG](/integration/typescript/tutorials/capturing-rag) - Learn how to capture RAG data from retrievers and tools
+- [Capturing Metadata and Attributes](/integration/typescript/tutorials/capturing-metadata) - Add custom metadata and attributes to your traces and spans
+- [Capturing Evaluations & Guardrails](/integration/python/tutorials/capturing-evaluations-guardrails) - Log evaluations and implement guardrails in your Vercel AI SDK applications

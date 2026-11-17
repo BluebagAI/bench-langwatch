@@ -1,0 +1,9 @@
+```typescript
+try {
+  throw new Error("unexpected error");
+} catch (error) {
+  span.end({
+    error: error,
+  });
+}
+```

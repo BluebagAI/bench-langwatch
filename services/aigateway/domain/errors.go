@@ -1,0 +1,269 @@
+package domain
+
+import (
+	"errors"
+	"fmt"
+
+	"github.com/langwatch/langwatch/pkg/herr"
+)
+
+// UpstreamError carries a provider's terminal HTTP response so the gateway
+// forwards it to the client verbatim instead of masking it as a generic
+// 502. Streaming dispatch can only return an error (not a *Response), so the
+// upstream status, native error body, and message ride on the error and the
+// HTTP layer writes them. A client (claude-code, the OpenAI SDK, ...) decides
+// retryable-vs-terminal from the status code, so collapsing an upstream 400
+// (e.g. "credit balance too low") into a 502 makes it retry a terminal error
+// indefinitely.
+type UpstreamError struct {
+	// StatusCode is the provider's HTTP status, forwarded verbatim.
+	StatusCode int
+	// Body is the provider's native error body, forwarded byte-for-byte when
+	// Bifrost captured it (raw-forward paths). Empty when only the status and
+	// message are available.
+	Body []byte
+	// Message is the provider's error message, used to build a minimal
+	// envelope when Body is empty.
+	Message string
+	// ErrorType and ErrorCode are the provider's own error discriminants
+	// (e.g. OpenAI "insufficient_quota", Anthropic "overloaded_error",
+	// Bedrock "ThrottlingException") as parsed by the provider adapter.
+	// They keep the error's identity on translated lanes where the native
+	// body is not captured: without them the minimal envelope collapses
+	// every provider verdict into a generic "provider_error" and the
+	// client loses the code it dispatches its own handling on.
+	ErrorType string
+	ErrorCode string
+	// Provider names the upstream this error came from (the credential's
+	// provider id), so a multi-provider chain's surviving error says which
+	// account to look at. Empty when the dispatch layer has not stamped it.
+	Provider string
+	// Headers carries the upstream's retry-signaling response headers
+	// (Retry-After, x-should-retry) so the client can honor the provider's
+	// backoff hint and terminal-vs-retryable signal instead of guessing.
+	Headers map[string]string
+}
+
+func (e *UpstreamError) Error() string {
+	return fmt.Sprintf("upstream error (status %d): %s", e.StatusCode, e.Message)
+}
+
+// Gateway-specific error codes.
+const (
+	ErrInvalidAPIKey  = herr.Code("invalid_api_key")
+	ErrBudgetExceeded = herr.Code("budget_exceeded")
+	// A per-end-user budget template is active on this key and the request
+	// carried no end-user id: fail closed, a cap evadable by omitting a
+	// field is not a cap.
+	ErrEndUserRequired  = herr.Code("end_user_required")
+	ErrRateLimited      = herr.Code("rate_limited")
+	ErrGuardrailBlocked = herr.Code("guardrail_blocked")
+	// ErrGuardrailUpstreamUnavailable means the guardrail could not be
+	// evaluated at all. Fail-closed keys stop here rather than proceeding as
+	// though the guardrail had passed. Contract 5.
+	ErrGuardrailUpstreamUnavailable = herr.Code("guardrail_upstream_unavailable")
+	ErrPolicyViolation              = herr.Code("policy_violation")
+	ErrModelNotAllowed              = herr.Code("model_not_allowed")
+	// ErrProviderNotBound means the request names a provider (explicit
+	// "provider/model" prefix or alias) that has no credential slot on
+	// this VK. Dispatching anyway would hand a mismatched credential to
+	// the provider selected by the model prefix, which surfaces as opaque
+	// provider-config errors ("deployments not set", HTML error pages).
+	ErrProviderNotBound = herr.Code("model_provider_not_bound")
+	// ErrModelNotRecognized means the request named a model that matches
+	// nothing this key can place: no provider declares it, its name matches no
+	// vendor the gateway can guess from, and the key holds more than one
+	// provider that told us what it serves. Sending it down the chain anyway
+	// makes every vendor answer for a model it never had, and the caller reads
+	// the last vendor's error instead of the real problem. Distinct from
+	// model_provider_not_bound, which is a provider the caller DID name.
+	ErrModelNotRecognized = herr.Code("model_not_recognized")
+	ErrProviderError      = herr.Code("provider_error")
+	// ErrProviderCredentialInvalid means the credentials configured for a
+	// model provider cannot produce an authenticated call at all — a Vertex
+	// service account that yields no OAuth token source, AWS credentials the
+	// signer cannot retrieve. The request never reaches the provider, so
+	// there is no upstream verdict to forward and no retry that can help:
+	// every credential in the chain fails the same way. Terminal and the
+	// customer's to fix, so it must not carry provider_timeout's retryable 504.
+	ErrProviderCredentialInvalid = herr.Code("provider_credential_invalid")
+	// ErrProviderCredentialRejected means the credential reached the provider
+	// and the provider refused it (401/403). Distinct from
+	// provider_credential_invalid, which never got that far: this one proves
+	// the credential is well-formed and says the account behind it is the
+	// problem — expired, revoked, or lacking permission for the operation.
+	//
+	// Reserved: no path emits it today. A provider that refuses a credential
+	// answers with a status, and errFromBifrost forwards every answered error
+	// verbatim before classification runs, so the 401/403 arrives as itself.
+	// Registered anyway (status, fault, remediation, presentation copy) so a
+	// path that does not forward — a pre-dispatch credential refresh, a plugin
+	// rejection — has a code to use without minting a new slug.
+	ErrProviderCredentialRejected = herr.Code("provider_credential_rejected")
+	// ErrProviderConfigInvalid means the provider slot is configured in a way
+	// that cannot serve THIS request: no key declares the requested model, a
+	// deployment map is missing, or the provider does not implement the
+	// operation. Terminal, and the remediation is in the customer's model
+	// provider settings rather than in the request.
+	//
+	// The answer carries a "problem" in its meta, one of the ConfigProblem*
+	// values below, naming which of those it was. The copy the customer reads
+	// is chosen from it, because "add your API key" and "add a deployment
+	// mapping" are different instructions.
+	ErrProviderConfigInvalid = herr.Code("provider_config_invalid")
+	// ErrProviderConnectionFailed means the request never got to the provider:
+	// DNS failure, connection refused, transport error. Retryable and the
+	// provider's (or the network's) fault, unlike the config and credential
+	// codes above, which repeat identically on every attempt.
+	//
+	// Deliberately not "provider_unreachable": that slug is already an app
+	// code, thrown when a credential CHECK finds nothing answering
+	// (providerValidation.ts), and its customer copy says the key was never
+	// checked. One slug cannot carry both meanings, and the copy for either
+	// would be wrong on the other's path.
+	ErrProviderConnectionFailed = herr.Code("provider_connection_failed")
+	// ErrRequestAbandoned means the caller disconnected or its deadline
+	// expired before the provider answered. It is a verdict about the caller,
+	// not about the credential: it must neither advance the fallback chain
+	// nor move the circuit breaker, or one client hanging up repeatedly would
+	// open the breaker on a healthy provider.
+	ErrRequestAbandoned = herr.Code("request_abandoned")
+	ErrPayloadTooLarge  = herr.Code("payload_too_large")
+	ErrBadRequest       = herr.Code("bad_request")
+	// ErrMissingModel is a request-shape error with its own stable identity so
+	// clients and rejection metrics do not have to infer it from prose.
+	ErrMissingModel    = herr.Code("missing_model")
+	ErrNotFound        = herr.Code("not_found")
+	ErrInternal        = herr.Code("internal_error")
+	ErrChainExhausted  = herr.Code("chain_exhausted")
+	ErrCircuitOpen     = herr.Code("circuit_open")
+	ErrProviderTimeout = herr.Code("provider_timeout")
+	ErrKeyRevoked      = herr.Code("virtual_key_revoked")
+	// ErrKeyDisabled is the REVERSIBLE stop: the key material is intact and
+	// an administrator can re-enable it. Distinct from revoked (one-way)
+	// so tenant tooling can branch on which one it is.
+	ErrKeyDisabled = herr.Code("virtual_key_disabled")
+	// ErrKeyExpired is the stop nobody pressed: the key carries an
+	// expiration date and that date has passed. The key material is intact
+	// and the key is still ACTIVE in the control plane, so the fix is a new
+	// date rather than a new secret. Distinct from revoked and disabled so a
+	// tenant can tell "extend it" from "ask an administrator" from "mint a
+	// new one".
+	ErrKeyExpired   = herr.Code("virtual_key_expired")
+	ErrAuthUpstream = herr.Code("auth_upstream_unavailable")
+	// ErrConnectInstanceRequired means a license token arrived without the
+	// X-LangWatch-Instance header. A license is bound to one install, so the
+	// token alone identifies nothing.
+	ErrConnectInstanceRequired = herr.Code("connect_instance_required")
+	// ErrConnectLicenseNotRegistered means the license behind the token is not
+	// in the registry, or is recorded there without a customer. The install's
+	// operator has to contact LangWatch; retrying changes nothing.
+	ErrConnectLicenseNotRegistered = herr.Code("connect_license_not_registered")
+	// ErrConnectLicenseRevoked means the license was revoked or replaced. The
+	// install keeps working offline on the license it holds, but hosted
+	// services are closed to it for good.
+	ErrConnectLicenseRevoked = herr.Code("connect_license_revoked")
+	// ErrConnectLicenseExpired means the license term ended. A renewed license
+	// opens hosted services again.
+	ErrConnectLicenseExpired = herr.Code("connect_license_expired")
+	// ErrConnectWrongInstance means the license is bound to another install.
+	// Either the token leaked, or the install was rebuilt and an operator has
+	// to reset the binding.
+	ErrConnectWrongInstance = herr.Code("connect_wrong_instance")
+	// ErrConnectCredentialPending means the license authenticated but its
+	// managed key is still being provisioned. It is not a refusal: a retry a
+	// few seconds later succeeds, so the gateway never remembers it.
+	ErrConnectCredentialPending = herr.Code("connect_credential_pending")
+	// ErrConnectServiceNotEntitled means the license authenticated but does
+	// not include the hosted service the call needs. Distinct from every
+	// refusal above: the license is live and its other services keep working,
+	// so the fix is a change to the contract rather than to the install.
+	ErrConnectServiceNotEntitled = herr.Code("connect_service_not_entitled")
+	// ErrHostedServiceUnavailable means the gateway could not get an answer
+	// from the control plane for a hosted-service call. Nothing was judged and
+	// nothing was charged, so the caller can retry.
+	ErrHostedServiceUnavailable = herr.Code("hosted_service_unavailable")
+	// ErrNoProviderConfigured means the virtual key's bundle carries zero
+	// provider credentials — the organization has no ModelProvider configured.
+	// Without this guard the dispatcher would hand Bifrost a zero-value
+	// Credential and the caller would see an opaque "provider is required".
+	ErrNoProviderConfigured = herr.Code("no_provider_configured")
+	// ErrCodexSessionExpired means the codex provider's OAuth session is
+	// dead (refresh rejected) — the user must sign in with OpenAI again.
+	// Clients receive it as a 401 with this code so Langy can render the
+	// re-authenticate card instead of a generic provider error.
+	ErrCodexSessionExpired = herr.Code("codex_session_expired")
+	// ErrUnsupportedParameter means the parameter policy refused a request
+	// parameter for the target lane: either the request depends on it
+	// functionally and the lane cannot honor it, or drop_tuning_params is false
+	// and the lane has no mapping for it. The code matches OpenAI's own
+	// parameter rejections so SDK error handling stays familiar.
+	ErrUnsupportedParameter = herr.Code("unsupported_parameter")
+	// ErrRealtimeSessionLimit means the virtual key already holds as many
+	// open realtime voice sessions as its realtime.maxOpenSessions allows.
+	// A voice session bills for as long as it runs, so the arrival-rate
+	// limits do not bound it and this is the only cap that does.
+	ErrRealtimeSessionLimit = herr.Code("realtime_session_limit")
+	// ErrRealtimeRegistryUnavailable means the control plane could not
+	// record the session, so the gateway refused to mint one. This is a
+	// deliberate departure from the budget fail-open rule: an unrecorded
+	// session is voice nobody can bill and a cap nobody can enforce.
+	ErrRealtimeRegistryUnavailable = herr.Code("realtime_registry_unavailable")
+)
+
+// KeyExpiredMessage is what a tenant reads when a key's expiration date has
+// passed. One string in one place: the control plane's 403 and the auth
+// cache's own check are the same answer to the same person, and two copies of
+// it drift.
+const KeyExpiredMessage = "This key has expired. Extend its expiration date, or create a new key."
+
+// noFallbackError marks a dispatch error the engine has already declared
+// terminal for the whole credential chain, carrying that verdict to the
+// dispatcher without changing the error the client sees.
+type noFallbackError struct{ error }
+
+func (e noFallbackError) Unwrap() error { return e.error }
+
+// WithNoFallback marks err as one that must not advance the fallback chain.
+// Bifrost documents AllowFallbacks as nil-means-true, so a provider or plugin
+// setting it false is stating that no other credential will do better;
+// ignoring it spent the whole chain re-proving a failure already known to be
+// terminal. Returns err unchanged when err is nil.
+func WithNoFallback(err error) error {
+	if err == nil {
+		return nil
+	}
+	return noFallbackError{err}
+}
+
+// IsNoFallback reports whether err carries an explicit refusal to fail over to
+// another credential.
+func IsNoFallback(err error) bool {
+	var nf noFallbackError
+	return errors.As(err, &nf)
+}
+
+// ConfigProblem names what a provider slot is missing when a request fails
+// with ErrProviderConfigInvalid. It travels as meta["problem"] and is a closed
+// vocabulary: clients match on it to pick their sentence, so a value is added
+// here and in features/errors/logic/presentation.ts together.
+type ConfigProblem string
+
+const (
+	// ConfigProblemAPIKeyMissing means the provider authenticates with an API
+	// key and the slot holds none.
+	ConfigProblemAPIKeyMissing ConfigProblem = "api_key_missing"
+	// ConfigProblemEndpointMissing means the provider is reached at a URL the
+	// customer supplies (an Azure resource, a self-hosted server) and the slot
+	// holds none.
+	ConfigProblemEndpointMissing ConfigProblem = "endpoint_missing"
+	// ConfigProblemDeploymentMissing means the provider serves models through
+	// named deployments and the slot maps none for the requested model.
+	ConfigProblemDeploymentMissing ConfigProblem = "deployment_missing"
+	// ConfigProblemOperationUnsupported means the provider has no API for the
+	// kind of request that was sent.
+	ConfigProblemOperationUnsupported ConfigProblem = "operation_unsupported"
+	// ConfigProblemModelNotServed is the remainder: the slot is complete and
+	// still holds nothing that can serve the requested model.
+	ConfigProblemModelNotServed ConfigProblem = "model_not_served"
+)

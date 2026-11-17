@@ -1,0 +1,92 @@
+/**
+ * Git context for a session directory; command injects runner for testability.
+ * Spec: specs/ai-governance/cli-wrappers/session-context-hook.feature
+ */
+
+import { spawnSync } from "node:child_process";
+import * as path from "node:path";
+
+import { parseGitRemoteUrl, type SessionContext } from "@/cli/utils/governance/session-context";
+
+/**
+ * How long a single git invocation may take. Each blocks the process, and the
+ * hook makes up to five (the top level only in a linked worktree): 5s at worst
+ * of its 7s budget (HOOK_BUDGET_MS), leaving 2s for the post.
+ */
+const GIT_TIMEOUT_MS = 1_000;
+
+/** Runs one git command in a directory. Trimmed stdout, or null on any failure. */
+export type GitRunner = (args: { args: string[]; cwd: string }) => string | null;
+
+/** The git identity of `directory`, or null when it is not a repository we can name. */
+export function readSessionContext({
+  directory,
+  runGit,
+}: {
+  directory: string;
+  runGit: GitRunner;
+}): SessionContext | null {
+  const remote = runGit({
+    args: ["remote", "get-url", "origin"],
+    cwd: directory,
+  });
+  const repository = remote === null ? null : parseGitRemoteUrl(remote);
+  if (!repository) return null;
+
+  // Empty on a detached HEAD, which is a state to omit rather than invent.
+  const branch = runGit({ args: ["branch", "--show-current"], cwd: directory });
+  const worktree = readWorktreeName({ directory, runGit });
+
+  return {
+    repository,
+    ...(branch ? { branch } : {}),
+    ...(worktree ? { worktree } : {}),
+  };
+}
+
+/** Runs git in `cwd`, bounded, and reports failure as null rather than throwing. */
+export function runGitCommand({ args, cwd }: { args: string[]; cwd: string }): string | null {
+  try {
+    const result = spawnSync("git", ["-C", cwd, ...args], {
+      encoding: "utf8",
+      timeout: GIT_TIMEOUT_MS,
+    });
+    if (result.status !== 0 || typeof result.stdout !== "string") return null;
+    const output = result.stdout.trim();
+    return output === "" ? null : output;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The name of the linked worktree `directory` sits in, or undefined in the
+ * main checkout (where the per-worktree git dir equals the common one).
+ * The name is just the directory it's checked out into.
+ */
+function readWorktreeName({
+  directory,
+  runGit,
+}: {
+  directory: string;
+  runGit: GitRunner;
+}): string | undefined {
+  const gitDir = runGit({ args: ["rev-parse", "--git-dir"], cwd: directory });
+  const commonDir = runGit({
+    args: ["rev-parse", "--git-common-dir"],
+    cwd: directory,
+  });
+  if (!gitDir || !commonDir) return undefined;
+  // Both may come back relative to the directory, so resolve before comparing.
+  const resolvedGitDir = path.resolve(directory, gitDir);
+  const resolvedCommonDir = path.resolve(directory, commonDir);
+  if (resolvedGitDir === resolvedCommonDir) {
+    return undefined;
+  }
+
+  const topLevel = runGit({
+    args: ["rev-parse", "--show-toplevel"],
+    cwd: directory,
+  });
+  return topLevel ? path.basename(topLevel) : undefined;
+}

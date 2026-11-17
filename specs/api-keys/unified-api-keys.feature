@@ -1,0 +1,467 @@
+@integration
+Feature: Unified API Keys
+  As a LangWatch user
+  I want to manage personal and service API keys from a single page
+  So that I can control access to the platform without switching between tabs
+
+  Background:
+    Given I am signed in as a user in an organization
+    And the organization has at least one project
+
+  # ── Unified table ──────────────────────────────────────────────
+
+  @unimplemented
+  Scenario: Single table replaces tabs
+    When I navigate to Settings > API Keys
+    Then I see a single "API Keys" heading with no tab switcher
+    And a "+ Create new secret key" button in the header
+    And one table with columns: NAME, STATUS, SECRET KEY, CREATED, LAST USED, CREATED BY, PERMISSIONS
+
+  @unimplemented
+  Scenario: Personal API key row displays in table
+    Given I have created an API key named "CI Pipeline" with "All" permissions
+    When I navigate to Settings > API Keys
+    Then the table contains a row with:
+      | NAME        | CI Pipeline  |
+      | STATUS      | Active       |
+      | SECRET KEY  | sk-...XXXX   |
+      | PERMISSIONS | All          |
+    And the row has an edit icon button and a revoke icon button
+
+  # ── Ingestion keys vs API keys split ───────────────────────────
+  # An ingestion key is an ApiKey row with ingestSourceType set non-null: a
+  # project-scoped, ingest-only write credential the `langwatch <tool>` CLI
+  # mints. Regular API / service keys have ingestSourceType == null. The page
+  # renders the regular keys under the page heading and the ingestion keys in
+  # their own labeled section below.
+
+  Scenario: Ingestion keys render in their own labeled section
+    Given the organization has an ingestion key with source "claude_code"
+    And I have a regular API key named "CI Pipeline"
+    When I navigate to Settings > API Keys
+    Then I see an "Ingestion keys" section heading
+    And the ingestion key row shows its source "claude_code"
+    And the ingestion key row has a revoke button but no permissions editor
+    And the regular key "CI Pipeline" renders above that section
+
+  Scenario: No ingestion section when no ingestion keys exist
+    Given the organization has only regular API keys
+    When I navigate to Settings > API Keys
+    Then I do not see an "Ingestion keys" section heading
+    And the regular API keys render exactly as before
+
+  Scenario: The page carries a single title and subtitle
+    Given the organization has an ingestion key with source "claude_code"
+    And I have a regular API key named "CI Pipeline"
+    When I navigate to Settings > API Keys
+    Then the only page-level title is "API Keys"
+    And it is followed by a single subtitle
+    And the regular keys table carries no heading of its own
+    And the "Do not share your API keys" warning still shows
+
+  Scenario: Deep link opens the page on a specific key
+    Given I have a regular API key named "CI Pipeline"
+    When I open "/settings/api-keys#api-key-<id of CI Pipeline>"
+    Then the row for "CI Pipeline" carries that anchor id
+    And it is scrolled into view once the keys have loaded
+
+  Scenario: The legacy project key can only be revoked from the keys page
+    Given the project has a legacy per-project service key
+    When I navigate to Settings > API Keys
+    Then its row offers Revoke only, which swaps it for an API key
+    And no control copies the project key or hands out a new one
+
+  Scenario: Ingestion key names the device session that minted it
+    Given the organization has an ingestion key minted from "Rogerio's MacBook Pro"
+    When I navigate to Settings > API Keys
+    Then the ingestion key row shows the device label "Rogerio's MacBook Pro"
+    And an ingestion key with no captured device falls back to "Unknown device"
+
+  @unimplemented
+  Scenario: Expired API key shows expired status
+    Given I have an API key that has passed its expiration date
+    When I navigate to Settings > API Keys
+    Then that API key row shows STATUS "Expired"
+
+  @unimplemented
+  Scenario: Non-admin sees own keys plus service keys
+    Given I am a member (not admin)
+    And there are service API keys in the organization
+    When I navigate to Settings > API Keys
+    Then I see my own API keys and all service keys
+    And I do not see other users' personal keys
+
+  @unimplemented
+  Scenario: Admin sees all API keys in the organization
+    Given I am an organization admin
+    And another user has created a personal API key
+    When I navigate to Settings > API Keys
+    Then I see all API keys including other users' personal keys
+    And the CREATED BY column shows each key's owner
+
+  # ── Personal API keys ─────────────────────────────────────────
+
+  @unimplemented
+  Scenario: Non-admin creates personal API key
+    When I click "+ Create new secret key"
+    Then the create drawer opens
+    And there is no "Key type" toggle (non-admins always create personal keys)
+    When I fill in name "My CI Key"
+    And I select "All" permissions
+    And I click "Create secret key"
+    Then a new API key is created assigned to me
+    And the token is displayed once for copying
+
+  @unimplemented
+  Scenario: Personal API key is bounded by user's role binding ceiling
+    Given my role on "Project Alpha" is Member
+    When I create an API key with "All" permissions
+    Then the key's effective permissions are bounded by my Member role on "Project Alpha"
+    And using the key for admin-only operations on "Project Alpha" is denied
+
+  @unimplemented
+  Scenario: Restricted permission mode limits key to selected projects
+    When I select "Restricted" in the permission toggle
+    Then I see a list of all projects in the organization
+    And each project has a role selector: Admin, Member, Viewer, None
+    When I set "Project Alpha" to "Viewer" and "Project Beta" to "None"
+    And I click "Create secret key"
+    Then the key only grants Viewer access to "Project Alpha"
+    And the key has no access to "Project Beta"
+
+  @unimplemented
+  Scenario: Restricted mode respects user ceiling per project
+    Given my role on "Project Alpha" is Member
+    When I select "Restricted" and look at "Project Alpha"
+    Then the role selector does not include "Admin" (exceeds my ceiling)
+
+  @unimplemented
+  Scenario: Read only mode sets all bindings to Viewer
+    When I select "Read only" in the permission toggle
+    And I click "Create secret key"
+    Then all role bindings on the key are set to VIEWER
+
+  @unimplemented
+  Scenario: Personal API key is disabled when user is removed from org
+    Given I have created a personal API key
+    When my user is removed from the organization
+    Then the API key no longer authenticates
+
+  # ── Admin: create for another user ─────────────────────────────
+
+  @unimplemented
+  Scenario: Admin sees key type toggle and user picker
+    Given I am an organization admin
+    When I click "+ Create new secret key"
+    Then the create drawer shows a "Key type" toggle with "Personal" and "Service"
+    And under "Personal" there is a user picker defaulting to myself
+
+  @unimplemented
+  Scenario: Admin creates API key for another user
+    Given I am an organization admin
+    When I select "Personal" key type
+    And I select user "alice@example.com" from the user picker
+    And I fill in name "Alice CI Key" and select "All" permissions
+    And I click "Create secret key"
+    Then the key is created with userId = Alice
+    And the ceiling validation uses Alice's permissions, not the admin's
+    And createdByUserId is set to the admin's userId
+
+  @unimplemented
+  Scenario: Non-admin cannot create API key for another user
+    Given I am a member (not admin)
+    When I call apiKey.create with assignedToUserId = another user
+    Then the request is rejected with a permission error
+
+  # ── Service API keys ───────────────────────────────────────────
+
+  @unimplemented
+  Scenario: Admin creates service API key
+    Given I am an organization admin
+    When I select "Service" key type
+    And I fill in name "CI/CD Pipeline"
+    And I click "Create secret key"
+    Then a service API key is created with userId = null
+    And the key has full organization access (no user ceiling)
+    And the permissions section is not shown (service keys are always "All")
+
+  @unimplemented
+  Scenario: Multiple service keys can coexist
+    Given I am an organization admin
+    When I create service keys named "CI Pipeline" and "Staging Deploy"
+    Then both keys appear in the table
+    And the CREATED BY column shows "Service" for both
+
+  @unimplemented
+  Scenario: Non-admin cannot create service API key
+    Given I am a member (not admin)
+    When I call apiKey.create with keyType = "service"
+    Then the request is rejected with a permission error
+
+  @unimplemented
+  Scenario: Service key survives user removal
+    Given a service API key exists
+    When the admin who created it is removed from the organization
+    Then the service API key still authenticates
+
+  @unimplemented
+  Scenario: Non-admin can see but not edit or revoke service keys
+    Given I am a member (not admin)
+    And a service API key exists
+    When I navigate to Settings > API Keys
+    Then I see the service key in the table
+    But the edit and revoke buttons are disabled or hidden for it
+
+  # ── Legacy project key backward compatibility ──────────────────
+
+  @unimplemented
+  Scenario: Legacy project key (Project.apiKey) continues to work
+    Given a project has the legacy apiKey string attribute set
+    When I authenticate with the legacy sk-lw-{projectKey} token (no underscore)
+    Then authentication succeeds as a legacy project key
+    And the request is scoped to that project
+
+  @unimplemented
+  Scenario: Legacy project key is never deleted by new API key operations
+    When I create, update, or revoke API keys via the new system
+    Then the Project.apiKey string attribute is never modified
+
+  # ── Edit API key ───────────────────────────────────────────────
+
+  @unimplemented
+  Scenario: Edit personal API key name
+    Given I have an API key named "CI Pipeline"
+    When I click the edit icon on "CI Pipeline"
+    Then an edit drawer opens pre-filled with the current name and permissions
+    When I change the name to "Production CI"
+    And I click Save
+    Then the table shows the key with name "Production CI"
+    And the token value has not changed
+
+  @unimplemented
+  Scenario: Edit personal API key permissions
+    Given I have an API key with "All" permissions
+    When I open the edit drawer and select "Restricted"
+    And I set "Project Alpha" to "Viewer"
+    And I click Save
+    Then the key's permissions are updated to "Restricted"
+    And the role bindings reflect the new Viewer-on-Alpha scope
+
+  @unimplemented
+  Scenario: Admin can edit another user's personal key
+    Given I am an organization admin
+    And "bob@example.com" has a personal API key
+    When I edit Bob's key name
+    Then the update succeeds
+
+  @unimplemented
+  Scenario: Non-admin cannot edit another user's key
+    Given I am a member (not admin)
+    When I call apiKey.update on another user's key
+    Then the update is rejected with a not-owned error
+
+  @unimplemented
+  Scenario: Cannot edit a revoked API key
+    Given an API key has been revoked
+    When I call apiKey.update on it
+    Then the update is rejected with an already-revoked error
+
+  @unimplemented
+  Scenario: Service key can only be edited by admin
+    Given a service API key exists
+    And I am a member (not admin)
+    When I call apiKey.update on the service key
+    Then the update is rejected with a not-owned error
+
+  # ── Revoke ─────────────────────────────────────────────────────
+
+  @unimplemented
+  Scenario: Owner revokes their own API key
+    Given I have a personal API key
+    When I click the revoke icon and confirm
+    Then the key is soft-deleted (revokedAt set)
+    And the key no longer appears in the active list
+    And authenticating with the token fails
+
+  @unimplemented
+  Scenario: Admin revokes another user's API key
+    Given I am an organization admin
+    And "bob@example.com" has a personal API key
+    When I revoke Bob's key
+    Then the revocation succeeds
+
+  @unimplemented
+  Scenario: Admin revokes a service API key
+    Given I am an organization admin
+    And a service API key exists
+    When I revoke the service key
+    Then the revocation succeeds
+
+  # ── Token format and authentication ────────────────────────────
+
+  @unit
+  Scenario: New API keys are minted with sk-lw- prefix
+    When I create a new API key
+    Then the token starts with "sk-lw-"
+    And the token format is sk-lw-{lookupId}_{secret}
+
+  @unit
+  Scenario: Old pat-lw- tokens still authenticate
+    Given an API key was created with the old pat-lw- prefix
+    When I authenticate with the pat-lw- token
+    Then authentication succeeds
+
+  @unit
+  Scenario: Token type detection distinguishes API keys from legacy project keys
+    Given a token "sk-lw-abc123_secretpart" (has underscore)
+    Then it is classified as "apiKey"
+    Given a token "sk-lw-oldprojectkey" (no underscore)
+    Then it is classified as "legacyProjectKey"
+
+  # ── Audit logging ──────────────────────────────────────────────
+
+  @unimplemented
+  Scenario: API key creation is audit logged
+    When I create an API key
+    Then an audit log entry is recorded with action "apiKey.create"
+    And the entry includes the key name, permission mode, and key type
+
+  @unimplemented
+  Scenario: API key update is audit logged
+    When I update an API key's name or permissions
+    Then an audit log entry is recorded with action "apiKey.update"
+
+  @unimplemented
+  Scenario: API key revocation is audit logged
+    When I revoke an API key
+    Then an audit log entry is recorded with action "apiKey.revoke"
+    And the entry includes the revoked key's ID
+
+  @unimplemented
+  Scenario: API key authentication is logged on use
+    When a request is authenticated via an API key
+    Then the lastUsedAt timestamp is updated on the key
+    And the API key ID is available in the request context for downstream logging
+
+  # ── Naming a single key ────────────────────────────────────────
+
+  # `apiKey.list` is admin-gated for the whole organization, so anywhere a key
+  # is merely REFERENCED by id (the trace drawer's `langwatch.api_key.id` row)
+  # most of the team would see a raw row id. `apiKey.nameById` answers that one
+  # question for one id the caller already holds, and nothing more: no lookup
+  # id, no secret, no owner, no bindings, no list. Anyone who can read the
+  # trace can already see the id stamped on it, and a name reveals less.
+  #
+  # It is not an enumeration surface: it takes a whole id rather than a prefix
+  # or filter, answers one at a time, and cannot distinguish "no such key" from
+  # "a key in a different organization".
+
+  @unit
+  Scenario: Any organization member can name a key they can already see
+    Given an API key belonging to my organization
+    When I look it up by its id
+    Then I get the key's name
+
+  @unit
+  Scenario: A revoked key still resolves to its name
+    Given an API key in my organization that has been revoked
+    When I look it up by its id
+    Then I get the key's name, marked as revoked
+
+  @unit
+  Scenario: A non-member cannot name a key in an organization they are outside
+    Given an organization I am not a member of
+    When I look up a key id against that organization
+    Then the request is rejected before any key is read
+
+  @unit
+  Scenario: An unresolvable key id returns nothing rather than an error
+    Given a key id that is unknown, or belongs to another organization
+    When I look it up against my own organization
+    Then I get nothing back, so the two cases are indistinguishable
+
+  # ─────────────────────────────────────────────────────────────────────
+  # The page, as it behaves after the family moved out of `[gone]`.
+  # Every one of these held before the move and none was written down: the
+  # move is where somebody finally read both halves.
+  # ─────────────────────────────────────────────────────────────────────
+
+  @integration
+  Scenario: A key row never renders its secret
+    Given the organization has API keys and ingestion keys
+    When I open Settings > API Keys
+    Then each row shows five characters of the key's public lookup id
+    And no row shows any part of the key's secret, however it is styled
+
+  @integration
+  Scenario: A member manages only their own keys
+    Given I am not an organization admin
+    And the table lists a key of mine and a key of somebody else's
+    When I look at the row actions
+    Then my own key offers edit and revoke
+    And the other person's key offers neither
+
+  @integration
+  Scenario: A key needs at least one scope
+    Given I am creating a key and have emptied the scope picker
+    When I submit the form
+    Then the page refuses it with a sentence naming what to do
+    And nothing is sent to the mint
+
+  @integration
+  Scenario: A member sees the page and not the write controls
+    Given I hold only the grant every member of the organization inherits
+    When I open Settings > API Keys
+    Then the page opens rather than refusing me
+    And what I may change is decided row by row, not at the door
+
+  @unit
+  Scenario: Every key the family claims is served by it
+    Given the API Key frontend feature
+    When its page loaders are read
+    Then it registers the API keys settings, authorize, MCP authorize and CLI auth screens, and nothing else
+  # ── The grants have to land before the key is handed out ───────
+
+  # A key row is a plain insert and its grants are ledger commands, so the two
+  # cannot share a transaction. The key is written revoked and un-revoked last,
+  # once its grants are readable. "Readable" is the part that was missing: a
+  # durable append whose projection had not landed yet counted as a grant, and
+  # the mutation answered with a live key that every route then refused.
+
+  @unit
+  Scenario: A key whose grants did not become readable is never activated
+    Given the grant write is durable but its projection has not landed
+    When I create an API key
+    Then the create fails with "authz_grant_not_confirmed"
+    And the key row is left revoked
+    And no token is returned
+
+  @unit
+  Scenario: A key whose custom role did not become readable is never activated
+    Given a restricted key whose role definition has not landed in the projection
+    When I create the API key
+    Then the create fails with "authz_grant_not_confirmed"
+    And the key row is left revoked
+
+  @unit
+  Scenario: A key whose grants are readable is activated and returned
+    Given the grant write lands in the projection
+    When I create an API key
+    Then the key row is activated
+    And the token is returned
+
+  @unit
+  Scenario: Replacing a key's grants keeps the old ones when the new ones do not land
+    Given an API key with grants
+    And the grant write is durable but its projection has not landed
+    When I replace its grants
+    Then the update fails with "authz_grant_not_confirmed"
+    And nothing the key already held is revoked
+
+  @unit
+  Scenario: Replacing a key's grants leaves its metadata alone when the new ones do not land
+    Given an API key with grants
+    And the grant write is durable but its projection has not landed
+    When I replace its grants and its permission mode in one edit
+    Then the update fails with "authz_grant_not_confirmed"
+    And the key still reads with the name and permission mode it had

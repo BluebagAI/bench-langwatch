@@ -1,0 +1,514 @@
+import type { HandledErrorFault, SerializedReason } from "@langwatch/handled-error";
+
+import packageJson from "../package.json" with { type: "json" };
+import { getConfig, requireApiKey } from "./config.ts";
+import type { EvaluationSummary } from "./utils/format-evaluations.ts";
+
+/** Every request names itself so the platform attributes it. */
+// See specs/observability/traffic-attribution.feature.
+export const MCP_IDENTITY_HEADERS: Record<string, string> = {
+  "User-Agent": `langwatch-mcp/${packageJson.version}`,
+  "X-LangWatch-SDK-Name": "langwatch-mcp",
+  "X-LangWatch-SDK-Language": "typescript",
+  "X-LangWatch-SDK-Version": packageJson.version,
+};
+
+/** The dated API version every request names (specs/api-reference/client-api-version.feature). */
+export const LANGWATCH_API_VERSION = "2026-10-26";
+
+/** Names the hosted MCP server's calls apart from a local server's. */
+export const HOSTED_MCP_HEADER = "X-LangWatch-MCP-Host";
+
+// --- Response types ---
+
+export interface TraceSearchResult {
+  trace_id: string;
+  formatted_trace?: string;
+  input?: { value: string };
+  output?: { value: string };
+  timestamps?: { started_at?: string | number };
+  metadata?: Record<string, unknown>;
+  error?: Record<string, unknown>;
+  evaluations?: EvaluationSummary[];
+}
+
+export interface SearchTracesResponse {
+  traces: TraceSearchResult[];
+  pagination?: {
+    totalHits?: number;
+    scrollId?: string;
+  };
+}
+
+export interface TraceDetailResponse {
+  trace_id: string;
+  formatted_trace?: string;
+  input?: { value: string };
+  output?: { value: string };
+  timestamps?: {
+    started_at?: string | number;
+    updated_at?: string | number;
+    inserted_at?: string | number;
+  };
+  metadata?: {
+    user_id?: string;
+    thread_id?: string;
+    customer_id?: string;
+    labels?: string[];
+    [key: string]: unknown;
+  };
+  error?: Record<string, unknown>;
+  ascii_tree?: string;
+  evaluations?: EvaluationSummary[];
+  spans?: {
+    span_id: string;
+    name?: string;
+    type?: string;
+    model?: string;
+    input?: { value: string };
+    output?: { value: string };
+    timestamps?: { started_at?: number; finished_at?: number };
+    metrics?: {
+      completion_time_ms?: number;
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      tokens_estimated?: boolean;
+      cost?: number;
+    };
+  }[];
+}
+
+export interface AnalyticsBucket {
+  date: string;
+  [key: string]: unknown;
+}
+
+export interface AnalyticsTimeseriesResponse {
+  currentPeriod: AnalyticsBucket[];
+  previousPeriod: AnalyticsBucket[];
+}
+
+export interface PromptSummary {
+  id?: string;
+  handle?: string;
+  name?: string;
+  latestVersionNumber?: number;
+  version?: number;
+}
+
+export interface PromptTag {
+  name: string;
+  versionId: string;
+}
+
+export type PromptFieldList = { identifier: string; type: string }[];
+
+/**
+ * A single versioned prompt payload.
+ */
+export interface PromptVersion {
+  versionId?: string;
+  version?: number;
+  commitMessage?: string | null;
+  model?: string;
+  /** Legacy single-text prompt body. */
+  prompt?: string;
+  messages?: { role: string; content: string }[];
+  temperature?: number;
+  maxTokens?: number;
+  responseFormat?: Record<string, unknown> | null;
+  /** Runtime parameters: an object map of name -> JSON value, not an array. */
+  parameters?: Record<string, unknown>;
+  inputs?: PromptFieldList;
+  outputs?: PromptFieldList;
+  /** All tags on the prompt; each names the version it currently points to. */
+  tags?: PromptTag[];
+}
+
+export interface PromptDetailResponse extends PromptSummary, PromptVersion {}
+
+export interface PromptMutationResponse {
+  id?: string;
+  handle?: string;
+  name?: string;
+  latestVersionNumber?: number;
+  versionId?: string;
+  tags?: string[];
+}
+
+// --- HTTP client ---
+
+export class LangWatchApiError extends Error {
+  readonly code?: string;
+  readonly tips?: string[];
+  readonly docsUrl?: string;
+  readonly fault?: HandledErrorFault;
+  /**
+   * The per-field failures behind this error, verbatim from the envelope. A validation failure
+   * carries the offending field and the values it would have accepted here — the difference
+   * between an agent correcting its own request and an agent guessing again.
+   */
+  readonly reasons?: SerializedReason[];
+
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly responseBody: string,
+    options: {
+      code?: string;
+      tips?: string[];
+      docsUrl?: string;
+      fault?: HandledErrorFault;
+      reasons?: SerializedReason[];
+    } = {},
+  ) {
+    super(message);
+    this.name = "LangWatchApiError";
+    this.code = options.code;
+    this.tips = options.tips;
+    this.docsUrl = options.docsUrl;
+    this.fault = options.fault;
+    this.reasons = options.reasons;
+  }
+}
+
+/** Structured fields extracted from a handled-error JSON response body. */
+interface ParsedErrorBody {
+  code?: string;
+  message?: string;
+  tips?: string[];
+  docsUrl?: string;
+  fault?: HandledErrorFault;
+  reasons?: SerializedReason[];
+  /** What the error says beyond its reasons, such as the names it refused. */
+  meta?: Record<string, unknown>;
+}
+
+/** The error's own facts: `meta` without the reasons (shown apart) and the request echo. */
+function detailsOf(meta: Record<string, unknown>): Record<string, unknown> | undefined {
+  const { reasons: _reasons, target: _target, fields: _fields, ...details } = meta;
+
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
+const VALID_FAULTS: readonly HandledErrorFault[] = [
+  "customer",
+  "platform",
+  "provider",
+  "presumed_platform",
+];
+
+/**
+ * Parses an error response body as a handled-error envelope.
+ */
+function parseErrorBody(responseBody: string): ParsedErrorBody {
+  try {
+    const parsed: unknown = JSON.parse(responseBody);
+    if (!isRecord(parsed)) return {};
+    const envelope = parsed;
+    // The canonical v1 envelope nests everything under `error`. Read the
+    // nested object as the body so one parser serves both generations.
+    const nestedValue = envelope.error;
+    const nested = isRecord(nestedValue) ? nestedValue : null;
+    const body = nested ?? envelope;
+    // `code` is the domain discriminant. The `error` fallback reads the
+    // legacy envelope some non-framework families still send; the framework's
+    // own unversioned union envelope, which used `error` for the HTTP status
+    // text, is gone (packages/api/adrs/002).
+    const code = readErrorCode(body);
+    const message = typeof body.message === "string" ? body.message : undefined;
+    if (code === undefined && message === undefined) {
+      return {};
+    }
+    const tips = readStringArray(body.tips);
+    const docsUrl = typeof body.docsUrl === "string" ? body.docsUrl : undefined;
+    const fault = VALID_FAULTS.includes(body.fault as HandledErrorFault)
+      ? (body.fault as HandledErrorFault)
+      : undefined;
+    // The v1 envelope carries the per-field failures in `meta.reasons`; older ones at the top.
+    const meta = isRecord(body.meta) ? body.meta : {};
+    const rawReasons = Array.isArray(body.reasons) ? body.reasons : meta.reasons;
+    const reasons =
+      Array.isArray(rawReasons) && rawReasons.every((r) => !!r && typeof r === "object")
+        ? (rawReasons as SerializedReason[])
+        : undefined;
+    return { code, message, tips, docsUrl, fault, reasons, meta: detailsOf(meta) };
+  } catch {
+    return {};
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readErrorCode(body: Record<string, unknown>): string | undefined {
+  if (typeof body.code === "string") return body.code;
+  if (typeof body.error === "string") return body.error;
+  return undefined;
+}
+
+function readStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || !value.every(isString)) return undefined;
+  return value;
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+/**
+ * The human line for one per-field failure: the field, what it would have accepted, and what it
+ * got. Returns null when a reason names no field, so a generic nested error adds no noise to
+ * the message.
+ */
+function describeReason(reason: SerializedReason): string | null {
+  const meta = reason.meta;
+  if (!meta || typeof meta !== "object") return null;
+
+  const field = typeof meta.field === "string" ? meta.field : null;
+  if (!field) return null;
+
+  const parts = [`- ${field}`];
+  if (meta.received !== undefined) {
+    parts.push(`received ${JSON.stringify(meta.received)}`);
+  }
+  if (Array.isArray(meta.expected) && meta.expected.length > 0) {
+    parts.push(`expected one of: ${meta.expected.join(", ")}`);
+  }
+  return parts.join(" — ");
+}
+
+/** The error an unsuccessful response becomes: its message, code, details, fields and tips. */
+function apiErrorOf({
+  status,
+  responseBody,
+}: {
+  status: number;
+  responseBody: string;
+}): LangWatchApiError {
+  const parsed = parseErrorBody(responseBody);
+  const lines = [`LangWatch API error ${status}: ${parsed.message ?? responseBody}`];
+  if (parsed.code) lines.push(`Code: ${parsed.code}`);
+  if (parsed.meta) lines.push(`Details: ${JSON.stringify(parsed.meta)}`);
+  const reasonLines = (parsed.reasons ?? [])
+    .map(describeReason)
+    .filter((line): line is string => line !== null);
+  if (reasonLines.length > 0) {
+    lines.push("Rejected fields:", ...reasonLines);
+  }
+  if (parsed.tips && parsed.tips.length > 0) {
+    lines.push("Tips:", ...parsed.tips.map((tip) => `- ${tip}`));
+  }
+  if (parsed.docsUrl) {
+    lines.push(`Docs: ${parsed.docsUrl}`);
+  }
+  return new LangWatchApiError(lines.join("\n"), status, responseBody, {
+    code: parsed.code,
+    tips: parsed.tips,
+    docsUrl: parsed.docsUrl,
+    fault: parsed.fault,
+    reasons: parsed.reasons,
+  });
+}
+
+/**
+ * Sends an HTTP request to the LangWatch API. Builds the full URL from the configured endpoint,
+ * adds authentication, and handles JSON serialization/deserialization. @throws
+ * LangWatchApiError with status code and response body when the response is not OK.
+ */
+export async function makeRequest(
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
+  path: string,
+  body?: unknown,
+): Promise<unknown> {
+  const config = getConfig();
+  const url = config.endpoint + path;
+  const headers: Record<string, string> = {
+    ...MCP_IDENTITY_HEADERS,
+    "X-API-Version": LANGWATCH_API_VERSION,
+    "X-Auth-Token": requireApiKey(),
+  };
+  if (config.projectId) {
+    headers["X-Project-Id"] = config.projectId;
+  }
+  if (config.hosted) {
+    headers[HOSTED_MCP_HEADER] = "hosted";
+  }
+
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+
+  if (!response.ok)
+    throw apiErrorOf({ status: response.status, responseBody: await response.text() });
+
+  if (response.status === 204 || response.headers?.get("content-length") === "0") {
+    return null;
+  }
+  return response.json();
+}
+
+/**
+ * Searches traces with optional filters and pagination. Paging is by `scrollId` only: pass the
+ * one the previous response returned, and stop when a response carries none.
+ */
+export async function searchTraces(params: {
+  query?: string;
+  /** Exact trace ids: a primary-key seek on trace_summaries, not a scan (ADR-164). */
+  traceIds?: string[];
+  filters?: Record<string, string[]>;
+  /**
+   * The Trace Explorer's query language, as one string. Combined server-side
+   * with `filters`, `query` and `traceIds` rather than replacing any of them.
+   */
+  filter?: string;
+  startDate: number;
+  endDate: number;
+  pageSize?: number;
+  scrollId?: string;
+  format?: "digest" | "json";
+}): Promise<SearchTracesResponse> {
+  const { format = "digest", ...rest } = params;
+  return makeRequest("POST", "/api/v1/traces/search", {
+    ...rest,
+    format,
+  }) as Promise<SearchTracesResponse>;
+}
+
+/** Retrieves a single trace by its ID. */
+export async function getTraceById(
+  traceId: string,
+  format: "digest" | "json" = "digest",
+): Promise<TraceDetailResponse> {
+  return makeRequest(
+    "GET",
+    `/api/v1/traces/${encodeURIComponent(traceId)}?format=${format}`,
+  ) as Promise<TraceDetailResponse>;
+}
+
+/** Fetches analytics timeseries data for the given metrics and date range. */
+export async function getAnalyticsTimeseries(params: {
+  series: {
+    metric: string;
+    aggregation: string;
+    key?: string;
+    subkey?: string;
+  }[];
+  startDate: number;
+  endDate: number;
+  timeZone?: string;
+  groupBy?: string;
+  groupByKey?: string;
+  filters?: Record<string, string[]>;
+}): Promise<AnalyticsTimeseriesResponse> {
+  return makeRequest(
+    "POST",
+    "/api/v1/analytics/timeseries",
+    params,
+  ) as Promise<AnalyticsTimeseriesResponse>;
+}
+
+/** Lists all prompts in the project. */
+export async function listPrompts(): Promise<PromptSummary[]> {
+  return makeRequest("GET", "/api/v1/prompts") as Promise<PromptSummary[]>;
+}
+
+/** Retrieves a single prompt by ID or handle. */
+export async function getPrompt(
+  idOrHandle: string,
+  options?: { version?: number; tag?: string },
+): Promise<PromptDetailResponse> {
+  const params = new URLSearchParams();
+  if (options?.version != null) params.set("version", String(options.version));
+  if (options?.tag) params.set("tag", options.tag);
+  const query = params.toString() ? `?${params}` : "";
+  return makeRequest(
+    "GET",
+    `/api/v1/prompts/${encodeURIComponent(idOrHandle)}${query}`,
+  ) as Promise<PromptDetailResponse>;
+}
+
+/** Lists all versions of a prompt (versioned data only). */
+export async function getPromptVersions(idOrHandle: string): Promise<PromptVersion[]> {
+  return makeRequest(
+    "GET",
+    `/api/v1/prompts/${encodeURIComponent(idOrHandle)}/versions`,
+  ) as Promise<PromptVersion[]>;
+}
+
+/** Creates a new prompt. */
+export async function createPrompt(data: {
+  handle: string;
+  messages: { role: string; content: string }[];
+  model: string;
+  tags?: string[];
+}): Promise<PromptMutationResponse> {
+  return makeRequest("POST", "/api/v1/prompts", data) as Promise<PromptMutationResponse>;
+}
+
+/** Updates an existing prompt by ID or handle. */
+export async function updatePrompt(
+  idOrHandle: string,
+  data: {
+    messages?: { role: string; content: string }[];
+    model?: string;
+    commitMessage: string;
+    tags?: string[];
+  },
+): Promise<PromptMutationResponse> {
+  return makeRequest(
+    "PUT",
+    `/api/v1/prompts/${encodeURIComponent(idOrHandle)}`,
+    data,
+  ) as Promise<PromptMutationResponse>;
+}
+
+/** Assigns a tag to a specific prompt version. */
+export async function assignPromptTag({
+  idOrHandle,
+  tag,
+  versionId,
+}: {
+  idOrHandle: string;
+  tag: string;
+  versionId: string;
+}): Promise<unknown> {
+  return makeRequest(
+    "PUT",
+    `/api/v1/prompts/${encodeURIComponent(idOrHandle)}/tags/${encodeURIComponent(tag)}`,
+    { versionId },
+  );
+}
+
+/** Lists all prompt tag definitions for the organization. */
+export async function listPromptTags(): Promise<unknown> {
+  return makeRequest("GET", "/api/v1/prompts/tags");
+}
+
+/** Creates a custom prompt tag definition. */
+export async function createPromptTag(name: string): Promise<unknown> {
+  return makeRequest("POST", "/api/v1/prompts/tags", { name });
+}
+
+/** Renames an existing prompt tag. */
+export async function renamePromptTag({
+  tag,
+  name,
+}: {
+  tag: string;
+  name: string;
+}): Promise<unknown> {
+  return makeRequest("PUT", `/api/v1/prompts/tags/${encodeURIComponent(tag)}`, { name });
+}
+
+/** Deletes a prompt tag and all its assignments. */
+export async function deletePromptTag(tag: string): Promise<unknown> {
+  return makeRequest("DELETE", `/api/v1/prompts/tags/${encodeURIComponent(tag)}`);
+}

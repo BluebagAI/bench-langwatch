@@ -1,0 +1,190 @@
+import chalk from "chalk";
+
+import {
+  type VirtualKeyBudgetInput,
+  type VirtualKeyRoutingMode,
+  VirtualKeysApiService,
+} from "@/client-sdk/services/virtual-keys/virtual-keys-api.service";
+
+import { resolveCredentials } from "../../utils/apiKey";
+import type { CommandResult } from "../../utils/output";
+import { createSpinner } from "../../utils/spinner";
+import { failSpinner } from "../../utils/spinnerError";
+import {
+  buildBudgetFlags,
+  formatScope,
+  parseRoutingModeArg,
+  parseScopeArg,
+  virtualKeyDetailUrl,
+} from "./_shared";
+
+export interface CreateVirtualKeyOptions {
+  name: string;
+  description?: string;
+  scope?: string[];
+  traceProject?: string;
+  routingPolicy?: string;
+  routingMode?: string;
+  principalUser?: string;
+  budgetLimit?: string;
+  budgetWindow?: string;
+  budgetBreach?: "block" | "warn";
+  providersAllowed?: string;
+  /**
+   * Withhold the secret and print a one-time reveal id instead. For a caller that relays the key to
+   * someone else, an agent printing a snippet for instance: the person reads the secret once
+   * through the app, and the caller never holds it.
+   */
+  revealOnce?: boolean;
+}
+
+/** The key as `--reveal-once` prints it: everything but the secret. */
+export function revealOnceLines({
+  id,
+  name,
+  preview,
+  revealId,
+}: {
+  id: string;
+  name: string;
+  preview: string;
+  revealId: string;
+}): string[] {
+  return [
+    "The secret was not printed. It is shown once, through the app, to the person the key is for.",
+    `Virtual key id: ${id}`,
+    `Name:           ${name}`,
+    `Prefix:         ${preview}...`,
+    `Reveal id:      ${revealId}`,
+  ];
+}
+
+/**
+ * Returns the created key rather than printing it. `data` includes `secret` --
+ * the ONE moment it exists. `--reveal-once` is the exception: the server
+ * withholds it and answers with the reveal id, so no output carries it.
+ */
+export const createVirtualKeyCommand = async (
+  options: CreateVirtualKeyOptions,
+): Promise<CommandResult | void> => {
+  await resolveCredentials();
+
+  if (!options.name) {
+    console.error(chalk.red("Error: --name is required"));
+    process.exit(1);
+  }
+
+  let scopes;
+  let budget: VirtualKeyBudgetInput | undefined;
+  let routingMode: VirtualKeyRoutingMode | undefined;
+  try {
+    // Omitted scopes are the common reseller path: the server scopes the
+    // key to the calling project.
+    scopes = options.scope?.length ? options.scope.map(parseScopeArg) : undefined;
+    budget = buildBudgetFlags(options) ?? undefined;
+    if (options.routingMode !== undefined) {
+      routingMode = parseRoutingModeArg(options.routingMode);
+    }
+  } catch (error) {
+    console.error(chalk.red(`Error: ${(error as Error).message}`));
+    process.exit(1);
+  }
+
+  const providersAllowed = options.providersAllowed
+    ?.split(",")
+    .map((p) => p.trim())
+    .filter((p) => p.length > 0);
+
+  const service = new VirtualKeysApiService();
+  const spinner = createSpinner(`Creating virtual key "${options.name}"...`).start();
+
+  try {
+    const input = {
+      name: options.name,
+      description: options.description,
+      principal_user_id: options.principalUser ?? null,
+      scopes,
+      trace_project_id: options.traceProject ?? null,
+      routing_policy_id: options.routingPolicy ?? null,
+      routing_mode: routingMode,
+      budget,
+      ...(providersAllowed?.length ? { config: { providersAllowed } } : {}),
+    };
+
+    if (options.revealOnce) {
+      const { virtual_key, reveal_id, preview } = await service.create({
+        ...input,
+        reveal_once: true,
+      });
+      spinner.succeed(`Created virtual key "${chalk.cyan(virtual_key.name)}"`);
+      return {
+        data: { virtual_key, reveal_id, preview },
+        table: () => {
+          console.log();
+          for (const line of revealOnceLines({
+            id: virtual_key.id,
+            name: virtual_key.name,
+            preview,
+            revealId: reveal_id,
+          })) {
+            console.log(`  ${line}`);
+          }
+          console.log();
+        },
+      };
+    }
+
+    const { virtual_key, secret } = await service.create(input);
+
+    spinner.succeed(`Created virtual key "${chalk.cyan(virtual_key.name)}"`);
+
+    return {
+      data: { virtual_key, secret },
+      table: () => printCreatedKey({ virtual_key, secret, budget }),
+    };
+  } catch (error) {
+    failSpinner({ spinner, error, action: "create virtual key" });
+    process.exit(1);
+  }
+};
+
+function printCreatedKey({
+  virtual_key,
+  secret,
+  budget,
+}: {
+  virtual_key: Awaited<ReturnType<VirtualKeysApiService["create"]>>["virtual_key"];
+  secret: string;
+  budget: VirtualKeyBudgetInput | undefined;
+}): void {
+  console.log();
+  console.log(chalk.bold.yellow("⚠  Save the secret below NOW. It will not be shown again."));
+  console.log();
+  console.log(`  ${chalk.green(secret)}`);
+  console.log();
+  console.log(chalk.gray("Use it as the API key in OpenAI-compatible clients:"));
+  console.log(chalk.cyan('  export OPENAI_API_KEY="' + secret + '"'));
+  console.log(chalk.cyan('  export OPENAI_BASE_URL="https://gateway.langwatch.ai/v1"'));
+  console.log();
+  console.log(chalk.gray("Virtual key id: ") + virtual_key.id);
+  console.log(chalk.gray("Prefix:         ") + `${virtual_key.display_prefix}...`);
+  console.log(chalk.gray("Scopes:         ") + virtual_key.scopes.map(formatScope).join(", "));
+  console.log(chalk.gray("Routing mode:   ") + virtual_key.routing_mode);
+  if (virtual_key.routing_policy_id) {
+    console.log(chalk.gray("Routing policy: ") + virtual_key.routing_policy_id);
+  }
+  if (virtual_key.principal_user_id) {
+    console.log(chalk.gray("Principal:      ") + virtual_key.principal_user_id);
+  }
+  if (budget) {
+    console.log(
+      chalk.gray("Budget:         ") +
+        `$${budget.limit_usd} / ${budget.window} (${budget.on_breach ?? "block"})`,
+    );
+  }
+  const detailUrl = virtualKeyDetailUrl(virtual_key.id);
+  if (detailUrl) {
+    console.log(chalk.gray("View in UI:     ") + chalk.cyan(detailUrl));
+  }
+  console.log();
+}

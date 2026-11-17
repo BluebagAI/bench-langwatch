@@ -1,0 +1,346 @@
+import { scopedApiKey } from "@/internal/credentialContext";
+
+import { PromptsFacade, PromptsApiService } from "./services/prompts";
+export { FetchPolicy, type GetPromptOptions } from "./services/prompts";
+export type {
+  Dataset,
+  DatasetEntry,
+  DatasetMetadata,
+  DatasetColumnType,
+  DatasetListItem,
+  Pagination,
+  PaginatedResponse,
+  GetDatasetOptions,
+  ListDatasetsOptions,
+  ListDatasetsApiResponse,
+  ListRecordsOptions,
+  ListRecordsApiResponse,
+  CreateDatasetOptions,
+  UpdateDatasetOptions,
+  CreateFromUploadResponse,
+  BatchCreateRecordsResponse,
+  DeleteRecordsResponse,
+  UploadResponse,
+  DatasetRecordResponse,
+} from "./services/datasets";
+export {
+  DatasetError,
+  DatasetNotFoundError,
+  DatasetApiError,
+  DatasetValidationError,
+  DatasetPlanLimitError,
+} from "./services/datasets";
+export type {
+  ExperimentConcurrencyOptions,
+  ExperimentRunResult,
+  RunExperimentOptions,
+  RunWithResultsOptions,
+  ExperimentRowResult,
+  ExperimentRunWithResults,
+} from "./services/experiments";
+export {
+  ExperimentsError,
+  ExperimentNotFoundError,
+  ExperimentTimeoutError,
+  ExperimentRunFailedError,
+  ExperimentsApiError,
+} from "./services/experiments";
+export type {
+  EvaluationResult,
+  EvaluateOptions,
+  EvaluationStatus,
+  EvaluationCost,
+} from "./services/evaluations";
+export {
+  EvaluationError,
+  EvaluatorCallError,
+  EvaluatorNotFoundError,
+  EvaluationsApiError,
+} from "./services/evaluations";
+export { EvaluatorsApiService, EvaluatorsApiError } from "./services/evaluators";
+export { ScenariosApiService, ScenariosApiError } from "./services/scenarios";
+export { SuitesApiService, SuitesApiError } from "./services/suites";
+export { RunPlansApiService, RunPlansApiError } from "./services/run-plans";
+export { InstantEvalsApiService, InstantEvalsApiError } from "./services/instant-evals";
+export { TestSuitesApiService, TestSuitesApiError } from "./services/test-suites";
+export { WorkflowsApiService, WorkflowsApiError } from "./services/workflows/workflows-api.service";
+export { AgentsApiService, AgentsApiError } from "./services/agents/agents-api.service";
+export {
+  AnnotationsApiService,
+  AnnotationsApiError,
+} from "./services/annotations/annotations-api.service";
+export {
+  DashboardsApiService,
+  DashboardsApiError,
+} from "./services/dashboards/dashboards-api.service";
+export type {
+  Dashboard,
+  DashboardListItem,
+  DashboardWidget,
+  CreateDashboardWidgetInput,
+  UpdateDashboardWidgetInput,
+} from "./services/dashboards/dashboards-api.service";
+export {
+  AnalyticsReportsApiService,
+  AnalyticsReportsApiError,
+} from "./services/analytics-reports/analytics-reports-api.service";
+export type {
+  AnalyticsReportSummary,
+  AnalyticsReportDetail,
+} from "./services/analytics-reports/analytics-reports-api.service";
+export {
+  ModelProvidersApiService,
+  ModelProvidersApiError,
+} from "./services/model-providers/model-providers-api.service";
+export { AnalyticsApiService, AnalyticsApiError } from "./services/analytics/analytics-api.service";
+export { QueryApiService, QueryApiError } from "./services/query/query-api.service";
+export { TriggersApiService, TriggersApiError } from "./services/triggers";
+export { GraphsApiService, GraphsApiError } from "./services/graphs";
+export { SimulationRunsApiService, SimulationRunsApiError } from "./services/simulation-runs";
+export { TracesApiService, TracesApiError } from "./services/traces/traces-api.service";
+export { MonitorsApiService, MonitorsApiError } from "./services/monitors";
+export { SecretsApiService, SecretsApiError } from "./services/secrets";
+export {
+  VirtualKeysApiService,
+  VirtualKeysApiError,
+} from "./services/virtual-keys/virtual-keys-api.service";
+export {
+  GatewayBudgetsApiService,
+  GatewayBudgetsApiError,
+} from "./services/gateway-budgets/gateway-budgets-api.service";
+export {
+  SpendEventsApiService,
+  SpendEventsApiError,
+} from "./services/spend-events/spend-events-api.service";
+export { WebhooksApiService, WebhooksApiError } from "./services/webhooks/webhooks-api.service";
+export { TeamsApiService, TeamsApiError } from "./services/teams/teams-api.service";
+export type {
+  Team,
+  TeamPagination,
+  TeamMember,
+  ListTeamsResponse,
+  ArchivedTeam,
+} from "./services/teams/teams-api.service";
+export { ProjectsApiService, ProjectsApiError } from "./services/projects/projects-api.service";
+export type {
+  Project,
+  PaginatedProjects,
+  ProjectWithServiceKey,
+  ArchivedProject,
+  CreateProjectInput,
+  UpdateProjectInput,
+} from "./services/projects/projects-api.service";
+import { resolveEndpoint } from "@/internal/endpoint";
+
+import { createLangWatchApiClient, type LangwatchApiClient } from "../internal/api/client";
+import { type Logger, NoOpLogger } from "../logger";
+import { AgentsApiService } from "./services/agents/agents-api.service";
+import { AnalyticsReportsApiService } from "./services/analytics-reports/analytics-reports-api.service";
+import { AnalyticsApiService } from "./services/analytics/analytics-api.service";
+import { AnnotationsApiService } from "./services/annotations/annotations-api.service";
+import { DashboardsApiService } from "./services/dashboards/dashboards-api.service";
+import { DatasetsFacade } from "./services/datasets";
+import { EvaluationsFacade } from "./services/evaluations";
+import { EvaluatorsApiService } from "./services/evaluators";
+import { ExperimentsFacade } from "./services/experiments";
+import { GatewayBudgetsApiService } from "./services/gateway-budgets/gateway-budgets-api.service";
+import { GraphsApiService } from "./services/graphs";
+import { InstantEvalsApiService } from "./services/instant-evals";
+import { ModelProvidersApiService } from "./services/model-providers/model-providers-api.service";
+import { MonitorsApiService } from "./services/monitors";
+import { ProjectsApiService } from "./services/projects/projects-api.service";
+import { LocalPromptsService } from "./services/prompts/local-prompts.service";
+import { QueryApiService } from "./services/query/query-api.service";
+import { RunPlansApiService } from "./services/run-plans";
+import { ScenariosApiService } from "./services/scenarios";
+import { SecretsApiService } from "./services/secrets";
+import { SimulationRunsApiService } from "./services/simulation-runs";
+import { SpendEventsApiService } from "./services/spend-events/spend-events-api.service";
+import { SuitesApiService } from "./services/suites";
+import { TeamsApiService } from "./services/teams/teams-api.service";
+import { TestSuitesApiService } from "./services/test-suites";
+import { TracesFacade } from "./services/traces/facade";
+import { TriggersApiService } from "./services/triggers";
+import { VirtualKeysApiService } from "./services/virtual-keys/virtual-keys-api.service";
+import { WebhooksApiService } from "./services/webhooks/webhooks-api.service";
+import { WorkflowsApiService } from "./services/workflows/workflows-api.service";
+import { type InternalConfig } from "./types";
+
+export interface LangWatchConstructorOptions {
+  apiKey?: string;
+  endpoint?: string;
+  projectId?: string;
+  options?: {
+    logger?: Logger;
+  };
+}
+
+export class LangWatch {
+  private readonly config: InternalConfig & { endpoint: string; apiKey: string };
+
+  readonly prompts: PromptsFacade;
+  readonly traces: TracesFacade;
+  readonly datasets: DatasetsFacade;
+
+  /**
+   * Run experiments on LangWatch platform or via SDK.
+   */
+  readonly experiments: ExperimentsFacade;
+
+  /**
+   * Run evaluators and guardrails in real-time (Online Evaluations).
+   * @example
+   */
+  readonly evaluations: EvaluationsFacade;
+
+  readonly evaluators: EvaluatorsApiService;
+  readonly scenarios: ScenariosApiService;
+  /**
+   * @deprecated Use runPlans and testSuites; /api/v1/suites is a frozen alias.
+   */
+  readonly suites: SuitesApiService;
+  readonly runPlans: RunPlansApiService;
+  /** Judge one LangWatchQL statement across the project's history as a job. */
+  readonly instantEvals: InstantEvalsApiService;
+  readonly testSuites: TestSuitesApiService;
+  readonly workflows: WorkflowsApiService;
+  readonly agents: AgentsApiService;
+  readonly annotations: AnnotationsApiService;
+  /** The project's dashboards and the widgets on them, over /api/v1/dashboards. */
+  readonly dashboards: DashboardsApiService;
+  /** The Analytics Reports, over /api/v1/analytics/reports; the platform deprecates them. */
+  readonly analyticsReports: AnalyticsReportsApiService;
+  readonly modelProviders: ModelProvidersApiService;
+  readonly analytics: AnalyticsApiService;
+  /** The raw LangWatchQL door: a governed SELECT or schema discovery outside a saved chart. */
+  readonly query: QueryApiService;
+  readonly triggers: TriggersApiService;
+  readonly graphs: GraphsApiService;
+  readonly simulationRuns: SimulationRunsApiService;
+  readonly monitors: MonitorsApiService;
+  readonly secrets: SecretsApiService;
+  readonly virtualKeys: VirtualKeysApiService;
+  readonly gatewayBudgets: GatewayBudgetsApiService;
+  readonly spendEvents: SpendEventsApiService;
+  readonly webhooks: WebhooksApiService;
+
+  #teams?: TeamsApiService;
+  #projects?: ProjectsApiService;
+
+  constructor(options: LangWatchConstructorOptions = {}) {
+    const apiKey = options.apiKey ?? scopedApiKey() ?? process.env.LANGWATCH_API_KEY ?? "";
+    const endpoint = resolveEndpoint(options.endpoint);
+
+    this.config = this.#createInternalConfig({
+      apiKey,
+      endpoint,
+      options: options.options,
+    });
+
+    this.prompts = new PromptsFacade({
+      promptsApiService: new PromptsApiService(this.config),
+      localPromptsService: new LocalPromptsService(),
+      ...this.config,
+    });
+    this.traces = new TracesFacade(this.config);
+
+    this.experiments = new ExperimentsFacade({
+      langwatchApiClient: this.config.langwatchApiClient,
+      endpoint: this.config.endpoint,
+      apiKey: this.config.apiKey,
+      logger: this.config.logger,
+    });
+
+    this.datasets = new DatasetsFacade({
+      langwatchApiClient: this.config.langwatchApiClient,
+      logger: this.config.logger,
+      endpoint: this.config.endpoint,
+      apiKey: this.config.apiKey,
+    });
+
+    this.evaluations = new EvaluationsFacade({
+      endpoint: this.config.endpoint,
+      apiKey: this.config.apiKey,
+      logger: this.config.logger,
+    });
+
+    this.evaluators = new EvaluatorsApiService(this.config);
+    this.scenarios = new ScenariosApiService(this.config);
+    this.suites = new SuitesApiService(this.config);
+    this.runPlans = new RunPlansApiService(this.config);
+    this.instantEvals = new InstantEvalsApiService(this.config);
+    this.testSuites = new TestSuitesApiService(this.config);
+    this.workflows = new WorkflowsApiService(this.config);
+    this.agents = new AgentsApiService(this.config);
+    this.annotations = new AnnotationsApiService(this.config);
+    this.dashboards = new DashboardsApiService(this.config);
+    this.analyticsReports = new AnalyticsReportsApiService(this.config);
+    this.modelProviders = new ModelProvidersApiService(this.config);
+    this.analytics = new AnalyticsApiService(this.config);
+    this.query = new QueryApiService(this.config);
+    this.triggers = new TriggersApiService(this.config);
+    this.graphs = new GraphsApiService(this.config);
+    this.simulationRuns = new SimulationRunsApiService(this.config);
+    this.monitors = new MonitorsApiService({ apiKey, endpoint });
+    this.secrets = new SecretsApiService({
+      apiKey,
+      endpoint,
+      projectId: options.projectId,
+    });
+    this.virtualKeys = new VirtualKeysApiService({ apiKey, endpoint });
+    this.gatewayBudgets = new GatewayBudgetsApiService({ apiKey, endpoint });
+    this.spendEvents = new SpendEventsApiService({ apiKey, endpoint });
+    this.webhooks = new WebhooksApiService({ apiKey, endpoint });
+  }
+
+  get apiClient(): LangwatchApiClient {
+    return this.config.langwatchApiClient;
+  }
+
+  /**
+   * Teams, which group projects and the members who can reach them. These routes want an
+   * organization API key.
+   */
+  get teams(): TeamsApiService {
+    this.#teams ??= new TeamsApiService(this.#managementConfig());
+    return this.#teams;
+  }
+
+  /**
+   * Projects, including provisioning one with its own service API key. These
+   * routes want an organization API key.
+   */
+  get projects(): ProjectsApiService {
+    this.#projects ??= new ProjectsApiService(this.#managementConfig());
+    return this.#projects;
+  }
+
+  /**
+   * What the management families are constructed with. An empty key is left
+   * off entirely so they resolve the ambient credential instead of
+   * authenticating with a blank bearer token.
+   */
+  #managementConfig(): { apiKey?: string; endpoint: string } {
+    return {
+      ...(this.config.apiKey ? { apiKey: this.config.apiKey } : {}),
+      endpoint: this.config.endpoint,
+    };
+  }
+
+  #createInternalConfig({
+    apiKey,
+    endpoint,
+    options,
+  }: {
+    apiKey: string;
+    endpoint: string;
+    options?: LangWatchConstructorOptions["options"];
+  }): InternalConfig & { endpoint: string; apiKey: string } {
+    return {
+      logger: options?.logger ?? new NoOpLogger(),
+      langwatchApiClient: createLangWatchApiClient(apiKey, endpoint),
+      endpoint,
+      apiKey,
+    };
+  }
+}

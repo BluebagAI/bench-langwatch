@@ -1,0 +1,635 @@
+import chalk from "chalk";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+
+import type { EvaluatorResponse } from "@/client-sdk/services/evaluators";
+import { EvaluatorsApiError, EvaluatorsApiService } from "@/client-sdk/services/evaluators";
+
+// Mock dependencies before imports
+vi.mock("@/client-sdk/services/evaluators", async (importOriginal) => {
+  const actual = await importOriginal<typeof evaluatorsModule>();
+  return {
+    ...actual,
+    EvaluatorsApiService: vi.fn(),
+  };
+});
+
+vi.mock("../../../utils/apiKey", () => ({
+  resolveCredentials: vi.fn(async () => ({
+    apiKey: "test-key",
+    source: "env",
+    endpoint: "https://app.langwatch.ai",
+  })),
+}));
+
+const spinnerFail = vi.hoisted(() => vi.fn());
+
+vi.mock("ora", () => ({
+  default: () => ({
+    start: vi.fn().mockReturnThis(),
+    succeed: vi.fn(),
+    fail: spinnerFail,
+  }),
+}));
+
+import type * as evaluatorsModule from "@/client-sdk/services/evaluators";
+
+import { applyOutputContext, resolveOutputOptions } from "../../../utils/output";
+import { createEvaluatorCommand } from "../create";
+import { deleteEvaluatorCommand } from "../delete";
+import { exactLookupMissMessage } from "../findEvaluator";
+import { getEvaluatorCommand } from "../get";
+import { listEvaluatorsCommand } from "../list";
+import { updateEvaluatorCommand } from "../update";
+import { handledError } from "./handledErrorFixture";
+
+class ProcessExitError extends Error {
+  constructor(public code: number) {
+    super(`process.exit(${code})`);
+  }
+}
+
+const noop = () => {
+  // intentionally empty — suppresses output during tests
+};
+
+const mockProcessExit = () =>
+  vi.spyOn(process, "exit").mockImplementation((code) => {
+    throw new ProcessExitError(code as number);
+  });
+
+const makeEvaluator = (overrides: Partial<EvaluatorResponse> = {}): EvaluatorResponse => ({
+  id: "evaluator_abc123",
+  projectId: "proj_1",
+  name: "Test Evaluator",
+  slug: "test-evaluator",
+  type: "evaluator",
+  config: { evaluatorType: "langevals/llm_boolean" },
+  workflowId: null,
+  copiedFromEvaluatorId: null,
+  version: 1,
+  labels: [],
+  createdBy: null,
+  updatedBy: null,
+  createdAt: "2026-01-01T00:00:00Z",
+  updatedAt: "2026-01-02T00:00:00Z",
+  fields: [{ identifier: "input", type: "string" }],
+  outputFields: [{ identifier: "score", type: "number" }],
+  platformUrl: "https://app.langwatch.ai/proj-1/evaluators/evaluator_abc123",
+  ...overrides,
+});
+
+const evaluatorNotFound = () => handledError("evaluator_not_found");
+
+const jsonErrorCode = async (run: () => Promise<unknown>): Promise<string> => {
+  await applyOutputContext(resolveOutputOptions({ output: "json" }, {}));
+  await expect(run()).rejects.toThrow(ProcessExitError);
+  const doc = JSON.parse(
+    vi
+      .mocked(console.log)
+      .mock.calls.map((call) => String(call[0]))
+      .join("\n"),
+  ) as { error: { code: string } };
+  await applyOutputContext(resolveOutputOptions({}, {}));
+  return doc.error.code;
+};
+
+describe("listEvaluatorsCommand()", () => {
+  let mockGetAll: ReturnType<typeof vi.fn>;
+  let exitSpy: ReturnType<typeof mockProcessExit>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetAll = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: mockGetAll,
+        get: vi.fn(),
+        create: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    exitSpy = mockProcessExit();
+  });
+
+  describe("when evaluators exist", () => {
+    it("calls getAll and prints output", async () => {
+      mockGetAll.mockResolvedValue([makeEvaluator()]);
+
+      await listEvaluatorsCommand();
+
+      expect(mockGetAll).toHaveBeenCalledOnce();
+    });
+  });
+
+  describe("when no evaluators exist", () => {
+    it("prints empty-state guidance", async () => {
+      mockGetAll.mockResolvedValue([]);
+
+      await listEvaluatorsCommand();
+
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("when the API call fails", () => {
+    it("exits with code 1", async () => {
+      mockGetAll.mockRejectedValue(new EvaluatorsApiError("Network error", "fetch all evaluators"));
+
+      await expect(listEvaluatorsCommand()).rejects.toThrow(ProcessExitError);
+    });
+  });
+});
+
+describe("getEvaluatorCommand()", () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockGetAll: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn();
+    mockGetAll = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: mockGetAll,
+        get: mockGet,
+        create: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when evaluator is found", () => {
+    it("calls get with the provided slug", async () => {
+      mockGet.mockResolvedValue(makeEvaluator());
+
+      await getEvaluatorCommand("test-evaluator");
+
+      expect(mockGet).toHaveBeenCalledWith("test-evaluator");
+    });
+  });
+
+  describe("when evaluator is not found", () => {
+    it("exits with code 1", async () => {
+      mockGet.mockRejectedValue(new EvaluatorsApiError("Not found", "fetch evaluator"));
+
+      await expect(getEvaluatorCommand("nonexistent")).rejects.toThrow(ProcessExitError);
+    });
+  });
+
+  describe("when two evaluators share the display name", () => {
+    it("fails with a validation_error", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+      mockGetAll.mockResolvedValue([
+        makeEvaluator({ id: "ev_1", slug: "a", name: "Twin" }),
+        makeEvaluator({ id: "ev_2", slug: "b", name: "Twin" }),
+      ]);
+
+      expect(await jsonErrorCode(() => getEvaluatorCommand("Twin"))).toBe("validation_error");
+    });
+  });
+
+  describe("when nothing matches the reference", () => {
+    it("fails with the evaluator_not_found code", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+      mockGetAll.mockResolvedValue([makeEvaluator()]);
+
+      expect(await jsonErrorCode(() => getEvaluatorCommand("ghost"))).toBe("evaluator_not_found");
+    });
+  });
+
+  describe("when the reference is a display name, not an id or slug", () => {
+    /** @scenario Get evaluator details by display name */
+    it("returns the evaluator with that name", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+      mockGetAll.mockResolvedValue([makeEvaluator({ id: "evaluator_xyz", name: "Tone Check" })]);
+
+      const result = await getEvaluatorCommand("tone check");
+
+      expect((result as { data: EvaluatorResponse }).data.id).toBe("evaluator_xyz");
+    });
+  });
+});
+
+describe("createEvaluatorCommand()", () => {
+  let mockCreate: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockCreate = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: vi.fn(),
+        get: vi.fn(),
+        create: mockCreate,
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when creation succeeds", () => {
+    it("calls create with name and evaluatorType config", async () => {
+      mockCreate.mockResolvedValue(makeEvaluator({ name: "My Eval" }));
+
+      await createEvaluatorCommand("My Eval", { type: "langevals/llm_boolean" });
+
+      expect(mockCreate).toHaveBeenCalledWith({
+        name: "My Eval",
+        config: { evaluatorType: "langevals/llm_boolean" },
+      });
+    });
+
+    /** @scenario The CLI accepts every type the platform's catalog accepts */
+    it("accepts the platform's native evaluator types, not only the langevals catalog", async () => {
+      mockCreate.mockResolvedValue(makeEvaluator({ name: "Secrets" }));
+
+      await createEvaluatorCommand("Secrets", {
+        type: "langwatch/api_keys_and_secrets_detection",
+      });
+
+      expect(mockCreate).toHaveBeenCalledWith({
+        name: "Secrets",
+        config: { evaluatorType: "langwatch/api_keys_and_secrets_detection" },
+      });
+    });
+  });
+
+  describe("when the evaluator type is not in the catalog", () => {
+    // The live failure this pins: an agent sent a stale slug
+    // ("ragas/answer_relevancy") and only learned it was wrong after a
+    // network round-trip, from a 422 that named no valid alternatives.
+    /** @scenario The CLI rejects an unknown evaluator type before calling the API */
+    it("fails before any API call is made", async () => {
+      await expect(
+        createEvaluatorCommand("quick-relevancy", {
+          type: "ragas/answer_relevancy",
+        }),
+      ).rejects.toThrow(ProcessExitError);
+
+      expect(mockCreate).not.toHaveBeenCalled();
+    });
+
+    /** @scenario The CLI rejects an unknown evaluator type before calling the API */
+    it("names the closest valid slugs and the command that lists them all", async () => {
+      await expect(
+        createEvaluatorCommand("quick-relevancy", {
+          type: "ragas/answer_relevancy",
+        }),
+      ).rejects.toThrow(ProcessExitError);
+
+      const printed = vi
+        .mocked(console.error)
+        .mock.calls.map((call) => String(call[0]))
+        .join("\n");
+      expect(printed).toContain("ragas/response_relevancy");
+      expect(printed).toContain("langwatch evaluator types");
+    });
+  });
+
+  describe("when creation fails", () => {
+    it("exits with code 1", async () => {
+      mockCreate.mockRejectedValue(new EvaluatorsApiError("Limit reached", "create evaluator"));
+
+      await expect(
+        createEvaluatorCommand("My Eval", { type: "langevals/llm_boolean" }),
+      ).rejects.toThrow(ProcessExitError);
+    });
+  });
+});
+
+describe("createEvaluatorCommand() catalog-miss shape under machine formats", () => {
+  let savedChalkLevel: typeof chalk.level;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    savedChalkLevel = chalk.level;
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: vi.fn(),
+        get: vi.fn(),
+        create: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  afterEach(async () => {
+    chalk.level = savedChalkLevel;
+    await applyOutputContext(resolveOutputOptions({}, {}));
+  });
+
+  it("emits validation_error with the reason's expected/received, the shape rule 16 reads", async () => {
+    await applyOutputContext(resolveOutputOptions({ output: "json", format: "table" }, {}));
+
+    await expect(
+      createEvaluatorCommand("quick-relevancy", { type: "ragas/answer_relevancy" }),
+    ).rejects.toThrow(ProcessExitError);
+
+    const printed = vi
+      .mocked(console.log)
+      .mock.calls.map((call) => String(call[0]))
+      .join("\n");
+    const doc = JSON.parse(printed) as {
+      ok: boolean;
+      error: {
+        code: string;
+        reasons: {
+          kind: string;
+          meta: { field: string; expected: string[]; received: string };
+        }[];
+      };
+    };
+    expect(doc.ok).toBe(false);
+    expect(doc.error.code).toBe("validation_error");
+    const reason = doc.error.reasons[0]!;
+    expect(reason.kind).toBe("schema_failure");
+    expect(reason.meta.field).toBe("type");
+    expect(reason.meta.expected).toContain("ragas/response_relevancy");
+    expect(reason.meta.received).toBe("ragas/answer_relevancy");
+  });
+});
+
+describe("listEvaluatorTypesCommand()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when listing the embedded catalog", () => {
+    /** @scenario Valid evaluator types can be listed without touching the API */
+    it("returns every type with slug, name, and category without any API call", async () => {
+      const { listEvaluatorTypesCommand } = await import("../types.js");
+
+      const result = listEvaluatorTypesCommand();
+
+      const entries = result.data as {
+        slug: string;
+        name: string;
+        category: string;
+      }[];
+      expect(entries.length).toBeGreaterThan(30);
+      const slugs = entries.map((entry) => entry.slug);
+      expect(slugs).toContain("ragas/response_relevancy");
+      expect(slugs).toContain("langwatch/api_keys_and_secrets_detection");
+      for (const entry of entries) {
+        expect(entry.name.length).toBeGreaterThan(0);
+        expect(entry.category.length).toBeGreaterThan(0);
+      }
+      // The catalog is embedded at build: no service constructed, no fetch.
+      expect(EvaluatorsApiService).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe("deleteEvaluatorCommand()", () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockDelete: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn();
+    mockDelete = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: vi.fn(),
+        get: mockGet,
+        create: vi.fn(),
+        delete: mockDelete,
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when evaluator exists and deletion succeeds", () => {
+    it("resolves by slug then deletes by ID", async () => {
+      mockGet.mockResolvedValue(makeEvaluator());
+      mockDelete.mockResolvedValue({ success: true });
+
+      await deleteEvaluatorCommand("test-evaluator");
+
+      expect(mockGet).toHaveBeenCalledWith("test-evaluator");
+      expect(mockDelete).toHaveBeenCalledWith("evaluator_abc123");
+    });
+  });
+
+  describe("when evaluator is not found", () => {
+    it("exits with code 1 without calling delete", async () => {
+      mockGet.mockRejectedValue(new EvaluatorsApiError("Not found", "fetch evaluator"));
+
+      await expect(deleteEvaluatorCommand("nonexistent")).rejects.toThrow(ProcessExitError);
+      expect(mockDelete).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("when the reference is a display name", () => {
+    it("does not look it up by name", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+      const getAll = vi.fn();
+      vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+        return { getAll, get: mockGet, delete: mockDelete } as unknown as EvaluatorsApiService;
+      });
+
+      await expect(deleteEvaluatorCommand("Test Evaluator")).rejects.toThrow(ProcessExitError);
+
+      expect(getAll).not.toHaveBeenCalled();
+    });
+
+    /** @scenario Delete an evaluator by display name is refused */
+    it("tells the user to pass the id or slug and how to find it", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+
+      await expect(deleteEvaluatorCommand("Test Evaluator")).rejects.toThrow(ProcessExitError);
+
+      expect(spinnerFail.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+        exactLookupMissMessage("Test Evaluator"),
+      );
+      expect(mockDelete).not.toHaveBeenCalled();
+    });
+
+    it("keeps the evaluator_not_found code", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+
+      expect(await jsonErrorCode(() => deleteEvaluatorCommand("Test Evaluator"))).toBe(
+        "evaluator_not_found",
+      );
+    });
+  });
+
+  describe("when delete API call fails", () => {
+    it("exits with code 1", async () => {
+      mockGet.mockResolvedValue(makeEvaluator());
+      mockDelete.mockRejectedValue(new EvaluatorsApiError("Server error", "delete evaluator"));
+
+      await expect(deleteEvaluatorCommand("test-evaluator")).rejects.toThrow(ProcessExitError);
+    });
+  });
+});
+
+/**
+ * Tests verify that format flags beat commander defaults in error rendering.
+ * Simulates the hook's applyOutputContext seam, ensuring JSON/agent formats
+ * override `-f table` default.
+ */
+describe("listEvaluatorsCommand() failure shape under machine formats", () => {
+  let mockGetAll: ReturnType<typeof vi.fn>;
+  let savedChalkLevel: typeof chalk.level;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    savedChalkLevel = chalk.level;
+    mockGetAll = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: mockGetAll,
+        get: vi.fn(),
+        create: vi.fn(),
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+    mockGetAll.mockRejectedValue(new EvaluatorsApiError("boom", "fetch all evaluators"));
+  });
+
+  afterEach(async () => {
+    // Undo the preAction simulation: reset the recorded format and colour.
+    chalk.level = savedChalkLevel;
+    await applyOutputContext(resolveOutputOptions({}, {}));
+  });
+
+  const printedStdout = (): string =>
+    vi
+      .mocked(console.log)
+      .mock.calls.map((call) => String(call[0]))
+      .join("\n");
+
+  it("emits the structured JSON error document under -o json, despite the -f commander default", async () => {
+    // What preAction resolves for `-o json`: the -f default "table" sits on
+    // the same options object and must not win.
+    await applyOutputContext(resolveOutputOptions({ output: "json", format: "table" }, {}));
+
+    await expect(listEvaluatorsCommand()).rejects.toThrow(ProcessExitError);
+
+    const doc = JSON.parse(printedStdout()) as {
+      ok: boolean;
+      error: { message: string };
+    };
+    expect(doc.ok).toBe(false);
+    expect(doc.error.message).toContain("boom");
+  });
+
+  it("emits the structured JSON error document under --agent, despite the -f commander default", async () => {
+    await applyOutputContext(resolveOutputOptions({ agent: true, format: "table" }, {}));
+
+    await expect(listEvaluatorsCommand()).rejects.toThrow(ProcessExitError);
+
+    const doc = JSON.parse(printedStdout()) as { ok: boolean };
+    expect(doc.ok).toBe(false);
+  });
+
+  it("still emits JSON errors when a human passes -f json explicitly", async () => {
+    await applyOutputContext(resolveOutputOptions({ format: "json" }, {}));
+
+    await expect(listEvaluatorsCommand()).rejects.toThrow(ProcessExitError);
+
+    const doc = JSON.parse(printedStdout()) as { ok: boolean };
+    expect(doc.ok).toBe(false);
+  });
+
+  it("keeps the human error block when no machine format was asked for", async () => {
+    await applyOutputContext(resolveOutputOptions({ format: "table" }, {}));
+
+    await expect(listEvaluatorsCommand()).rejects.toThrow(ProcessExitError);
+
+    expect(() => JSON.parse(printedStdout())).toThrow(SyntaxError);
+  });
+});
+
+describe("updateEvaluatorCommand()", () => {
+  let mockGet: ReturnType<typeof vi.fn>;
+  let mockUpdate: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet = vi.fn();
+    mockUpdate = vi.fn();
+    vi.mocked(EvaluatorsApiService).mockImplementation(function () {
+      return {
+        getAll: vi.fn(),
+        get: mockGet,
+        create: vi.fn(),
+        update: mockUpdate,
+        delete: vi.fn(),
+      } as unknown as EvaluatorsApiService;
+    });
+    vi.spyOn(console, "log").mockImplementation(noop);
+    vi.spyOn(console, "error").mockImplementation(noop);
+    mockProcessExit();
+  });
+
+  describe("when the reference is a display name", () => {
+    /** @scenario Update an evaluator by display name is refused */
+    it("tells the user to pass the id or slug and how to find it", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+
+      await expect(updateEvaluatorCommand("Test Evaluator", { name: "Renamed" })).rejects.toThrow(
+        ProcessExitError,
+      );
+
+      expect(spinnerFail.mock.calls.map((call) => String(call[0])).join("\n")).toContain(
+        exactLookupMissMessage("Test Evaluator"),
+      );
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+
+    it("keeps the evaluator_not_found code", async () => {
+      mockGet.mockRejectedValue(evaluatorNotFound());
+
+      expect(
+        await jsonErrorCode(() => updateEvaluatorCommand("Test Evaluator", { name: "Renamed" })),
+      ).toBe("evaluator_not_found");
+    });
+  });
+
+  describe("when --settings JSON is provided", () => {
+    /** @scenario Settings updated through the CLI take effect */
+    it("nests the parsed settings under config.settings", async () => {
+      mockGet.mockResolvedValue(makeEvaluator());
+      mockUpdate.mockResolvedValue(makeEvaluator());
+
+      await updateEvaluatorCommand("test-evaluator", {
+        settings: JSON.stringify({ model: "openai/gpt-5-mini", prompt: "Judge it" }),
+      });
+
+      expect(mockUpdate).toHaveBeenCalledWith("evaluator_abc123", {
+        config: {
+          settings: { model: "openai/gpt-5-mini", prompt: "Judge it" },
+        },
+      });
+    });
+
+    it("exits when the settings are not valid JSON", async () => {
+      mockGet.mockResolvedValue(makeEvaluator());
+
+      await expect(
+        updateEvaluatorCommand("test-evaluator", { settings: "{not json" }),
+      ).rejects.toThrow(ProcessExitError);
+      expect(mockUpdate).not.toHaveBeenCalled();
+    });
+  });
+});

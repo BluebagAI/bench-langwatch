@@ -1,0 +1,86 @@
+# size-ha.yaml — High-availability production. 3-node replicated ClickHouse.
+#
+# 3 app replicas, 3 workers, 2 NLP/langevals, replicated CH with Keeper.
+# Combine with access, external database, and cold storage overlays.
+# Requires app.dataplane (S3 or Azure Blob) for stored objects; the
+# cold-storage-s3.yaml overlay configures ClickHouse cold storage and
+# backups only.
+#
+# Usage:
+#   helm install lw . \
+#     -f examples/overlays/size-ha.yaml \
+#     -f examples/overlays/access-ingress.yaml \
+#     -f examples/overlays/postgres-external.yaml \
+#     -f examples/overlays/redis-external.yaml \
+#     -f examples/overlays/cold-storage-s3.yaml
+
+app:
+  replicaCount: 3
+  # Multi-pod: local-FS is unsafe (pods don't share filesystems). Set
+  # app.dataplane (S3 or Azure Blob) so every pod reads the same stored
+  # objects. cold-storage-s3.yaml covers ClickHouse only.
+  storedObjects:
+    localFilesystem:
+      enabled: false
+  resources:
+    requests: { cpu: 1, memory: 4Gi }
+    limits: { cpu: 2, memory: 4Gi }
+  podDisruptionBudget:
+    minAvailable: 2
+
+workers:
+  enabled: true
+  replicaCount: 3
+  resources:
+    requests: { cpu: 1, memory: 4Gi }
+    limits: { cpu: 2, memory: 4Gi }
+  podDisruptionBudget:
+    minAvailable: 2
+
+langwatch_nlp:
+  replicaCount: 2
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: 1, memory: 1Gi }
+
+langevals:
+  replicaCount: 2
+  resources:
+    requests: { cpu: 1, memory: 4Gi }
+    limits: { cpu: 2, memory: 8Gi }
+
+clickhouse:
+  chartManaged: true
+  replicas: 3
+  memory: 16Gi
+  cpu: 4
+  storage:
+    size: 300Gi
+
+postgresql:
+  chartManaged: true
+  auth:
+    database: "langwatch"
+  primary:
+    persistence:
+      size: 50Gi
+
+redis:
+  chartManaged: true
+  master:
+    persistence:
+      size: 10Gi
+    # Ceiling is half the limit (1.5Gi), so a snapshot fits under it.
+    resources:
+      requests: { cpu: 500m, memory: 1Gi }
+      limits: { cpu: 1, memory: 3Gi }
+
+prometheus:
+  chartManaged: true
+  server:
+    retention: 60d
+    persistentVolume:
+      size: 50Gi
+
+cronjobs:
+  enabled: true

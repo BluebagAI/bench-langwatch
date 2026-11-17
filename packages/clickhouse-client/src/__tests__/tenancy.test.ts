@@ -1,0 +1,488 @@
+import { describe, expect, it, vi } from "vitest";
+
+import {
+  createTenantRouter,
+  DuplicateRouteError,
+  parseRoutingTable,
+  PrivateRouteRefusalFactory,
+  PrivateRouteUnavailableError,
+  type TenantDirectory,
+  UnknownTenantError,
+} from "../tenancy.ts";
+
+const directoryOf = (mapping: Record<string, string>): TenantDirectory => ({
+  organizationForTenant: async (tenantId) => mapping[tenantId] ?? null,
+});
+
+const tableOf = (routes: Record<string, string>) => ({
+  routes: new Map(Object.entries(routes)),
+  skipped: [],
+  ambiguous: [],
+});
+
+describe("parseRoutingTable", () => {
+  describe("given well-formed entries", () => {
+    describe("when the table is parsed", () => {
+      /** @scenario Parse private ClickHouse URL from env var */
+      it("keys the route by the organisation id, ignoring the human label", () => {
+        const table = parseRoutingTable({
+          CLICKHOUSE_URL__acme__org_1: "http://acme:8123",
+          UNRELATED: "x",
+        });
+
+        expect(table.routes.get("org_1")).toBe("http://acme:8123");
+        expect(table.routes.size).toBe(1);
+      });
+
+      it("tolerates a label containing the separator", () => {
+        const table = parseRoutingTable({
+          CLICKHOUSE_URL__acme__eu__org_1: "http://acme:8123",
+        });
+
+        expect(table.routes.get("org_1")).toBe("http://acme:8123");
+      });
+
+      /** @scenario Multiple private ClickHouse env vars are parsed */
+      it("parses every well-formed entry into its own route", () => {
+        const table = parseRoutingTable({
+          CLICKHOUSE_URL__acme__org_1: "http://acme:8123",
+          CLICKHOUSE_URL__globex__org_2: "http://globex:8123",
+        });
+
+        expect(table.routes.get("org_1")).toBe("http://acme:8123");
+        expect(table.routes.get("org_2")).toBe("http://globex:8123");
+        expect(table.routes.size).toBe(2);
+      });
+    });
+  });
+
+  describe("given no private ClickHouse env vars", () => {
+    describe("when the table is parsed", () => {
+      /** @scenario No private ClickHouse env vars results in empty map */
+      it("returns an empty routing table", () => {
+        const table = parseRoutingTable({ UNRELATED: "x" });
+
+        expect(table.routes.size).toBe(0);
+      });
+    });
+  });
+
+  describe("given unusable entries", () => {
+    describe("when the table is parsed", () => {
+      it.each([
+        ["an empty value", { CLICKHOUSE_URL__acme__org_1: "" }],
+        ["a whitespace value", { CLICKHOUSE_URL__acme__org_1: "   " }],
+        ["no organisation id", { CLICKHOUSE_URL__: "http://x:8123" }],
+      ])("skips %s rather than routing on it", (_label, env) => {
+        const table = parseRoutingTable(env);
+
+        expect(table.routes.size).toBe(0);
+        expect(table.skipped).toHaveLength(1);
+      });
+
+      it("collects every problem instead of dying on the first", () => {
+        const table = parseRoutingTable({
+          CLICKHOUSE_URL__a__org_1: "",
+          CLICKHOUSE_URL__b__org_2: "  ",
+        });
+
+        expect(table.skipped).toHaveLength(2);
+      });
+    });
+  });
+
+  describe("given an organisation id that contains the separator", () => {
+    describe("when the name cannot be split unambiguously", () => {
+      it("reports the split as a guess rather than making it silently", () => {
+        // Guessing wrong is a fail-open: the intended organisation gets no
+        // route, so every one of its tenants falls through to the shared
+        // instance.
+        const table = parseRoutingTable({
+          CLICKHOUSE_URL__acme__organization__x1: "http://acme:8123",
+        });
+
+        expect(table.ambiguous).toEqual([
+          {
+            envVar: "CLICKHOUSE_URL__acme__organization__x1",
+            organizationId: "x1",
+          },
+        ]);
+      });
+    });
+
+    describe("when the name has a single separator", () => {
+      it("does not flag it", () => {
+        expect(parseRoutingTable({ CLICKHOUSE_URL__org_1: "http://x:8123" }).ambiguous).toEqual([]);
+      });
+    });
+  });
+
+  describe("given two routes for one organisation", () => {
+    describe("when the table is parsed", () => {
+      it("refuses to guess which instance holds their data", () => {
+        expect(() =>
+          parseRoutingTable({
+            CLICKHOUSE_URL__acme__org_1: "http://one:8123",
+            CLICKHOUSE_URL__acme_eu__org_1: "http://two:8123",
+          }),
+        ).toThrow(DuplicateRouteError);
+      });
+    });
+  });
+});
+
+describe("createTenantRouter", () => {
+  describe("given an invalid cache bound", () => {
+    describe("when the router is built", () => {
+      it.each([0, -1, 2.5, Number.NaN, Number.POSITIVE_INFINITY])(
+        "refuses to be built with %s",
+        (maxCacheEntries) => {
+          // `cache.size >= NaN` and `>= Infinity` are both false forever, so an
+          // unvalidated value removes the bound and lets a long-lived worker
+          // grow the map for the life of the process.
+          expect(() =>
+            createTenantRouter({
+              table: tableOf({}),
+              directory: directoryOf({}),
+              maxCacheEntries,
+            }),
+          ).toThrow(RangeError);
+        },
+      );
+    });
+  });
+
+  describe("given a tenant in an organisation with no private instance", () => {
+    describe("when it is routed", () => {
+      /** @scenario Org without private ClickHouse gets the shared client */
+      /** @scenario "Project in a standard org routes to the shared instance" */
+      it("routes to the shared instance", async () => {
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: directoryOf({ project_1: "org_1" }),
+        });
+
+        await expect(router.route("project_1")).resolves.toEqual({
+          kind: "shared",
+        });
+      });
+    });
+  });
+
+  describe("given a tenant in an organisation with a private instance", () => {
+    describe("when it is routed", () => {
+      /** @scenario Org with private ClickHouse gets a dedicated client */
+      /** @scenario "Project in a private-CH org routes to the private instance" */
+      it("routes to that instance", async () => {
+        const router = createTenantRouter({
+          table: tableOf({ org_1: "http://acme:8123" }),
+          directory: directoryOf({ project_1: "org_1" }),
+        });
+
+        await expect(router.route("project_1")).resolves.toEqual({
+          kind: "private",
+          organizationId: "org_1",
+          url: "http://acme:8123",
+        });
+      });
+    });
+  });
+
+  describe("given an organisation reading its own tenant identity", () => {
+    describe("when it is routed", () => {
+      /** @scenario "An organization is a tenant in its own right" */
+      it("routes on itself, with no project in between", async () => {
+        const router = createTenantRouter({
+          table: tableOf({ org_1: "http://acme:8123" }),
+          directory: directoryOf({ org_1: "org_1" }),
+        });
+
+        await expect(router.route("org_1")).resolves.toEqual({
+          kind: "private",
+          organizationId: "org_1",
+          url: "http://acme:8123",
+        });
+      });
+    });
+  });
+
+  describe("given a user reading their own tenant identity", () => {
+    describe("when it is routed", () => {
+      /** @scenario "A user is a tenant in its own right" */
+      it("routes through the organisation the directory answers for that user", async () => {
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: directoryOf({ user_1: "org_1" }),
+        });
+
+        await expect(router.route("user_1")).resolves.toEqual({
+          kind: "shared",
+        });
+      });
+    });
+  });
+
+  describe("given a tenant the directory does not know", () => {
+    describe("when it is routed", () => {
+      /** @scenario "A tenant that names no project, organization or user is refused" */
+      it("fails closed rather than falling back to shared", async () => {
+        // Falling back would run the statement against the shared instance,
+        // which succeeds and returns plausible rows belonging to someone else.
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: directoryOf({}),
+        });
+
+        await expect(router.route("project_unknown")).rejects.toBeInstanceOf(UnknownTenantError);
+      });
+    });
+
+    describe("when the tenant id is empty", () => {
+      /** @scenario "A tenant that names no project, organization or user is refused" */
+      it("fails closed without asking the directory", async () => {
+        const directory = { organizationForTenant: vi.fn() };
+        const router = createTenantRouter({ table: tableOf({}), directory });
+
+        await expect(router.route("")).rejects.toBeInstanceOf(UnknownTenantError);
+        expect(directory.organizationForTenant).not.toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe("given repeated lookups for the same tenant", () => {
+    describe("when it is routed twice", () => {
+      it("asks the directory once while the answer is fresh", async () => {
+        const organizationForTenant = vi.fn(async () => "org_1");
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: { organizationForTenant },
+        });
+
+        await router.route("project_1");
+        await router.route("project_1");
+
+        expect(organizationForTenant).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("when it is routed many times", () => {
+      it("asks the directory once, because the mapping cannot change", async () => {
+        // A project belongs to a team and a team to an organisation, and
+        // neither link is reassignable, so a resolved answer is final. There is
+        // nothing for an expiry to protect against; the bound below covers
+        // memory.
+        const organizationForTenant = vi.fn(async () => "org_1");
+        const router = createTenantRouter({
+          table: tableOf({ org_1: "http://acme:8123" }),
+          directory: { organizationForTenant },
+        });
+
+        for (let i = 0; i < 50; i++) {
+          await expect(router.route("project_1")).resolves.toMatchObject({
+            organizationId: "org_1",
+          });
+        }
+
+        expect(organizationForTenant).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
+  describe("given a tenant that does not exist yet", () => {
+    describe("when it is created between two lookups", () => {
+      it("does not cache the failure, so it routes once it is created", async () => {
+        let known = false;
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: {
+            organizationForTenant: async () => (known ? "org_1" : null),
+          },
+        });
+
+        await expect(router.route("project_new")).rejects.toBeInstanceOf(UnknownTenantError);
+        known = true;
+
+        await expect(router.route("project_new")).resolves.toEqual({
+          kind: "shared",
+        });
+      });
+    });
+  });
+
+  describe("given more tenants than the cache bound", () => {
+    describe("when they are all routed", () => {
+      it("stays bounded instead of growing for the life of the process", async () => {
+        const router = createTenantRouter({
+          table: tableOf({}),
+          directory: { organizationForTenant: async () => "org_1" },
+          maxCacheEntries: 3,
+        });
+
+        for (let i = 0; i < 10; i++) await router.route(`project_${i}`);
+
+        expect(router.size()).toBeLessThanOrEqual(3);
+      });
+    });
+  });
+});
+
+describe("createTenantRouter, given organizations recorded as private", () => {
+  const recordedDirectory = (
+    recorded: Record<string, string>,
+  ): TenantDirectory & { asked: string[] } => {
+    const asked: string[] = [];
+    return {
+      asked,
+      organizationForTenant: async (tenantId) => (tenantId.startsWith("project_") ? "org_1" : null),
+      recordedPrivateDataplaneOf: async (organizationId) => {
+        asked.push(organizationId);
+        return { clickhouseLabel: recorded[organizationId] ?? null, s3Label: null };
+      },
+    };
+  };
+
+  describe("when the recorded organization's route is present", () => {
+    /** @scenario "A recorded private organization with its route present routes to its own server" */
+    it("routes it to its own server without asking for the record", async () => {
+      const directory = recordedDirectory({ org_1: "acme" });
+      const router = createTenantRouter({
+        table: tableOf({ org_1: "http://acme:8123" }),
+        directory,
+      });
+
+      await expect(router.route("project_a")).resolves.toEqual({
+        kind: "private",
+        organizationId: "org_1",
+        url: "http://acme:8123",
+      });
+      expect(directory.asked).toEqual([]);
+    });
+  });
+
+  describe("when the recorded organization's route is missing", () => {
+    /** @scenario "A recorded private organization whose route is missing is refused, naming the variable" */
+    it("refuses, naming the variable as missing, and never answers shared", async () => {
+      const router = createTenantRouter({
+        table: tableOf({}),
+        directory: recordedDirectory({ org_1: "acme" }),
+      });
+
+      await expect(router.route("project_a")).rejects.toMatchObject({
+        name: "PrivateRouteUnavailableError",
+        refusal: {
+          organizationId: "org_1",
+          variable: "CLICKHOUSE_URL__acme__org_1",
+          problem: "missing",
+        },
+      });
+    });
+
+    it("refuses a declared tenant set through the same check", async () => {
+      const router = createTenantRouter({
+        table: tableOf({}),
+        directory: recordedDirectory({ org_1: "acme" }),
+      });
+
+      await expect(router.routeOrganization("org_1")).rejects.toBeInstanceOf(
+        PrivateRouteUnavailableError,
+      );
+    });
+
+    it("throws what the refusal factory builds", async () => {
+      class Refusal extends PrivateRouteRefusalFactory {
+        create(refusal: { variable: string }): unknown {
+          return new Error(`refused ${refusal.variable}`);
+        }
+      }
+      const router = createTenantRouter({
+        table: tableOf({}),
+        directory: recordedDirectory({ org_1: "acme" }),
+        refusal: new Refusal(),
+      });
+
+      await expect(router.route("project_a")).rejects.toThrow(
+        "refused CLICKHOUSE_URL__acme__org_1",
+      );
+    });
+  });
+
+  describe("when the organization's route variable is malformed", () => {
+    /** @scenario "An organization whose route variable is malformed is refused, naming the variable" */
+    it("parses it as malformed and refuses, naming the variable", async () => {
+      const table = parseRoutingTable({
+        CLICKHOUSE_URL__acme__org_1: "clickhouse-private-route-is-not-a-url",
+      });
+      expect(table.routes.size).toBe(0);
+      expect(table.malformed?.get("org_1")).toBe("CLICKHOUSE_URL__acme__org_1");
+
+      const router = createTenantRouter({ table, directory: recordedDirectory({}) });
+
+      await expect(router.route("project_a")).rejects.toMatchObject({
+        refusal: { variable: "CLICKHOUSE_URL__acme__org_1", problem: "malformed" },
+      });
+    });
+  });
+
+  describe("when the organization was never recorded and has no route", () => {
+    /** @scenario "An organization never recorded as private and with no route stays on the shared server" */
+    it("routes it to the shared server, as before", async () => {
+      const router = createTenantRouter({ table: tableOf({}), directory: recordedDirectory({}) });
+
+      await expect(router.route("project_a")).resolves.toEqual({ kind: "shared" });
+    });
+  });
+});
+
+describe("createTenantRouter placementOf", () => {
+  const recordedPrivate: TenantDirectory = {
+    organizationForTenant: async () => "org_private",
+    recordedPrivateDataplaneOf: async () => ({ clickhouseLabel: "eu", s3Label: null }),
+  };
+
+  describe("given an organisation recorded private whose route variable is missing", () => {
+    it("reports it recorded private beside the shared route, and refuses nothing itself", async () => {
+      const router = createTenantRouter({ table: tableOf({}), directory: recordedPrivate });
+
+      await expect(router.placementOf("project_a")).resolves.toEqual({
+        organizationId: "org_private",
+        recordedPrivate: true,
+        route: { kind: "shared" },
+      });
+      await expect(router.route("project_a")).rejects.toBeInstanceOf(PrivateRouteUnavailableError);
+    });
+  });
+
+  describe("given an organisation with its route present", () => {
+    it("reports the private route it resolves to", async () => {
+      const router = createTenantRouter({
+        table: tableOf({ org_private: "http://private.invalid:8123" }),
+        directory: recordedPrivate,
+      });
+
+      await expect(router.placementOf("project_a")).resolves.toEqual({
+        organizationId: "org_private",
+        recordedPrivate: true,
+        route: {
+          kind: "private",
+          organizationId: "org_private",
+          url: "http://private.invalid:8123",
+        },
+      });
+    });
+  });
+
+  describe("given an organisation never recorded private", () => {
+    it("reports the shared route and nothing recorded", async () => {
+      const router = createTenantRouter({
+        table: tableOf({}),
+        directory: directoryOf({ project_a: "org_shared" }),
+      });
+
+      await expect(router.placementOf("project_a")).resolves.toEqual({
+        organizationId: "org_shared",
+        recordedPrivate: false,
+        route: { kind: "shared" },
+      });
+    });
+  });
+});

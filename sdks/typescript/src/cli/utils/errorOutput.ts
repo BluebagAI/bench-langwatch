@@ -1,0 +1,226 @@
+import {
+  handledErrorFromThrown,
+  toCliErrorDocument,
+  type LangWatchHandledErrorShape,
+} from "@langwatch/handled-error/langwatch-handled-error";
+/**
+ * Error output: prose for humans, JSON for machines.
+ * Both paths scrub messages through `redactSecrets` first; meta/reasons/kind are not scrubbed.
+ */
+import chalk from "chalk";
+
+import { redactSecrets } from "../telemetry/events";
+import { fallbackSuggestionsFor, withFallbackSuggestions } from "./errorSuggestions";
+import { loginPermissionsHint, usesLoginCredential } from "./loginScopeHint";
+import { currentOutputScope, getOutputFormat, resolveOutputFormat } from "./outputScope";
+
+/**
+ * Re-exported from ./outputScope (chalk-free) to avoid cold-start impact.
+ */
+export {
+  currentOutputScope,
+  getOutputFormat,
+  resolveOutputFormat,
+  setOutputFormat,
+  withOutputScope,
+  type CliOutputFormat,
+} from "./outputScope";
+
+/**
+ * Turn colour off for agent mode. Inside a daemon scope, uses a flag;
+ * outside, mutates chalk.level directly (only one command in flight).
+ */
+export const disableOutputColor = (): void => {
+  const scope = currentOutputScope();
+  if (scope) scope.hasColor = false;
+  else chalk.level = 0;
+};
+
+/**
+ * Message scrubbed only (via redactSecrets); meta/kind/reasons are curated platform payload.
+ * Asymmetry is deliberate: credentials leak via message prose, not via structured fields.
+ */
+export const readCommandError = (error: unknown): LangWatchHandledErrorShape => {
+  const domain = handledErrorFromThrown(error);
+  return { ...domain, message: redactSecrets(domain.message) };
+};
+
+const reasonDetailLines = (domain: LangWatchHandledErrorShape): [string, string][] => {
+  if (!domain.reasons?.length) {
+    return [];
+  }
+
+  const details: [string, string][] = [
+    ["caused by", domain.reasons.map((r) => r.kind).join(" → ")],
+  ];
+
+  for (const reason of domain.reasons) {
+    const field = reason.meta?.field;
+    const message = reason.meta?.message;
+    if (typeof message !== "string" || !message) continue;
+    details.push([typeof field === "string" && field ? field : reason.kind, message]);
+  }
+
+  return details;
+};
+
+/** A list of words, such as `missingPermissions`, reads as a comma list, not JSON. */
+const renderMetaValue = (value: unknown): string => {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && value.every((item) => typeof item === "string")) {
+    return value.join(", ");
+  }
+  return JSON.stringify(value) ?? "";
+};
+
+/** `code` / `trace id` / meta keys, aligned into a dim block under `Details:`. */
+const detailLines = (domain: LangWatchHandledErrorShape): string[] => {
+  const details: [string, string][] = [["code", domain.code]];
+
+  if (domain.httpStatus > 0) {
+    details.push(["status", String(domain.httpStatus)]);
+  }
+  if (domain.traceId) {
+    details.push(["trace id", domain.traceId]);
+  }
+  if (domain.traceUrl) {
+    details.push(["trace url", domain.traceUrl]);
+  }
+
+  // Printed as the platform composed it. See `readCommandError` on why `meta` is
+  // NOT scrubbed: it is curated, secret-free by contract, and the scrub would eat
+  // the very identifiers the user is reading the error to find.
+  for (const [key, value] of Object.entries(domain.meta)) {
+    if (value === null || value === undefined) continue;
+    const rendered = renderMetaValue(value);
+    if (!rendered) continue;
+    details.push([key, rendered]);
+  }
+
+  details.push(...reasonDetailLines(domain));
+
+  const width = Math.max(...details.map(([key]) => key.length));
+
+  return [
+    "Details:",
+    ...details.map(([key, value]) => `  ${chalk.dim(key.padEnd(width))}  ${chalk.dim(value)}`),
+  ];
+};
+
+/** A login is a person's access, not a key with a project: the project hint fits the credential. */
+const withLoginProjectAdvice = (domain: LangWatchHandledErrorShape): LangWatchHandledErrorShape => {
+  if (domain.code !== "project_not_found" || !usesLoginCredential()) return domain;
+  const [keyLine] = fallbackSuggestionsFor("project_not_found")?.suggestions ?? [];
+  const personLine =
+    "Check that your account can read the project; ask a workspace admin to grant you access";
+
+  return {
+    ...domain,
+    suggestions: [personLine, ...(domain.suggestions ?? []).filter((line) => line !== keyLine)],
+  };
+};
+
+/**
+ * The fallback advice, plus what only this machine knows: the permissions the
+ * login here was minted with. Applied to both renderings, so a person and an
+ * agent are told the same thing about why a 403 happened.
+ */
+const withCliAdvice = (domain: LangWatchHandledErrorShape): LangWatchHandledErrorShape => {
+  const enriched = withLoginProjectAdvice(withFallbackSuggestions(domain));
+  const hint = loginPermissionsHint(enriched.code, enriched.meta);
+  if (!hint) return enriched;
+  return { ...enriched, suggestions: [...(enriched.suggestions ?? []), hint] };
+};
+
+/**
+ * Human rendering: Error sentence, Details, Suggestions (platform or fallback), Docs.
+ * Infrastructure failures print sentence only (no invented precision).
+ */
+export const renderErrorForHumans = (domain: LangWatchHandledErrorShape): string => {
+  if (!domain.isHandled) return domain.message;
+
+  const enriched = withCliAdvice(domain);
+  const lines = [`Error: ${enriched.message}`, ...detailLines(enriched)];
+
+  if (enriched.suggestions?.length) {
+    lines.push("Suggestions:", ...enriched.suggestions.map((suggestion) => `  - ${suggestion}`));
+  }
+  if (enriched.docUrl) {
+    lines.push(`Docs: ${enriched.docUrl}`);
+  }
+
+  return lines.join("\n");
+};
+
+/**
+ * Machine rendering: JSON on stdout. Fallback suggestions filled even for unhandled errors
+ * (isHandled: false signals code source); human gets sentence only (no invented precision).
+ */
+export const renderErrorAsJson = (domain: LangWatchHandledErrorShape): string =>
+  JSON.stringify(
+    toCliErrorDocument(withCliAdvice(domain)),
+    null,
+    // Agent mode's contract is compact single-line JSON (utils/output.ts);
+    // the pretty two-space form is for `-o json`, where a person may read it.
+    getOutputFormat() === "agents" ? 0 : 2,
+  );
+
+/**
+ * Local validation error with SDK brand so handledErrorFromThrown recognizes it as already read.
+ */
+export const commandValidationError = (
+  message: string,
+  meta: Record<string, unknown> = {},
+): LangWatchHandledErrorShape & { isLangWatchHandledError: true } => ({
+  isLangWatchHandledError: true,
+  code: "validation_error",
+  kind: "validation_error",
+  message,
+  httpStatus: 0,
+  meta,
+  isHandled: true,
+  retryable: false,
+});
+
+/**
+ * A local "sign in first" failure the CLI checked itself, so `httpStatus` is 0:
+ * without its own code a missing login reads as `network_error`, whose advice
+ * has nothing to do with the precondition that failed.
+ */
+export const commandAuthError = (
+  message: string,
+  meta: Record<string, unknown> = {},
+): LangWatchHandledErrorShape & { isLangWatchHandledError: true } => ({
+  isLangWatchHandledError: true,
+  code: "not_authenticated",
+  kind: "not_authenticated",
+  message,
+  httpStatus: 0,
+  meta,
+  isHandled: true,
+  retryable: false,
+});
+
+/**
+ * Report failure from no-spinner path (validation, credentials, preconditions).
+ * Human block or JSON + single line, depending on format. Does not exit.
+ */
+export const reportCommandError = ({
+  error,
+  format,
+}: {
+  error: unknown;
+  /** Explicit format override; defaults to the running command's format. */
+  format?: string;
+}): void => {
+  const domain = readCommandError(error);
+  const wantsJson = resolveOutputFormat(format) !== "text";
+
+  if (wantsJson) {
+    console.log(renderErrorAsJson(domain));
+    console.error(chalk.red(domain.message));
+    return;
+  }
+
+  console.error(chalk.red(renderErrorForHumans(domain)));
+};

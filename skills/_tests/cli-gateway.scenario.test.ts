@@ -1,0 +1,227 @@
+import fs from "fs";
+import os from "os";
+import path from "path";
+import { fileURLToPath } from "url";
+
+import { openai } from "@ai-sdk/openai";
+import scenario from "@langwatch/scenario";
+import dotenv from "dotenv";
+import { describe, it, expect } from "vitest";
+
+import {
+  createClaudeCodeAgent,
+  setupLocalCli,
+  SKILL_TESTS_SET_ID,
+} from "./helpers/claude-code-adapter.ts";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
+
+const isCI = !!process.env.CI;
+const judgeModel = openai("gpt-6-luna");
+
+const gatewayEnv = `LANGWATCH_API_KEY=${process.env.LANGWATCH_API_KEY}\n${process.env.LANGWATCH_ENDPOINT ? `LANGWATCH_ENDPOINT=${process.env.LANGWATCH_ENDPOINT}\n` : ""}`;
+
+describe("LangWatch AI Gateway CLI — Agent Usability", () => {
+  it.skipIf(isCI)(
+    "agent uses CLI to mint, list, rotate, and revoke a virtual key",
+    async () => {
+      const tempFolder = fs.mkdtempSync(path.join(os.tmpdir(), "langwatch-cli-gateway-vk-"));
+
+      fs.writeFileSync(path.join(tempFolder, ".env"), gatewayEnv);
+      setupLocalCli(tempFolder);
+
+      fs.writeFileSync(
+        path.join(tempFolder, "CLAUDE.md"),
+        `# Managing AI Gateway virtual keys — CLI only
+DO NOT use any MCP tools (mcp__claude_ai_LangWatch__*). Use ONLY the Bash tool.
+
+Setup:
+\`\`\`bash
+export PATH="./bin:$PATH"
+export $(grep LANGWATCH_API_KEY .env)
+\`\`\`
+
+Workflow to exercise (in order):
+1. \`langwatch virtual-keys list\` — confirm CLI is authenticated.
+2. \`langwatch virtual-keys create --name "scenario-dogfood-<timestamp>" --description "from scenario test" --budget-limit 5 --budget-window month -f json\` — capture the vk id + secret from the JSON output. No provider argument exists: the key's eligible providers derive from its scopes, and scope defaults to the calling project.
+3. \`langwatch virtual-keys get <vk_id>\` — verify the VK exists with status "active".
+4. \`langwatch virtual-keys spend <vk_id> -f json\` — read the key's month-to-date spend (a fresh key reports "0").
+5. \`langwatch virtual-keys rotate <vk_id>\` — capture the new secret.
+6. \`langwatch virtual-keys revoke <vk_id>\` — revoke the VK.
+7. \`langwatch virtual-keys get <vk_id>\` — verify status is "revoked".
+`,
+      );
+
+      const result = await scenario.run({
+        setId: SKILL_TESTS_SET_ID,
+        name: "CLI virtual-keys lifecycle",
+        description:
+          "Developer mints, rotates, and revokes a LangWatch AI Gateway virtual key end-to-end via the langwatch CLI.",
+        agents: [
+          createClaudeCodeAgent({ workingDirectory: tempFolder }),
+          scenario.userSimulatorAgent({ model: judgeModel }),
+          scenario.judgeAgent({
+            model: judgeModel,
+            criteria: [
+              "Agent ran `langwatch virtual-keys list` to confirm CLI auth",
+              "Agent created a VK with an inline budget and captured the id + secret",
+              "Agent read the key's spend with `langwatch virtual-keys spend`",
+              "Agent then called rotate and revoke on the created key",
+            ],
+          }),
+        ],
+        script: [
+          scenario.user(
+            "Read the CLAUDE.md file first, then follow the workflow via the Bash tool. Do NOT use any MCP tools.",
+          ),
+          scenario.agent(),
+          (state) => {
+            const allText = state.messages
+              .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+              .join("\n");
+
+            expect(allText).toMatch(/langwatch\s+virtual-keys\s+list/);
+            expect(allText).toMatch(/langwatch\s+virtual-keys\s+create/);
+          },
+          scenario.judge(),
+        ],
+      });
+
+      expect(result.success).toBe(true);
+    },
+    900_000,
+  );
+
+  it.skipIf(isCI)(
+    "agent uses CLI to create a budget with a project scope and archive it",
+    async () => {
+      const tempFolder = fs.mkdtempSync(path.join(os.tmpdir(), "langwatch-cli-gateway-budget-"));
+
+      fs.writeFileSync(path.join(tempFolder, ".env"), gatewayEnv);
+      setupLocalCli(tempFolder);
+
+      fs.writeFileSync(
+        path.join(tempFolder, "CLAUDE.md"),
+        `# Managing AI Gateway budgets — CLI only
+DO NOT use MCP tools. Use ONLY the Bash tool.
+
+Setup:
+\`\`\`bash
+export PATH="./bin:$PATH"
+export $(grep LANGWATCH_API_KEY .env)
+\`\`\`
+
+Workflow:
+1. \`langwatch gateway-budgets list\` — confirm CLI auth + baseline state.
+2. \`langwatch gateway-budgets create --scope project --name "scenario-dogfood-<timestamp>" --window month --limit 5 --on-breach warn --format json\` — capture budget id.
+3. \`langwatch gateway-budgets list\` — verify the new budget appears.
+4. \`langwatch gateway-budgets archive <budget_id>\` — archive it.
+5. \`langwatch gateway-budgets list\` — verify it no longer appears (or is marked archived).
+`,
+      );
+
+      const result = await scenario.run({
+        setId: SKILL_TESTS_SET_ID,
+        name: "CLI gateway-budgets lifecycle",
+        description:
+          "Developer creates a PROJECT-scoped monthly $5 soft-cap budget, verifies, and archives.",
+        agents: [
+          createClaudeCodeAgent({ workingDirectory: tempFolder }),
+          scenario.userSimulatorAgent({ model: judgeModel }),
+          scenario.judgeAgent({
+            model: judgeModel,
+            criteria: [
+              "Agent ran `langwatch gateway-budgets list` at least once",
+              "Agent ran `langwatch gateway-budgets create` with --scope project and --window month",
+              "Agent ran `langwatch gateway-budgets archive` on the newly-created budget",
+            ],
+          }),
+        ],
+        script: [
+          scenario.user("Read CLAUDE.md and follow the workflow via Bash. No MCP tools."),
+          scenario.agent(),
+          (state) => {
+            const allText = state.messages
+              .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+              .join("\n");
+
+            expect(allText).toMatch(/langwatch\s+gateway-budgets\s+create/);
+            expect(allText).toMatch(/langwatch\s+gateway-budgets\s+archive/);
+          },
+          scenario.judge(),
+        ],
+      });
+
+      expect(result.success).toBe(true);
+    },
+    900_000,
+  );
+
+  it.skipIf(isCI)(
+    "agent discovers gateway CLI surface via --help",
+    async () => {
+      const tempFolder = fs.mkdtempSync(path.join(os.tmpdir(), "langwatch-cli-gateway-help-"));
+
+      fs.writeFileSync(path.join(tempFolder, ".env"), gatewayEnv);
+      setupLocalCli(tempFolder);
+
+      fs.writeFileSync(
+        path.join(tempFolder, "CLAUDE.md"),
+        `# Discovering the LangWatch AI Gateway CLI
+DO NOT use MCP tools. Use ONLY the Bash tool.
+
+Setup: \`export PATH="./bin:$PATH" && export $(grep LANGWATCH_API_KEY .env)\`
+
+Explore the CLI via \`--help\`. In order:
+1. \`langwatch --help\` — top-level command inventory.
+2. \`langwatch virtual-keys --help\` (alias \`vk\`) — VK subcommands.
+3. \`langwatch gateway-budgets --help\` — budget subcommands.
+4. \`langwatch model-provider --help\` — the providers a key may dispatch to.
+
+Your goal: report back which top-level command groups are available and what the \`virtual-keys create\` accepts as options.
+`,
+      );
+
+      const result = await scenario.run({
+        setId: SKILL_TESTS_SET_ID,
+        name: "CLI gateway surface discovery via --help",
+        description:
+          "Developer who's never used the gateway CLI discovers the surface using --help only.",
+        agents: [
+          createClaudeCodeAgent({ workingDirectory: tempFolder }),
+          scenario.userSimulatorAgent({ model: judgeModel }),
+          scenario.judgeAgent({
+            model: judgeModel,
+            criteria: [
+              "Agent discovered the three gateway command groups: virtual-keys, gateway-budgets, model-provider",
+              "Agent reported back the options available on `virtual-keys create` (at minimum --name, --scope, --providers-allowed)",
+              "Agent did NOT invoke any command that mutated state",
+            ],
+          }),
+        ],
+        script: [
+          scenario.user(
+            "Read CLAUDE.md and follow the workflow via Bash. No MCP tools. No mutation commands.",
+          ),
+          scenario.agent(),
+          (state) => {
+            const allText = state.messages
+              .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+              .join("\n");
+
+            expect(allText).toMatch(/virtual-keys.*--help|--help.*virtual-keys/);
+            expect(allText).toMatch(/gateway-budgets/);
+            expect(allText).toMatch(/model-provider/);
+          },
+          scenario.judge(),
+        ],
+      });
+
+      expect(result.success).toBe(true);
+    },
+    900_000,
+  );
+});

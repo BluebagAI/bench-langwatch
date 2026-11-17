@@ -1,0 +1,74 @@
+/**
+ * The `/api/v1/scim-tokens` management family: the bearer tokens an identity provider
+ * holds to reach `/api/scim/v2`.
+ */
+import { resolveEndpoint } from "@/internal/endpoint";
+
+import {
+  createManagementRequest,
+  managementPath,
+  type ManagementRequest,
+  resolveManagementToken,
+} from "../_shared/management-request";
+
+export interface ScimTokenSummary {
+  id: string;
+  description: string | null;
+  createdAt: string;
+  lastUsedAt: string | null;
+}
+
+export interface CreatedScimToken {
+  id: string;
+  /** Returned once, here. The platform cannot show it again. */
+  token: string;
+  description: string | null;
+}
+
+export class ScimTokensApiError extends Error {
+  constructor(
+    message: string,
+    public readonly operation: string,
+    public readonly originalError?: unknown,
+  ) {
+    super(message);
+    this.name = "ScimTokensApiError";
+  }
+}
+
+export class ScimTokensApiService {
+  readonly #request: ManagementRequest;
+
+  constructor(config?: { endpoint?: string; apiKey?: string }) {
+    this.#request = createManagementRequest({
+      endpoint: resolveEndpoint(config?.endpoint),
+      token: resolveManagementToken({ apiKey: config?.apiKey }),
+      errorFactory: ({ message, operation, body }) =>
+        new ScimTokensApiError(message, operation, body),
+    });
+  }
+
+  async list(): Promise<{ tokens: ScimTokenSummary[] }> {
+    return this.#request({
+      operation: "list SCIM tokens",
+      path: managementPath("/api/v1/scim-tokens"),
+    });
+  }
+
+  async create(input: { description?: string } = {}): Promise<CreatedScimToken> {
+    return this.#request({
+      operation: "create SCIM token",
+      path: managementPath("/api/v1/scim-tokens"),
+      method: "POST",
+      body: input,
+    });
+  }
+
+  async revoke(id: string): Promise<{ success: true }> {
+    return this.#request({
+      operation: `revoke SCIM token "${id}"`,
+      path: managementPath(`/api/v1/scim-tokens/${encodeURIComponent(id)}`),
+      method: "DELETE",
+    });
+  }
+}

@@ -1,0 +1,144 @@
+package app
+
+import (
+	"bytes"
+	"errors"
+	"net/http"
+	"testing"
+
+	"github.com/tidwall/gjson"
+
+	"github.com/langwatch/langwatch/pkg/providererr"
+	"github.com/langwatch/langwatch/services/aigateway/domain"
+)
+
+// rewriteErrorMessage swaps only the human message, preserving the rest of the
+// envelope, and is a no-op on bodies without an error.message field.
+func TestRewriteErrorMessage(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"},"request_id":"req_123"}`)
+	out := rewriteErrorMessage(body, "Contact your admin")
+
+	if got := gjson.GetBytes(out, "error.message").String(); got != "Contact your admin" {
+		t.Fatalf("message not rewritten: %q", got)
+	}
+	if got := gjson.GetBytes(out, "error.type").String(); got != "invalid_request_error" {
+		t.Fatalf("error.type must be preserved, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "request_id").String(); got != "req_123" {
+		t.Fatalf("request_id must be preserved, got %q", got)
+	}
+
+	noMsg := []byte(`{"detail":"something else"}`)
+	if got := rewriteErrorMessage(noMsg, "x"); !bytes.Equal(got, noMsg) {
+		t.Fatalf("body without error.message must be unchanged, got %q", got)
+	}
+}
+
+func TestApplyGovernanceMessage_RewritesAccountError(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low"}}`)
+
+	// Stream shape: *UpstreamError.
+	ue := &domain.UpstreamError{StatusCode: 400, Body: append([]byte(nil), body...), Message: "Your credit balance is too low"}
+	_, gotErr := applyGovernanceMessage(nil, ue)
+	var got *domain.UpstreamError
+	errors.As(gotErr, &got)
+	if got.Message != accountExhaustionMessage {
+		t.Fatalf("UpstreamError.Message not rewritten: %q", got.Message)
+	}
+	if m := gjson.GetBytes(got.Body, "error.message").String(); m != accountExhaustionMessage {
+		t.Fatalf("body message not rewritten: %q", m)
+	}
+	if got.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status must be preserved: %d", got.StatusCode)
+	}
+
+	// Non-stream shape: Response.
+	resp := &domain.Response{StatusCode: 400, Body: append([]byte(nil), body...)}
+	gotResp, _ := applyGovernanceMessage(resp, nil)
+	if m := gjson.GetBytes(gotResp.Body, "error.message").String(); m != accountExhaustionMessage {
+		t.Fatalf("response body message not rewritten: %q", m)
+	}
+	if gotResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("response status must be preserved: %d", gotResp.StatusCode)
+	}
+
+	// Readers past the gateway classify on the code, not the sentence.
+	for name, b := range map[string][]byte{"stream": got.Body, "response": gotResp.Body} {
+		if c := gjson.GetBytes(b, "error.code").String(); c != providererr.GatewayAccountExhaustedCode {
+			t.Fatalf("%s body must carry the exhaustion code, got %q", name, c)
+		}
+	}
+	if got.ErrorCode != providererr.GatewayAccountExhaustedCode {
+		t.Fatalf("UpstreamError.ErrorCode must carry the exhaustion code, got %q", got.ErrorCode)
+	}
+}
+
+// A provider's own code survives, and the message rewrite alone sets no code.
+func TestMarkAccountExhausted_KeepsProviderCode(t *testing.T) {
+	body := []byte(`{"error":{"message":"quota","type":"insufficient_quota","code":"insufficient_quota"}}`)
+	if c := gjson.GetBytes(markAccountExhausted(body), "error.code").String(); c != "insufficient_quota" {
+		t.Fatalf("provider code must be kept, got %q", c)
+	}
+	plain := []byte(`{"error":{"message":"quota"}}`)
+	if gjson.GetBytes(rewriteErrorMessage(plain, "x"), "error.code").Exists() {
+		t.Fatal("rewriteErrorMessage must not set a code")
+	}
+}
+
+// Translated lanes carry the provider's discriminants on the error itself
+// (no captured body); the parsed type/code must trigger the same rewrite or
+// the provider's billing message reaches governed users on those lanes.
+func TestApplyGovernanceMessage_RewritesOnParsedQuotaCode(t *testing.T) {
+	ue := &domain.UpstreamError{
+		StatusCode: 429,
+		Message:    "You exceeded your current quota, please check your plan and billing details.",
+		ErrorType:  "insufficient_quota",
+		ErrorCode:  "insufficient_quota",
+	}
+	_, gotErr := applyGovernanceMessage(nil, ue)
+	var got *domain.UpstreamError
+	errors.As(gotErr, &got)
+	if got.Message != accountExhaustionMessage {
+		t.Fatalf("bodyless quota error must be re-messaged, got %q", got.Message)
+	}
+	if got.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status must be preserved: %d", got.StatusCode)
+	}
+	if got.ErrorType != "insufficient_quota" || got.ErrorCode != "insufficient_quota" {
+		t.Fatalf("error identity must be preserved: type=%q code=%q", got.ErrorType, got.ErrorCode)
+	}
+}
+
+// A provider outage that names a quota code is still an outage, not a spent account.
+func TestApplyGovernanceMessage_LeavesOutageWithQuotaCodeVerbatim(t *testing.T) {
+	ue := &domain.UpstreamError{
+		StatusCode: http.StatusServiceUnavailable,
+		Message:    "upstream unavailable",
+		ErrorType:  "insufficient_quota",
+		ErrorCode:  "insufficient_quota",
+	}
+	_, gotErr := applyGovernanceMessage(nil, ue)
+	var got *domain.UpstreamError
+	errors.As(gotErr, &got)
+	if got.Message != "upstream unavailable" {
+		t.Fatalf("a 5xx must keep its message, got %q", got.Message)
+	}
+}
+
+// A retryable rate-limit must NOT be re-messaged — it stays verbatim and
+// retryable (the bug-33 complement: only terminal account exhaustion is
+// re-messaged).
+func TestApplyGovernanceMessage_LeavesRetryableVerbatim(t *testing.T) {
+	body := []byte(`{"error":{"message":"Rate limit reached","type":"rate_limit_error"}}`)
+
+	ue := &domain.UpstreamError{StatusCode: 429, Body: append([]byte(nil), body...), Message: "Rate limit reached"}
+	_, gotErr := applyGovernanceMessage(nil, ue)
+	var got *domain.UpstreamError
+	errors.As(gotErr, &got)
+	if got.Message != "Rate limit reached" {
+		t.Fatalf("retryable rate-limit must stay verbatim, got %q", got.Message)
+	}
+	if m := gjson.GetBytes(got.Body, "error.message").String(); m != "Rate limit reached" {
+		t.Fatalf("retryable body must stay verbatim, got %q", m)
+	}
+}

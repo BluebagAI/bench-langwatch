@@ -1,0 +1,1247 @@
+/**
+ * Experiment - Main class for running batch experiments
+ */
+
+import { AsyncLocalStorage } from "node:async_hooks";
+
+import { trace, SpanStatusCode, ROOT_CONTEXT } from "@opentelemetry/api";
+
+import type { LangwatchApiClient } from "@/internal/api/client";
+import { buildRequestHeaders } from "@/internal/api/request-headers";
+import { resolveEndpoint } from "@/internal/endpoint";
+import { langwatchFetch } from "@/internal/http/langwatchFetch";
+import type { Logger } from "@/logger";
+import { ensureSetup } from "@/observability-sdk/setup/node";
+import { createLangWatchSpan } from "@/observability-sdk/span/implementation";
+import type { LangWatchSpan } from "@/observability-sdk/span/types";
+
+import type { CapturedTargetOutput } from "./comparison.ts";
+import {
+  COMPARISON_EVALUATOR_SLUG,
+  DEFAULT_COMPARISON_NAME,
+  buildComparisonCandidates,
+  buildComparisonData,
+  buildComparisonSettings,
+  comparisonEntryLabel,
+  comparisonEntryStatus,
+  describeSkippedComparison,
+  renderTargetOutput,
+  toComparisonVerdict,
+} from "./comparison.ts";
+import {
+  ExperimentInitError,
+  TargetMetadataConflictError,
+  ComparisonError,
+  EvaluatorError,
+} from "./errors/index.ts";
+import {
+  printExperimentSummary,
+  type SummaryEntry,
+  type SummaryEvaluation,
+} from "./experiment-summary.ts";
+import { generateHumanReadableId } from "./humanReadableId.ts";
+import {
+  describeRefusedEntry,
+  endsTheRun,
+  halveLogResultsBody,
+  splitLogResultsBody,
+} from "./log-results-batching.ts";
+import type {
+  Batch,
+  BatchEntry,
+  ComparisonOptions,
+  ComparisonVerdict,
+  ExperimentEvaluationResult,
+  TargetInfo,
+  TargetMetadata,
+  ExperimentInitOptions,
+  LogOptions,
+  ExperimentEvaluateOptions,
+  RunOptions,
+  RunCallback,
+  RunContext,
+  ExperimentInitResponse,
+  LogResultsRequest,
+  RunEvaluatorResponse,
+  TargetCallback,
+  TargetResult,
+  TargetExecutionContext,
+  TargetContext,
+} from "./types.ts";
+
+const DEFAULT_CONCURRENCY = 4;
+const DEBOUNCE_INTERVAL_MS = 1000;
+
+/**
+ * How many rows of captured target outputs compare() keeps around.
+ */
+const MAX_COMPARISON_ROWS_RETAINED = 1000;
+
+/**
+ * How long an evaluator call may take before the socket is given up on.
+ */
+export const EVALUATOR_TIMEOUT_MS = 900_000;
+
+function predictedOf(result: unknown): Record<string, unknown> | null {
+  if (result === undefined || result === null) return null;
+  return typeof result === "object" ? (result as Record<string, unknown>) : { output: result };
+}
+
+/**
+ * AsyncLocalStorage for iteration context isolation. This stores the current item, index
+ * and trace for each iteration, preventing race conditions in concurrent execution.
+ */
+type IterationContext = {
+  index: number;
+  item: unknown;
+  traceId: string | null;
+};
+const iterationContextStorage = new AsyncLocalStorage<IterationContext>();
+
+/**
+ * AsyncLocalStorage for target context isolation.
+ * This allows log() calls inside withTarget() to automatically
+ * infer the target without explicit specification.
+ */
+const targetContextStorage = new AsyncLocalStorage<TargetExecutionContext>();
+
+/**
+ * Experiment session for running batch experiments
+ */
+export class Experiment {
+  readonly name: string;
+  readonly runId: string;
+  readonly experimentSlug: string;
+
+  private readonly apiClient: LangwatchApiClient;
+  private readonly endpoint: string;
+  private readonly apiKey: string;
+  private readonly logger: Logger;
+  private readonly concurrency: number;
+
+  private initialized = false;
+  private createdAtMs: number;
+  private total = 0;
+  private progress = 0;
+
+  // Batching state
+  private batch: Batch = { dataset: [], evaluations: [], targets: [] };
+  private lastSentMs = 0;
+  private pendingFlush: Promise<void> | null = null;
+  /** Every row and verdict sent so far, by the identity the platform stores it under. */
+  private readonly sentRows = new Set<string>();
+  private readonly sentEvaluations = new Set<string>();
+  private flushTimeout: ReturnType<typeof setTimeout> | null = null;
+
+  // Cumulative record for printSummary() — never cleared, mirrors batch.
+  // Store only the fields printSummary() needs, not the full payloads —
+  // inputs/tracebacks/outputs can be large and don't belong in retained summary state.
+  private cumulativeEvaluations: SummaryEvaluation[] = [];
+  private cumulativeEntries: SummaryEntry[] = [];
+  private runUrl = "";
+
+  // Target registry
+  private targets = new Map<string, TargetInfo>();
+
+  // Per-row target outputs for compare(), keyed by row then by target name.
+  // Captured when a withTarget() callback resolves and kept independently of
+  // the batch, which is flushed on a timer and may be long gone by the time
+  // the row is compared. Insertion-ordered, and reaped oldest-first past
+  // MAX_COMPARISON_ROWS_RETAINED.
+  private capturedOutputs = new Map<number, Map<string, CapturedTargetOutput>>();
+
+  // Track whether withTarget() was used in the current iteration
+  // If so, we don't create dataset entries in executeItem()
+  // Note: This is now checked via iterationContextStorage to be thread-safe
+  private iterationUsedWithTarget = new Map<number, boolean>();
+
+  // Track whether withTarget() has EVER been used in this evaluation
+  // Once set to true, we stop creating iteration-level traces
+  private evaluationUsesTargets = false;
+
+  private constructor(
+    name: string,
+    options: {
+      apiClient: LangwatchApiClient;
+      endpoint: string;
+      apiKey: string;
+      logger: Logger;
+      runId?: string;
+      concurrency?: number;
+    },
+  ) {
+    this.name = name;
+    this.experimentSlug = name;
+    this.runId = options.runId ?? generateHumanReadableId();
+    this.apiClient = options.apiClient;
+    this.endpoint = resolveEndpoint(options.endpoint);
+    this.apiKey = options.apiKey;
+    this.logger = options.logger;
+    this.concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
+    this.createdAtMs = Date.now();
+  }
+
+  /**
+   * Initialize an evaluation session
+   */
+  static async init(
+    name: string,
+    options: {
+      apiClient: LangwatchApiClient;
+      endpoint: string;
+      apiKey: string;
+      logger: Logger;
+    } & ExperimentInitOptions,
+  ): Promise<Experiment> {
+    // Ensure observability is set up for proper tracing
+    ensureSetup();
+
+    const experiment = new Experiment(name, options);
+    await experiment.initialize();
+    return experiment;
+  }
+
+  /**
+   * Initialize the evaluation by creating/getting the experiment
+   */
+  private async initialize(): Promise<void> {
+    if (!this.apiKey) {
+      throw new ExperimentInitError(
+        "API key is required. Set LANGWATCH_API_KEY or pass apiKey to LangWatch constructor.",
+      );
+    }
+
+    try {
+      const response = await langwatchFetch(`${this.endpoint}/api/v1/experiment/init`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildRequestHeaders({ apiKey: this.apiKey }),
+        },
+        body: JSON.stringify({
+          experiment_name: this.name,
+          experiment_slug: this.experimentSlug,
+          experiment_type: "BATCH_EVALUATION_V2",
+        }),
+      });
+
+      if (response.status === 401) {
+        throw new ExperimentInitError("Invalid API key");
+      }
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new ExperimentInitError(`Failed to initialize experiment: ${text}`);
+      }
+
+      const data = (await response.json()) as ExperimentInitResponse;
+      (this as { experimentSlug: string }).experimentSlug = data.slug;
+
+      const encodedRunId = encodeURIComponent(this.runId);
+      this.runUrl = `${this.endpoint}${data.path}?runId=${encodedRunId}`;
+      console.log(`Follow results at: ${this.runUrl}`);
+
+      this.initialized = true;
+    } catch (error) {
+      if (error instanceof ExperimentInitError) {
+        throw error;
+      }
+      throw new ExperimentInitError(
+        `Failed to initialize evaluation: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error : undefined,
+      );
+    }
+  }
+
+  /**
+   * Run evaluation over a dataset with a callback.
+   * @param dataset - Array of items to evaluate
+   * @param callback - Function called for each item with { item, index, span }
+   */
+  async run<T>(dataset: T[], callback: RunCallback<T>, options?: RunOptions): Promise<void> {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const concurrency = options?.concurrency ?? this.concurrency;
+    this.total = dataset.length;
+    this.progress = 0;
+
+    const tracer = trace.getTracer("langwatch");
+
+    // Process items with concurrency control
+    const executing = new Set<Promise<void>>();
+
+    for (let index = 0; index < dataset.length; index++) {
+      const item = dataset[index] as T;
+
+      const itemPromise = this.executeItem(tracer, item, index, callback);
+
+      executing.add(itemPromise);
+      void itemPromise.finally(() => executing.delete(itemPromise));
+
+      // Wait if we've hit concurrency limit
+      if (executing.size >= concurrency) {
+        await Promise.race(executing);
+      }
+    }
+
+    // Wait for all remaining items
+    await Promise.all(executing);
+
+    // Flush OTEL spans so all child spans created inside callbacks are exported
+    const provider = trace.getTracerProvider();
+    const delegate =
+      "getDelegate" in provider && typeof provider.getDelegate === "function"
+        ? provider.getDelegate()
+        : provider;
+    if (delegate && "forceFlush" in delegate && typeof delegate.forceFlush === "function") {
+      await delegate.forceFlush();
+    }
+
+    // Send final batch with finished timestamp
+    await this.flush(true);
+  }
+
+  /**
+   * Execute a single item in the dataset
+   */
+  /** Runs one row without a trace of its own: each withTarget() call traces itself. */
+  private async runItemUntraced<T>({
+    iterationContext,
+    item,
+    callback,
+  }: {
+    iterationContext: IterationContext;
+    item: T;
+    callback: RunCallback<T>;
+  }): Promise<{ error: Error | undefined; capturedTraceId: string | null }> {
+    const index = iterationContext.index;
+    let error: Error | undefined;
+    await iterationContextStorage.run(iterationContext, async () => {
+      try {
+        // Create a minimal span context for the callback
+        const span = {
+          setStatus: () => {
+            /* no-op */
+          },
+          recordException: () => {
+            /* no-op */
+          },
+          end: () => {
+            /* no-op */
+          },
+        } as unknown as LangWatchSpan;
+
+        const ctx: RunContext<T> = { item, index, span };
+        const result = callback(ctx);
+
+        if (result && typeof result.then === "function") {
+          await result;
+        }
+      } catch (err) {
+        error = err instanceof Error ? err : new Error(String(err));
+        this.logger.error(`Evaluation error at index ${index}:`, error);
+      }
+    });
+    return { error, capturedTraceId: null };
+  }
+
+  /** Runs one row inside its own iteration span. */
+  private async runItemTraced<T>({
+    tracer,
+    iterationContext,
+    item,
+    callback,
+  }: {
+    tracer: ReturnType<typeof trace.getTracer>;
+    iterationContext: IterationContext;
+    item: T;
+    callback: RunCallback<T>;
+  }): Promise<{ error: Error | undefined; capturedTraceId: string | null }> {
+    const index = iterationContext.index;
+    let error: Error | undefined;
+    let capturedTraceId: string | null = null;
+    await iterationContextStorage.run(iterationContext, async () => {
+      await tracer.startActiveSpan(
+        "evaluation.iteration",
+        {
+          attributes: {
+            "langwatch.origin": "evaluation",
+            "evaluation.run_id": this.runId,
+            "evaluation.index": index,
+          },
+        },
+        async (otelSpan) => {
+          const span = createLangWatchSpan(otelSpan);
+          const spanContext = otelSpan.spanContext();
+          const traceId = spanContext.traceId;
+
+          // The row's own trace, for the log/evaluate/compare calls made
+          // inside it. It rides the iteration context rather than the
+          // instance, so a row reads its own trace and never a neighbour's.
+          iterationContext.traceId = traceId;
+          capturedTraceId = traceId;
+
+          try {
+            const ctx: RunContext<T> = { item, index, span };
+            const result = callback(ctx);
+
+            if (result && typeof result.then === "function") {
+              await result;
+            }
+
+            span.setStatus({ code: SpanStatusCode.OK });
+          } catch (err) {
+            error = err instanceof Error ? err : new Error(String(err));
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: error.message,
+            });
+            span.recordException(error);
+            this.logger.error(`Evaluation error at index ${index}:`, error);
+          } finally {
+            span.end();
+          }
+        },
+      );
+    });
+    return { error, capturedTraceId };
+  }
+
+  private async executeItem<T>(
+    tracer: ReturnType<typeof trace.getTracer>,
+    item: T,
+    index: number,
+    callback: RunCallback<T>,
+  ): Promise<void> {
+    const startTime = Date.now();
+
+    // Reset withTarget tracking for this iteration
+    this.iterationUsedWithTarget.set(index, false);
+
+    // Set up iteration context (thread-safe via AsyncLocalStorage)
+    const iterationContext: IterationContext = { index, item, traceId: null };
+
+    // If evaluation uses targets, skip creating iteration-level traces
+    // Each withTarget() call will create its own independent trace
+    const { error, capturedTraceId } = this.evaluationUsesTargets
+      ? await this.runItemUntraced({ iterationContext, item, callback })
+      : await this.runItemTraced({ tracer, iterationContext, item, callback });
+
+    // Only add a dataset entry if withTarget() was NOT used
+    // When withTarget() is used, it creates its own dataset entries per target
+    if (!this.iterationUsedWithTarget.get(index)) {
+      const duration = Date.now() - startTime;
+      const entry: BatchEntry = {
+        index,
+        entry: this.serializeItem(item),
+        duration,
+        error: error?.message ?? null,
+        trace_id: capturedTraceId ?? this.getTraceIdFromContext(),
+      };
+
+      this.batch.dataset.push(entry);
+      this.cumulativeEntries.push({
+        duration: entry.duration,
+        error: entry.error,
+        cost: entry.cost,
+        target_id: entry.target_id,
+      });
+    }
+
+    // Clean up
+    this.iterationUsedWithTarget.delete(index);
+
+    this.progress++;
+
+    // Debounced send
+    this.scheduleSend();
+  }
+
+  /**
+   * @param metric - Name of the metric
+   * @param options - Metric options including index, score, passed, etc.
+   * @example
+   */
+  log(metric: string, options: LogOptions): void {
+    // Get context from AsyncLocalStorage (if inside withTarget)
+    const targetContext = targetContextStorage.getStore();
+
+    const {
+      data = {},
+      score,
+      passed,
+      label,
+      details,
+      status = options.error ? "error" : "processed",
+      duration,
+      cost,
+      error,
+      // Use context values as defaults, allow explicit override
+      target = targetContext?.targetId,
+      metadata,
+      index = targetContext?.index ?? options.index,
+    } = options;
+
+    // Register target if provided (explicit or from context)
+    let targetId: string | undefined;
+    if (target) {
+      targetId = this.registerTarget(target, metadata);
+    }
+
+    // Use trace ID from the target, then the row being iterated, then OTEL context
+    const traceId =
+      targetContext?.traceId ??
+      iterationContextStorage.getStore()?.traceId ??
+      this.getTraceIdFromContext();
+
+    const result: ExperimentEvaluationResult = {
+      name: metric,
+      evaluator: metric,
+      trace_id: traceId,
+      status,
+      data,
+      score: score ?? null,
+      passed: passed ?? null,
+      details: details ?? (error ? error.message : null),
+      index,
+      label: label ?? null,
+      cost: cost ?? null,
+      duration: duration ?? null,
+      error_type: error ? error.name : null,
+      traceback: error ? [error.stack ?? error.message] : null,
+      target_id: targetId ?? null,
+    };
+
+    this.pushEvaluation(result);
+  }
+
+  /**
+   * Queue an evaluation result for the next batch
+   */
+  private pushEvaluation(result: ExperimentEvaluationResult): void {
+    this.batch.evaluations.push(result);
+    this.cumulativeEvaluations.push({
+      name: result.name,
+      evaluator: result.evaluator,
+      status: result.status,
+      passed: result.passed,
+      score: result.score,
+      cost: result.cost,
+      target_id: result.target_id,
+    });
+    this.scheduleSend();
+  }
+
+  /**
+   * @param evaluatorSlug - The evaluator identifier (e.g., 'ragas/faithfulness')
+   * @param options - Evaluator options including data and settings
+   * @example
+   */
+  async evaluate(evaluatorSlug: string, options: ExperimentEvaluateOptions): Promise<void> {
+    // Get context from AsyncLocalStorage (if inside withTarget)
+    const targetContext = targetContextStorage.getStore();
+
+    const {
+      data,
+      settings,
+      name,
+      asGuardrail = false,
+      // Use context values as defaults, allow explicit override
+      target = targetContext?.targetId,
+      metadata,
+      index = targetContext?.index ?? options.index,
+    } = options;
+
+    const startTime = Date.now();
+    // Use trace ID from the target, then the row being iterated, then OTEL context
+    const traceId =
+      targetContext?.traceId ??
+      iterationContextStorage.getStore()?.traceId ??
+      this.getTraceIdFromContext();
+    const spanId = targetContext?.spanId ?? this.getSpanIdFromContext();
+
+    try {
+      const result = await this.callEvaluator({
+        evaluatorSlug,
+        data,
+        settings,
+        name,
+        traceId,
+        spanId,
+        asGuardrail,
+      });
+      const duration = Date.now() - startTime;
+
+      // Log the result
+      this.log(name ?? evaluatorSlug, {
+        index,
+        data,
+        status: result.status,
+        score: result.score ?? undefined,
+        passed: result.passed ?? undefined,
+        details: result.details ?? undefined,
+        label: result.label ?? undefined,
+        duration,
+        cost: result.cost?.amount,
+        target,
+        metadata,
+      });
+    } catch (error) {
+      const duration = Date.now() - startTime;
+
+      if (error instanceof EvaluatorError) {
+        this.log(name ?? evaluatorSlug, {
+          index,
+          data,
+          status: "error",
+          duration,
+          error: error,
+          target,
+          metadata,
+        });
+        throw error;
+      }
+
+      const wrappedError = new EvaluatorError(
+        evaluatorSlug,
+        error instanceof Error ? error.message : String(error),
+        error instanceof Error ? error : undefined,
+      );
+
+      this.log(name ?? evaluatorSlug, {
+        index,
+        data,
+        status: "error",
+        duration,
+        error: wrappedError,
+        target,
+        metadata,
+      });
+
+      throw wrappedError;
+    }
+  }
+
+  /**
+   * Call an evaluator and return its raw result
+   */
+  private async callEvaluator({
+    evaluatorSlug,
+    data,
+    settings,
+    name,
+    traceId,
+    spanId,
+    asGuardrail = false,
+  }: {
+    evaluatorSlug: string;
+    data: Record<string, unknown>;
+    settings?: Record<string, unknown>;
+    name?: string;
+    traceId?: string | null;
+    spanId?: string | null;
+    asGuardrail?: boolean;
+  }): Promise<RunEvaluatorResponse> {
+    const response = await langwatchFetch(
+      `${this.endpoint}/api/v1/evaluations/${evaluatorSlug}/evaluate`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...buildRequestHeaders({ apiKey: this.apiKey }),
+        },
+        body: JSON.stringify({
+          trace_id: traceId ?? null,
+          span_id: spanId ?? null,
+          name: name ?? evaluatorSlug,
+          data,
+          settings,
+          as_guardrail: asGuardrail,
+        }),
+        signal: AbortSignal.timeout(EVALUATOR_TIMEOUT_MS),
+      },
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new EvaluatorError(evaluatorSlug, text);
+    }
+
+    return (await response.json()) as RunEvaluatorResponse;
+  }
+
+  /**
+   * @param options - How the judge should read the row, and which row when
+   * @returns The verdict, including the candidates it actually saw
+   * @example
+   */
+  async compare(options: ComparisonOptions = {}): Promise<ComparisonVerdict> {
+    const { name = DEFAULT_COMPARISON_NAME, targets, input, golden } = options;
+
+    const index = this.resolveComparisonRow(options.index);
+
+    const captured = this.capturedOutputs.get(index) ?? new Map<string, CapturedTargetOutput>();
+
+    if (targets) {
+      const missing = targets.filter((target) => !captured.has(target));
+      if (missing.length > 0) {
+        throw new ComparisonError(
+          `Cannot compare row ${index}: no output was recorded for ${missing
+            .map((target) => `'${target}'`)
+            .join(", ")}. Compare a row once every withTarget() call for it has settled.`,
+          missing,
+        );
+      }
+    }
+
+    // Registration order, not the order the outputs happened to land in:
+    // targets usually run concurrently, so completion order varies per row and
+    // would reshuffle what the judge sees from one row to the next.
+    const requested = targets ? new Set(targets) : null;
+    const candidates = Array.from(this.targets.keys()).filter(
+      (target) => captured.has(target) && (requested === null || requested.has(target)),
+    );
+
+    if (candidates.length < 2) {
+      const missing = Array.from(this.targets.keys()).filter(
+        (target) => !captured.has(target) && (requested === null || requested.has(target)),
+      );
+      const verdict: ComparisonVerdict = {
+        status: "skipped",
+        winner: null,
+        reasoning: describeSkippedComparison({ candidates, missing }),
+        candidates,
+      };
+
+      this.recordComparison({ name, index, verdict });
+
+      return verdict;
+    }
+
+    const data = buildComparisonData({
+      input,
+      golden,
+      candidates: buildComparisonCandidates(candidates, captured),
+      index,
+    });
+    const settings = buildComparisonSettings(options);
+
+    const startTime = Date.now();
+
+    // A judge that could not be reached measured nothing about the
+    // candidates, so it is an errored row rather than a finding about them.
+    // One unreachable judge must not end a run over a thousand rows either,
+    // so the failure is reported to the caller instead of thrown.
+    let response: RunEvaluatorResponse;
+    try {
+      response = await this.callEvaluator({
+        evaluatorSlug: COMPARISON_EVALUATOR_SLUG,
+        data,
+        settings,
+        name,
+        traceId: iterationContextStorage.getStore()?.traceId ?? this.getTraceIdFromContext(),
+        spanId: this.getSpanIdFromContext(),
+      });
+    } catch (error) {
+      response = {
+        status: "error",
+        details: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    const verdict = toComparisonVerdict({ response, candidates });
+
+    this.recordComparison({
+      name,
+      index,
+      verdict,
+      score: response.score ?? null,
+      cost: response.cost?.amount ?? null,
+      duration: Date.now() - startTime,
+    });
+
+    return verdict;
+  }
+
+  /**
+   * The row a comparison is about
+   */
+  private resolveComparisonRow(index?: number): number {
+    const resolved = index ?? iterationContextStorage.getStore()?.index;
+
+    if (resolved === undefined) {
+      throw new ComparisonError(
+        "Cannot compare: no row was given and none could be inferred. Pass index explicitly when comparing outside a run() iteration.",
+      );
+    }
+
+    return resolved;
+  }
+
+  /**
+   * Record a comparison verdict against the row
+   */
+  private recordComparison({
+    name,
+    index,
+    verdict,
+    score = null,
+    cost = null,
+    duration = null,
+  }: {
+    name: string;
+    index: number;
+    verdict: ComparisonVerdict;
+    score?: number | null;
+    cost?: number | null;
+    duration?: number | null;
+  }): void {
+    const status = comparisonEntryStatus(verdict.status);
+
+    this.pushEvaluation({
+      name,
+      evaluator: COMPARISON_EVALUATOR_SLUG,
+      trace_id: iterationContextStorage.getStore()?.traceId ?? this.getTraceIdFromContext(),
+      status,
+      // The results page keys a comparison column off this candidate list.
+      data: {
+        candidates: verdict.candidates.map((candidate) => ({ id: candidate })),
+      },
+      // A row that established nothing carries no score: 0.5 would read as the
+      // tie it is not, and 1.0 as a win for a winner it does not have.
+      score: status === "processed" ? score : null,
+      passed: null,
+      details: verdict.reasoning,
+      index,
+      label: comparisonEntryLabel(verdict),
+      cost,
+      duration,
+      error_type: null,
+      traceback: null,
+      target_id: null,
+    });
+  }
+
+  /**
+   * Execute code within a target context with automatic tracing.
+   * @param targetName - Unique identifier for the target
+   * @param callback - Function to execute within the target context
+   */
+  async withTarget<R>(
+    targetName: string,
+    metadata: TargetMetadata | null,
+    callback: TargetCallback<R>,
+  ): Promise<TargetResult<R>>;
+  async withTarget<R>(targetName: string, callback: TargetCallback<R>): Promise<TargetResult<R>>;
+  async withTarget<R>(
+    targetName: string,
+    metadataOrCallback: TargetMetadata | null | TargetCallback<R>,
+    maybeCallback?: TargetCallback<R>,
+  ): Promise<TargetResult<R>> {
+    // Handle overloads
+    const metadata = typeof metadataOrCallback === "function" ? null : metadataOrCallback;
+    const callback = typeof metadataOrCallback === "function" ? metadataOrCallback : maybeCallback!;
+
+    // On FIRST withTarget() call ever in this evaluation:
+    // - Set flag to skip creating iteration-level traces going forward
+    this.evaluationUsesTargets = true;
+
+    // Get iteration context (thread-safe via AsyncLocalStorage)
+    const iterationContext = iterationContextStorage.getStore();
+    const index = iterationContext?.index ?? 0;
+    const currentItem = iterationContext?.item;
+
+    // Mark that withTarget() was used - prevents executeItem from creating a dataset entry
+    this.iterationUsedWithTarget.set(index, true);
+
+    // Register target
+    this.registerTarget(targetName, metadata ?? undefined);
+
+    const tracer = trace.getTracer("langwatch");
+    const startTime = Date.now();
+    let result: R | undefined;
+    let traceId = "";
+    let spanId = "";
+    let callbackError: Error | undefined;
+
+    // Create an INDEPENDENT root span using ROOT_CONTEXT
+    // This ensures each target gets a unique trace_id, not shared with iteration
+    await tracer.startActiveSpan(
+      `evaluation.target.${targetName}`,
+      {
+        attributes: {
+          "langwatch.origin": "evaluation",
+          "evaluation.run_id": this.runId,
+          "evaluation.target": targetName,
+          "evaluation.index": index,
+        },
+      },
+      ROOT_CONTEXT,
+      async (otelSpan) => {
+        const span = createLangWatchSpan(otelSpan);
+        const spanContext = otelSpan.spanContext();
+        const rawTraceId = spanContext.traceId;
+        spanId = spanContext.spanId;
+
+        // Check if this is a no-op trace (all zeros = no tracer configured)
+        const isNoOpTrace = rawTraceId === "00000000000000000000000000000000";
+        traceId = isNoOpTrace ? "" : rawTraceId;
+
+        // Set up the target execution context
+        const executionContext: TargetExecutionContext = {
+          targetId: targetName,
+          traceId,
+          spanId,
+          index,
+        };
+
+        try {
+          // Run callback within AsyncLocalStorage context
+          result = await targetContextStorage.run(executionContext, async () => {
+            const ctx: TargetContext = { span, traceId, spanId };
+            const callbackResult = callback(ctx);
+
+            if (callbackResult && typeof (callbackResult as Promise<R>).then === "function") {
+              return callbackResult;
+            }
+            return callbackResult as R;
+          });
+
+          span.setStatus({ code: SpanStatusCode.OK });
+        } catch (err) {
+          callbackError = err instanceof Error ? err : new Error(String(err));
+          span.setStatus({
+            code: SpanStatusCode.ERROR,
+            message: callbackError.message,
+          });
+          span.recordException(callbackError);
+          throw err;
+        } finally {
+          span.end();
+        }
+      },
+    );
+
+    const duration = Date.now() - startTime;
+
+    // Serialize the result as "predicted" output (similar to Evaluations V3)
+    const predicted = predictedOf(result);
+
+    // Create a dataset entry for this target execution (like Evaluations V3)
+    // This captures per-target duration/latency properly
+    // Use currentItem from iteration context (thread-safe), NOT shared instance variable
+    const entry: BatchEntry = {
+      index,
+      entry: this.serializeItem(currentItem),
+      duration,
+      error: callbackError?.message ?? null,
+      trace_id: traceId || null, // null if no tracer configured (no-op)
+      target_id: targetName,
+      predicted,
+    };
+
+    this.batch.dataset.push(entry);
+    this.cumulativeEntries.push({
+      duration: entry.duration,
+      error: entry.error,
+      cost: entry.cost,
+      target_id: entry.target_id,
+    });
+    this.captureTargetOutput({
+      index,
+      targetName,
+      output: renderTargetOutput(result),
+      durationMs: duration,
+    });
+    this.scheduleSend();
+
+    return {
+      result: result!,
+      duration,
+      traceId,
+      spanId,
+    };
+  }
+
+  /**
+   * Keep a target's output for the row so compare() can reach it later
+   */
+  private captureTargetOutput({
+    index,
+    targetName,
+    output,
+    durationMs,
+  }: {
+    index: number;
+    targetName: string;
+    output: string;
+    durationMs?: number;
+  }): void {
+    if (output === "") {
+      return;
+    }
+
+    let row = this.capturedOutputs.get(index);
+    if (!row) {
+      row = new Map<string, CapturedTargetOutput>();
+      this.capturedOutputs.set(index, row);
+    }
+    row.set(targetName, { output, durationMs });
+
+    while (this.capturedOutputs.size > MAX_COMPARISON_ROWS_RETAINED) {
+      const oldest = this.capturedOutputs.keys().next();
+      if (oldest.done) break;
+      this.capturedOutputs.delete(oldest.value);
+    }
+  }
+
+  /**
+   * Register a target for multi-target comparison
+   */
+  private registerTarget(name: string, metadata?: TargetMetadata): string {
+    const existing = this.targets.get(name);
+
+    if (existing) {
+      // Check for metadata conflict
+      if (metadata) {
+        const existingMeta = existing.metadata ?? {};
+        const existingMetaJson = JSON.stringify(existingMeta);
+        const metadataJson = JSON.stringify(metadata);
+        if (existingMetaJson !== metadataJson) {
+          throw new TargetMetadataConflictError(name, existingMeta, metadata);
+        }
+      }
+      return name;
+    }
+
+    // Register new target
+    const targetInfo: TargetInfo = {
+      id: name,
+      name,
+      type: "custom",
+      metadata: metadata ?? null,
+    };
+
+    this.targets.set(name, targetInfo);
+    this.batch.targets.push(targetInfo);
+
+    return name;
+  }
+
+  /**
+   * Schedule a debounced send
+   */
+  private scheduleSend(): void {
+    const now = Date.now();
+
+    if (now - this.lastSentMs >= DEBOUNCE_INTERVAL_MS) {
+      this.sendBatch();
+    } else {
+      this.flushTimeout ??= setTimeout(
+        () => {
+          this.flushTimeout = null;
+          this.sendBatch();
+        },
+        DEBOUNCE_INTERVAL_MS - (now - this.lastSentMs),
+      );
+    }
+  }
+
+  /**
+   * Print a CI-friendly summary and optionally exit with code 1 on failure.
+   * @param exitOnFailure - If true (default), calls `process.exit(1)` when any evaluation failed.
+   * @example
+   */
+  printSummary(exitOnFailure = true): void {
+    printExperimentSummary({
+      runId: this.runId,
+      runUrl: this.runUrl,
+      createdAtMs: this.createdAtMs,
+      evaluations: this.cumulativeEvaluations,
+      entries: this.cumulativeEntries,
+      exitOnFailure,
+    });
+  }
+
+  /**
+   * Send current batch to the API
+   */
+  private sendBatch(finished = false): void {
+    if (this.batch.dataset.length === 0 && this.batch.evaluations.length === 0) {
+      if (this.batch.targets.length === 0 && !finished) {
+        return;
+      }
+    }
+
+    for (const entry of this.batch.dataset) {
+      this.sentRows.add(`${entry.index}:${entry.target_id ?? ""}`);
+    }
+    for (const evaluation of this.batch.evaluations) {
+      this.sentEvaluations.add(
+        `${evaluation.index ?? ""}:${evaluation.target_id ?? ""}:${evaluation.evaluator}`,
+      );
+    }
+
+    const body: LogResultsRequest = {
+      experiment_slug: this.experimentSlug,
+      name: this.name,
+      run_id: this.runId,
+      dataset: this.batch.dataset.map((entry) => ({
+        index: entry.index,
+        entry: entry.entry,
+        duration: entry.duration,
+        error: entry.error,
+        trace_id: entry.trace_id,
+        target_id: entry.target_id ?? null,
+        cost: entry.cost ?? null,
+        // Only include predicted if it's defined (omit entirely when null/undefined)
+        ...(entry.predicted !== undefined && entry.predicted !== null
+          ? { predicted: entry.predicted }
+          : {}),
+      })),
+      evaluations: this.batch.evaluations.map((e) => ({
+        name: e.name,
+        evaluator: e.evaluator,
+        trace_id: e.trace_id,
+        status: e.status,
+        inputs: e.data,
+        score: e.score,
+        passed: e.passed,
+        details: e.details,
+        index: e.index,
+        label: e.label,
+        cost: e.cost,
+        duration: e.duration,
+        target_id: e.target_id,
+      })),
+      targets: this.batch.targets,
+      progress: this.progress,
+      total: this.total,
+      timestamps: {
+        created_at: this.createdAtMs,
+        finished_at: finished ? Date.now() : null,
+      },
+      // What the run reported in total, so a reader can tell results that are still being
+      // stored from a run that is whole.
+      ...(finished
+        ? { expected: { dataset: this.sentRows.size, evaluations: this.sentEvaluations.size } }
+        : {}),
+    };
+
+    // Fire and forget (with error logging). Requests go out one after another, so the parts
+    // of a batch arrive in order and the request that ends the run arrives last.
+    const parts = splitLogResultsBody(body);
+    this.pendingFlush = (this.pendingFlush ?? Promise.resolve()).then(async () => {
+      for (const part of parts) {
+        await this.postLogResults(part);
+      }
+    });
+
+    // Clear batch
+    this.batch = { dataset: [], evaluations: [], targets: [] };
+    this.lastSentMs = Date.now();
+  }
+
+  /**
+   * Posts one log_results request. A request the server refuses as too large is cut in two
+   * and sent again. When a single entry is refused, the error names it and its size.
+   */
+  private async postLogResults(body: LogResultsRequest): Promise<void> {
+    try {
+      const response = await langwatchFetch(
+        `${this.endpoint}/api/v1/evaluations/batch/log_results`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...buildRequestHeaders({ apiKey: this.apiKey }),
+          },
+          body: JSON.stringify(body),
+        },
+      );
+      if (response.ok) return;
+
+      if (response.status !== 413) {
+        this.logger.error(`Failed to send batch: ${response.status}`);
+        return;
+      }
+
+      const halves = halveLogResultsBody(body);
+      if (halves) {
+        for (const half of halves) {
+          await this.postLogResults(half);
+        }
+        return;
+      }
+
+      this.logger.error(
+        `Failed to send batch: ${describeRefusedEntry(body)}, and LangWatch refused it as too large for one request (HTTP 413). It was not logged. Make the row's entry, output or evaluation inputs smaller, for example by sending images as URLs.`,
+      );
+      if (endsTheRun(body) && body.dataset.length + body.evaluations.length > 0) {
+        await this.postLogResults({ ...body, dataset: [], evaluations: [] });
+      }
+    } catch (error) {
+      this.logger.error("Failed to send batch:", error);
+    }
+  }
+
+  /**
+   * Flush all pending data
+   */
+  private async flush(finished = false): Promise<void> {
+    if (this.flushTimeout) {
+      clearTimeout(this.flushTimeout);
+      this.flushTimeout = null;
+    }
+
+    this.sendBatch(finished);
+
+    if (this.pendingFlush) {
+      await this.pendingFlush;
+    }
+  }
+
+  /**
+   * Serialize a dataset item for the API
+   */
+  private serializeItem(item: unknown): unknown {
+    if (item === null || item === undefined) {
+      return item;
+    }
+
+    if (typeof item === "object") {
+      // Handle objects with toJSON method
+      if ("toJSON" in item && typeof (item as { toJSON: unknown }).toJSON === "function") {
+        return (item as { toJSON: () => unknown }).toJSON();
+      }
+      // Return as-is, JSON.stringify will handle it
+      return item;
+    }
+
+    return item;
+  }
+
+  /**
+   * Get trace ID from current OpenTelemetry context
+   */
+  private getTraceIdFromContext(): string {
+    const span = trace.getActiveSpan();
+    if (span) {
+      return span.spanContext().traceId;
+    }
+    return "";
+  }
+
+  /**
+   * Get span ID from current OpenTelemetry context
+   */
+  private getSpanIdFromContext(): string | null {
+    const span = trace.getActiveSpan();
+    if (span) {
+      return span.spanContext().spanId;
+    }
+    return null;
+  }
+}

@@ -1,0 +1,41 @@
+#!/bin/bash
+# Generate compiled prompts from SKILL.md sources.
+# Run from the repo root: bash skills/_compiled/generate.sh
+
+set -e
+
+# The compiler is plain TypeScript that node runs directly (type stripping).
+# The cwd stays the repo root, which is what compile.ts's paths are relative to.
+COMPILER="node skills/_compiler/compile.ts"
+OUT_DIR="skills/_compiled"
+
+SKILLS="tracing experiments online-evaluations evaluations scenarios connect-agent prompts agent-performance agent-improve level-up datasets context-sweet-spot provider-cost-comparison coding-agent-cost"
+
+for skill in $SKILLS; do
+  echo "Compiling $skill..."
+  $COMPILER --skills "$skill" --mode platform > "$OUT_DIR/$skill.platform.txt"
+  $COMPILER --skills "$skill" --mode docs > "$OUT_DIR/$skill.docs.txt"
+done
+
+RECIPES="debug-instrumentation agent-best-practices debug-with-langwatch eval-triage setup-lw evaluate-multimodal generate-rag-dataset test-compliance test-cli-usability lwql-charts dashboard-widgets find-traces"
+
+for recipe in $RECIPES; do
+  echo "Compiling recipe $recipe..."
+  $COMPILER --skills "recipes/$recipe" --mode docs > "$OUT_DIR/recipes-$recipe.docs.txt"
+done
+
+echo "Done. Generated $(ls -1 $OUT_DIR/*.txt 2>/dev/null | wc -l) files in $OUT_DIR/"
+
+# Native opencode skills — one <name>/SKILL.md per canonical skill, consumed by
+# the langyagent image so the in-product assistant loads exactly what the
+# public skill directory publishes (see skills/_compiler/native.ts).
+echo "Generating native (opencode) skills..."
+node skills/_compiler/native.ts
+
+# Mirror the native set into the langyagent Go embed tree. The Dockerfile
+# overlays the same content at image build, so the committed copy only serves
+# local (host-tier) manager builds — but a stale copy there means local Langy
+# runs older skills than production. skills/_tests/native-skills.test.ts pins
+# the two trees equal.
+echo "Syncing native skills into services/langyagent/internal/assets/skills/..."
+rsync -a --delete skills/_compiled/native/ services/langyagent/internal/assets/skills/

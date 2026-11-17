@@ -1,0 +1,178 @@
+Feature: Custom (OpenAI-compatible) provider routing to customer endpoints
+  Customers who self-host OpenAI-compatible model servers (vLLM, LiteLLM
+  proxy, ...) configure them in LangWatch as the "Custom (OpenAI-compatible)"
+  provider with a base URL and an optional API key. Every dispatch path,
+  virtual-key gateway traffic and in-app features (playground, workflows,
+  evaluations), must send requests to the customer's endpoint, never to
+  api.openai.com.
+
+  The same story applies to self-hosted servers that speak the Anthropic
+  Messages API natively (vLLM >= 0.24, Claude-compatible proxies): an
+  "anthropic" provider with a base URL routes /v1/messages traffic to the
+  customer's endpoint instead of api.anthropic.com, keeping clients like
+  Claude Code on LangWatch virtual keys, budgets, and tracing.
+
+  Background:
+    Given a project with a "custom" model provider configured
+    And its CUSTOM_BASE_URL points at a self-hosted OpenAI-compatible server
+    And its CUSTOM_API_KEY is empty because the server is unauthenticated
+
+  Scenario: Virtual-key chat completion reaches the customer's endpoint
+    Given a virtual key whose provider slot is the custom provider
+    When a chat completion for "custom/<model>" is sent through the gateway
+    Then the upstream request is sent to the configured base URL
+    And the request body is OpenAI chat-completions shape with the bare model id
+
+  Scenario: Playground chat completion reaches the customer's endpoint
+    When the playground dispatches a chat completion using the custom provider
+    Then the upstream request is sent to the configured base URL
+    And no request is sent to api.openai.com
+
+  Scenario: Empty API key is accepted for unauthenticated servers
+    When a chat completion is dispatched through the custom provider
+    Then the dispatch does not fail credential validation
+    And the upstream request carries no bearer token
+
+  Scenario: OpenAI provider with a base URL override routes to that URL
+    Given an "openai" model provider with OPENAI_BASE_URL set to a proxy endpoint
+    When a chat completion is dispatched through it
+    Then the upstream request is sent to the proxy endpoint instead of api.openai.com
+
+  # The Responses lane forwards the caller's body as it arrived. Bifrost's
+  # chat-completions adapter, which serves the base-URL override for chat, has
+  # no Responses route and posted that body to /v1/chat/completions, which every
+  # OpenAI-compatible server refuses for having no "messages". That held for
+  # OPENAI_BASE_URL set to the default https://api.openai.com/v1 as much as for
+  # a proxy, so an OpenAI provider with any base URL could not serve Langy,
+  # which calls OpenAI models on the Responses API.
+  #
+  # Bindings: services/aigateway/adapters/providers/openai_base_url_responses_test.go
+  @unit
+  Scenario Outline: OpenAI provider with a base URL serves the Responses API at that URL
+    Given an "openai" model provider with OPENAI_BASE_URL set to "<base URL>"
+    When a /v1/responses request is dispatched through it
+    Then the upstream request is sent to "/v1/responses" under that endpoint
+    And the request body is forwarded in Responses shape unchanged
+    And no request is sent to "/v1/chat/completions"
+
+    Examples:
+      | base URL                |
+      | https://host.test/v1    |
+      | https://host.test/v1/   |
+      | https://host.test       |
+      | https://host.test/      |
+
+  @unit
+  Scenario: An unauthenticated OpenAI-compatible endpoint serves the Responses API without a key
+    Given an "openai" model provider with a base URL and no API key
+    When a /v1/responses request is dispatched through it
+    Then the dispatch does not fail credential validation
+    And the upstream request carries no bearer token
+
+  @unit
+  Scenario: Two OpenAI providers with different base URLs stay isolated on the Responses API
+    Given two "openai" model providers configured with different base URLs
+    When a /v1/responses request is dispatched through each
+    Then each upstream request reaches its own configured endpoint
+
+  Scenario: OpenAI provider without a base URL keeps default routing
+    Given an "openai" model provider with only OPENAI_API_KEY set
+    When a chat completion is dispatched through it
+    Then the upstream request is sent to api.openai.com
+
+  Scenario: Streaming chat completion still reports token usage
+    Given a virtual key whose provider slot is the custom provider
+    When a streaming chat completion for "custom/<model>" is sent through the gateway
+    Then the gateway asks the endpoint for a final usage chunk
+    And the streamed response reports non-zero prompt and completion tokens
+
+  Scenario: Provider-specific sampling params reach the endpoint unchanged
+    Given a virtual key whose provider slot is the custom provider
+    When a chat completion carrying vLLM-specific params (top_k, chat_template_kwargs, guided_json) is sent through the gateway
+    Then the upstream request preserves every param byte-for-byte
+    And no provider-specific param is dropped on the way to the endpoint
+
+  Scenario: Anthropic provider with a base URL routes /v1/messages to the customer's endpoint
+    Given an "anthropic" model provider with a base URL pointing at a self-hosted Anthropic-compatible server
+    When a /v1/messages request is dispatched through it
+    Then the upstream request is sent to the configured base URL instead of api.anthropic.com
+    And the request body is forwarded in Anthropic Messages shape unchanged
+
+  Scenario: Streaming /v1/messages against a custom endpoint keeps native event frames
+    Given an "anthropic" model provider with a base URL pointing at a self-hosted Anthropic-compatible server
+    When a streaming /v1/messages request is dispatched through it
+    Then the server's native Anthropic SSE events reach the client unchanged
+    And no OpenAI-shape chunk is emitted
+
+  Scenario: Anthropic provider without a base URL keeps default routing
+    Given an "anthropic" model provider with only an API key configured
+    When a /v1/messages request is dispatched through it
+    Then the upstream request is sent to api.anthropic.com
+
+  Scenario: Two Anthropic providers with different base URLs stay isolated
+    Given two "anthropic" model providers configured with different base URLs
+    When a /v1/messages request is dispatched through each
+    Then each upstream request reaches its own configured endpoint
+    And neither request leaks to the other endpoint
+
+  Scenario: Empty API key is accepted for unauthenticated Anthropic-compatible servers
+    Given an "anthropic" model provider with a base URL and no API key
+    When a /v1/messages request is dispatched through it
+    Then the dispatch does not fail credential validation
+    And the upstream request carries no x-api-key header
+
+  @unit
+  Scenario: A Gemini or Vertex provider with a base URL reaches that host instead of Google's
+    Given a Gemini credential, or a Vertex credential with a project and location, whose base_url names another host
+    When a chat completion is dispatched through the gateway
+    Then the generateContent call reaches that host, on the Gemini models path or the Vertex publishers path
+    And a credential without a base_url keeps Google's endpoints
+
+  @unit
+  Scenario: A Bedrock provider whose runtime host is on the customer-endpoint allowlist reaches that host
+    Given a Bedrock credential whose runtime endpoint or base_url names a host on ALLOWED_PROXY_HOSTS
+    When a chat completion is dispatched through the gateway
+    Then the Converse call is signed for and sent to that host
+    But a runtime host that is neither amazonaws.com nor on the allowlist is still refused
+
+  @unit
+  Scenario Outline: A provider on a private address is dispatched to only with the private-network guard off
+    The allowlist does not lift the refusal at dispatch: every custom endpoint
+    shares one Bifrost provider, so it would lift it for every host.
+
+    Given BLOCK_LOCAL_HTTP_CALLS is <block> and ALLOWED_PROXY_HOSTS is <allowlist>
+    When the gateway configures a provider for dispatch
+    Then its connections to private addresses are <outcome>
+
+    Examples:
+      | block   | allowlist                 | outcome |
+      | "false" | empty                     | allowed |
+      | "true"  | "llm-proxy.internal"      | refused |
+      | "true"  | empty                     | refused |
+
+  Scenario: An endpoint that fell out of recent use still works when dispatched to again
+    Given an "anthropic" model provider with a base URL that has not been used recently
+    And many other Anthropic-compatible endpoints have served traffic since
+    When a /v1/messages request is dispatched through it again
+    Then the upstream request reaches its configured endpoint
+    And the response comes back with no added latency the caller can notice
+
+  Scenario: Serving many self-hosted endpoints does not degrade the gateway
+    Given Anthropic-compatible endpoints for many different projects
+    When traffic flows through all of them
+    Then every request reaches the endpoint configured for its project
+    And the gateway keeps serving them without growing its resource use unboundedly
+
+  Rule: A custom prefix keeps the whole model name after it
+
+    Self-hosted servers and proxies serve models whose own ids contain a
+    slash ("stealth/ox-alpha", "meta-llama/Llama-3-70B"). The "custom/" prefix
+    names the provider and everything after it is the model, so the id the
+    server knows arrives intact.
+
+    @unit
+    Scenario: A custom-prefixed model keeps every segment after the prefix
+      Given a virtual key whose provider slot is the custom provider
+      When a chat completion for "custom/stealth/ox-alpha" is sent through the gateway
+      Then the model sent upstream is "stealth/ox-alpha"
+      And the request reaches the custom provider

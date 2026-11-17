@@ -1,0 +1,77 @@
+import type { RunPlanRunBody } from "@/client-sdk/services/run-plans";
+
+import { resolveCredentials } from "../../utils/apiKey";
+import { parseRunParameterFlags } from "../../utils/keyValueFlags";
+import type { RawOutputFlags } from "../../utils/output";
+import { parseRunNoteFlag } from "../../utils/runNote";
+import { createSpinner } from "../../utils/spinner";
+import { failSpinner } from "../../utils/spinnerError";
+import { createCliRunPlansService } from "../run-plans/cli-run-plans-service";
+import { emitRunResult } from "../run-plans/reportRun";
+import { parseRepeat, parseTargets, parseWait } from "../run-plans/scopeFlags";
+import { resolveScenarioId } from "./resolveScenario";
+
+export interface RunScenarioOptions extends RawOutputFlags {
+  target?: string[];
+  name?: string;
+  repeat?: string;
+  param?: string[];
+  note?: string;
+  idempotencyKey?: string;
+  wait?: boolean | string;
+}
+
+/**
+ * Runs one scenario against one or more targets: a run plan scoped to a
+ * single scenario, no test suite created or deleted for it.
+ * @see specs/features/scenario-cli.feature
+ */
+export const runScenarioCommand = async (
+  reference: string,
+  options: RunScenarioOptions,
+): Promise<void> => {
+  await resolveCredentials();
+
+  const id = await resolveScenarioId({ reference });
+
+  const parameters = parseRunParameterFlags({ pairs: options.param });
+  const note = parseRunNoteFlag({ note: options.note });
+  const targets = parseTargets(options.target);
+  const repeatCount = parseRepeat(options.repeat);
+  const wait = parseWait(options.wait);
+
+  const service = createCliRunPlansService();
+  const spinner = createSpinner(`Scheduling run for scenario "${id}"...`).start();
+
+  try {
+    const body: RunPlanRunBody = {
+      ...(options.name ? { name: options.name } : {}),
+      config: {
+        scope: { mode: "scenarios" },
+        scenarioIds: [id],
+        targets,
+        ...(repeatCount !== undefined ? { repeatCount } : {}),
+      },
+      ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+      ...(parameters ? { parameters } : {}),
+      ...(note ? { note } : {}),
+    };
+
+    const result = await service.run(body);
+
+    spinner.succeed(
+      `Run scheduled under "${result.planName}": ${result.jobCount} job${result.jobCount !== 1 ? "s" : ""} (batch: ${result.batchRunId}${note ? `, note: "${note}"` : ""})`,
+    );
+
+    await emitRunResult({
+      result,
+      note,
+      options,
+      wait,
+      subject: "scenario run",
+    });
+  } catch (error) {
+    failSpinner({ spinner, error, action: "run the scenario" });
+    process.exit(1);
+  }
+};

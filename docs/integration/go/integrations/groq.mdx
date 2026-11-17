@@ -1,0 +1,95 @@
+---
+title: Groq Integration
+sidebarTitle: Groq
+description: Instrument Groq API calls in Go using LangWatch for LLM observability, cost tracking, and agent evaluation insights.
+keywords: go, golang, groq, instrumentation, langwatch, openai-compatible
+---
+
+LangWatch traces calls to the Groq API. Groq provides an OpenAI-compatible endpoint, so you reuse the [OpenAI](/integration/go/integrations/open-ai) `otelopenai` middleware: point the client at Groq's base URL and label the spans with `WithGenAIProvider`.
+
+## Installation
+
+```bash
+go get github.com/langwatch/langwatch/sdks/go
+go get github.com/langwatch/langwatch/sdks/go/instrumentation/openai
+go get github.com/openai/openai-go/v3
+```
+
+## Usage
+
+<Info>Set `LANGWATCH_API_KEY` and `GROQ_API_KEY` environment variables before running.</Info>
+
+```go
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+
+	langwatch "github.com/langwatch/langwatch/sdks/go"
+	otelopenai "github.com/langwatch/langwatch/sdks/go/instrumentation/openai"
+
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
+	"go.opentelemetry.io/otel"
+	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+)
+
+func main() {
+	ctx := context.Background()
+
+	// Set up the LangWatch exporter (reads LANGWATCH_API_KEY from env).
+	exporter, err := langwatch.NewExporter(ctx)
+	if err != nil {
+		log.Fatalf("failed to create exporter: %v", err)
+	}
+	tp := sdktrace.NewTracerProvider(sdktrace.WithBatcher(exporter))
+	otel.SetTracerProvider(tp)
+	defer tp.Shutdown(ctx) // Critical: ensures traces are flushed.
+
+	// Create a Groq client via the OpenAI-compatible API.
+	client := openai.NewClient(
+		option.WithBaseURL("https://api.groq.com/openai/v1"),
+		option.WithAPIKey(os.Getenv("GROQ_API_KEY")),
+		option.WithMiddleware(otelopenai.Middleware("my-app",
+			otelopenai.WithGenAIProvider(semconv.GenAIProviderNameKey.String("groq")),
+		)),
+	)
+
+	response, err := client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
+		Model: "openai/gpt-oss-20b",
+		Messages: []openai.ChatCompletionMessageParamUnion{
+			openai.SystemMessage("You are a helpful assistant."),
+			openai.UserMessage("Hello, Groq!"),
+		},
+	})
+	if err != nil {
+		log.Fatalf("Groq API call failed: %v", err)
+	}
+
+	log.Printf("Response: %s", response.Choices[0].Message.Content)
+}
+```
+
+<Note>
+The middleware captures input and output content **by default**. Pass `otelopenai.WithDataCapture(langwatch.DataCaptureNone)` to opt out.
+</Note>
+
+<Warning>
+  The `defer tp.Shutdown(ctx)` call is essential. Without it, traces buffered in memory will be lost
+  when your application exits.
+</Warning>
+
+## Check it worked
+
+Run the program with `go run .`. The deferred `tp.Shutdown(ctx)` flushes the spans when `main` returns. Then open your project in LangWatch: a new trace appears in the traces list within a few seconds, with the Groq call as an LLM span carrying its input, output and token counts.
+
+If no trace appears, check that `LANGWATCH_API_KEY` is set in the environment the program runs in.
+
+## Related
+
+- [Go Integration Guide](/integration/go/guide#openai-compatible-providers)
+- [Go SDK API Reference](/integration/go/reference#openai-middleware)
+- [Capturing Evaluations & Guardrails](/integration/python/tutorials/capturing-evaluations-guardrails)

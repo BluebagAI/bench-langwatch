@@ -1,0 +1,106 @@
+// @langwatch/api — transport-agnostic half of the API; shared error vocabulary, access policies,
+// capability ports, Standard Schema boundary. The Hono service framework is `@langwatch/api/rest`;
+// tRPC root and policy middleware are `@langwatch/api/trpc`. Neither is re-exported here: a
+// consumer that wants a transport names it.
+
+export {
+  AuthenticatedActorRequiredError,
+  SurfaceBlankSecretError,
+  SurfaceCapabilityUnavailableError,
+  SurfaceUnconfiguredError,
+  SurfaceUnverifiedError,
+  OrganizationAuthenticationUnavailableError,
+  OrganizationCredentialClassMismatchError,
+  OrganizationInvalidCredentialsError,
+  OrganizationMissingCredentialsError,
+  OrganizationNotFoundForCredentialError,
+  OrganizationPermissionError,
+  ProjectInvalidCredentialsError,
+  ProjectMissingCredentialsError,
+  ProjectRequiredError,
+  ApiVersionConflictError,
+  BatchingNotSupportedError,
+  ConfirmationRequiredError,
+  createErrorHandler,
+  EnterprisePlanRequiredError,
+  formatError,
+  ProjectInputMismatchError,
+  InvalidApiVersionError,
+  isUpgradeInProgress,
+  KeyKindRefusedError,
+  MediaTypeMalformedRequestError,
+  PayloadTooLargeError,
+  PlatformPermissionDeniedError,
+  PlatformSurfaceHiddenError,
+  RateLimitedError,
+  retryAfterOf,
+  ScopeInputMismatchError,
+  setLedgerCurrent,
+  setOrganizationsCatchingUp,
+  UnsupportedMediaTypeError,
+} from "./errors.ts";
+
+export type { RateLimiter, ResponseCache, UpgradeHandler } from "./ports.ts";
+export { jsonTextField } from "./json-text-field.ts";
+export { ConnectUpgradeRouter } from "./ports.ts";
+export {
+  WebSocketHost,
+  WebSocketProtocol,
+  type ProtocolConnection,
+  type WebSocketCaller,
+  type WebSocketDoor,
+  type WebSocketSessionCaller,
+  type WebSocketSessionKeyDoor,
+} from "./websocket.ts";
+export {
+  RAW_SOCKET_LIVENESS_PATH,
+  RawSocketHost,
+  RawSocketProtocol,
+  type RawSocketUpgrade,
+} from "./raw-socket.ts";
+export {
+  RawHttpHost,
+  RawHttpProtocol,
+  type RawHttpDoor,
+  type RawHttpExchange,
+  type RawHttpListener,
+} from "./raw-http.ts";
+
+export type {
+  BoundMiddlewareBindings,
+  FeatureRestHost,
+  FeatureRestMountOptions,
+  FeatureTrpcHost,
+  FeatureTrpcMountOptions,
+  MountableTransport,
+  MiddlewareBinding,
+  TransportPeers,
+} from "./hosting/transport-hosts.ts";
+
+export type { ApiSchema, ApiSchemaOutput } from "./schema.ts";
+
+// The access-policy vocabulary: what credential an operation accepts, and what
+// that credential can reach. Read by the REST route registry, the OpenAPI
+// security generator and the authorization audit alike, so it belongs to no
+// one transport.
+
+export {
+  type AccessPolicy,
+  anyAuthenticated,
+  type CredentialClass,
+  credentialClassFor,
+  type HandlerCredential,
+  handlerManagedAuth,
+  internalSecret,
+  isInternalSecretValid,
+  policyPermissions,
+  publicEndpoint,
+} from "./access-policy.ts";
+
+// Every mounted route and the policy it declared, recorded as each surface mounts.
+export {
+  allRegisteredRoutes,
+  getRoutePolicy,
+  registerRoutePolicy,
+  type RegisteredRoute,
+} from "./route-registry.ts";

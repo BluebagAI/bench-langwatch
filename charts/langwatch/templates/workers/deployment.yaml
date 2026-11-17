@@ -1,0 +1,156 @@
+{{- if .Values.workers.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-workers
+  labels:
+    app.kubernetes.io/name: {{ .Release.Name }}-workers
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: workers
+    {{- include "langwatch.labels" . | nindent 4 }}
+    {{- if .Values.workers.deployment.labels }}
+    {{- toYaml .Values.workers.deployment.labels | nindent 4 }}
+    {{- end }}
+  {{- $serializeUpgrades := eq (include "langwatch.storedObjects.serializeUpgradesActive" .) "true" }}
+  {{- if or .Values.workers.deployment.annotations $serializeUpgrades }}
+  annotations:
+    {{- with .Values.workers.deployment.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if $serializeUpgrades }}
+    {{- /* Read by the stored-objects upgrade hooks. Metadata only, so a new
+           value never rolls a pod. */}}
+    langwatch.ai/stored-objects-upgrade-fingerprint: {{ include "langwatch.storedObjects.upgradeFingerprint" . | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.workers.replicaCount }}
+  {{- if .Values.workers.deployment.strategy }}
+  strategy:
+    {{- toYaml .Values.workers.deployment.strategy | nindent 8 }}
+  {{- else if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+  {{/* Default kill-then-start under local-FS, same rationale as the app
+       Deployment: workers mount the app's RWO stored-objects PVC, and the k8s default RollingUpdate (25% surge) starts
+       the new pod BEFORE the old one releases the volume — on a multi-node
+       cluster the new pod can land on another node and wedge Pending on a
+       multi-attach error (the scheduler does not avoid RWO conflicts for CSI
+       volumes). maxSurge=0/maxUnavailable=1 at replicas=1 behaves exactly like
+       Recreate (old pod terminates and releases the volume before the new one
+       schedules), at the cost of a brief downtime — honest for the
+       single-replica local-FS tier.
+
+       Deliberately NOT `type: Recreate`: switching a live Deployment from the
+       k8s-defaulted RollingUpdate to Recreate requires DELETING the live
+       `rollingUpdate` struct, and Helm's 3-way merge cannot emit that deletion
+       when the previous release's manifest never had a `strategy` key (the
+       pre-#5083 chart) — the API then rejects the patch with
+       "spec.strategy.rollingUpdate: Forbidden: may not be specified when
+       strategy `type` is 'Recreate'", failing every upgrade across this
+       boundary. Setting maxSurge/maxUnavailable only UPDATES existing fields,
+       which the merge applies cleanly. An explicit workers.deployment.strategy
+       overrides this. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  {{- end }}
+  {{- if hasKey (default (dict) .Values.workers.deployment) "revisionHistoryLimit" }}
+  revisionHistoryLimit: {{ .Values.workers.deployment.revisionHistoryLimit }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ .Release.Name }}-workers
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Release.Name }}-workers
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: workers
+        {{- if .Values.workers.pod.labels }}
+        {{- toYaml .Values.workers.pod.labels | nindent 8 }}
+        {{- end }}
+        {{- with (include "langwatch.cloudIdentityPodLabels" .) }}
+        {{- . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- with (coalesce .Values.workers.pod.annotations .Values.global.podAnnotations) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- if .Values.app.telemetry.metrics.enabled }}
+        {{- /* What the langwatch-workers scrape job keeps on. The port is the
+               worker's own scrape listener, not the probes' health port. */}}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ include "langwatch.metricsPort" . | quote }}
+        {{- end }}
+    spec:
+      # Workers do not call the Kubernetes API, so don't mount the SA token.
+      {{- with (include "langwatch.serviceAccountName" .) }}
+      serviceAccountName: {{ . }}
+      {{- end }}
+      automountServiceAccountToken: {{ .Values.global.automountServiceAccountToken }}
+      # SIGTERM starts a real drain here, unlike a stateless web pod: the
+      # GroupQueue stops dispatching and waits for in-flight jobs to finish
+      # their ClickHouse writes. The helper refuses to render when this is too
+      # short for workers.shutdownDrainSeconds, because a missed grace period
+      # is a SIGKILL — the abrupt shutdown that severs in-flight statements.
+      terminationGracePeriodSeconds: {{ include "langwatch.terminationGracePeriod" (dict "component" .Values.workers "name" "workers") }}
+      securityContext:
+        {{- include "langwatch.podSecurityContext" (dict "ctx" . "component" .Values.workers) | nindent 8 }}
+
+      {{- with (coalesce .Values.workers.nodeSelector .Values.global.scheduling.nodeSelector)}}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- with (coalesce .Values.workers.tolerations .Values.global.scheduling.tolerations)}}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- $affinity := coalesce .Values.workers.affinity .Values.global.scheduling.affinity }}
+      {{- if $affinity }}
+      affinity:
+        {{- toYaml $affinity | nindent 8 }}
+      {{- else if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+      {{/* Default co-location with the app pod: workers mount the app's RWO
+           stored-objects PVC below, so off-node scheduling means a multi-attach
+           Pending wedge. See langwatch.storedObjects.colocationAffinity. */}}
+      affinity:
+        {{- include "langwatch.storedObjects.colocationAffinity" . | nindent 8 }}
+      {{- end }}
+
+      {{- with (coalesce .Values.workers.topologySpreadConstraints .Values.global.scheduling.topologySpreadConstraints)}}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      # PriorityClass - https://kubespec.dev/v1/Pod#spec.priorityClassName
+      {{- with (coalesce .Values.workers.priorityClassName .Values.global.scheduling.priorityClassName)}}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+
+      {{- with .Values.workers.extraInitContainers}}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        {{- with .Values.workers.extraContainers}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- include "langwatch.workersContainer" . | nindent 8 }}
+
+      volumes:
+        {{- with .Values.workers.extraVolumes}}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        - name: tmp-dir
+          emptyDir:
+            sizeLimit: {{ .Values.workers.scratchSizeLimit }}
+        {{- if eq (include "langwatch.storedObjects.localFilesystemIsActive" .) "true" }}
+        - name: stored-objects-data
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-stored-objects
+        {{- end }}
+{{- end }}

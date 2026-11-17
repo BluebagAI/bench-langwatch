@@ -1,0 +1,170 @@
+Feature: CLI login never lands a user on a personal project
+
+  A customer used the LangWatch coding-assistant skills to set up experiments. Their
+  agent ran `langwatch login`, which signed them into a personal project, and the
+  evaluations they then created were sent to that personal project, confusing, and
+  wrong for shared / team work. Two backend guards make this impossible, paired with
+  the CLI-side default-to-project behavior:
+
+    1. The device-session (AI-tools) login provisions a personal workspace. It mints
+       no personal virtual key: the CLI issues one on its first gateway call, so an
+       approval never creates a credential. That is a governance-plane feature.
+       Governance ships enabled by default (ADR-038 Decision 7), so the approval works
+       out of the box on a fresh installation; for an organization whose governance
+       flag has been switched off it must be refused, with a message pointing at
+       project login.
+    2. The project-login (project_api_key) flow targets a project the user chose
+       DELIBERATELY. The hazard was silent AUTO-selection of a personal project, so:
+       the browser picker lists the caller's personal project as an explicit,
+       clearly-labelled entry (preselected only when the org has no shared projects,
+       where it is the only sane target), the approval endpoint honours the caller's
+       OWN personal project when explicitly picked, refuses anyone else's personal
+       project outright, and the picker defaults to the last project the user worked
+       in when shared projects exist.
+
+  Pairs with:
+    - specs/ai-governance/cli-onboarding/login-unified.feature  (CLI-side default-to-project)
+
+  Background:
+    Given a user who is a member of an organization
+    And the CLI device-code approval endpoint `POST /api/auth/cli/approve`
+    And governance for an organization is gated by the `release_ui_ai_governance_enabled` feature flag
+    And the flag is enabled by default and can be switched off per organization
+
+  Rule: device-session (AI-tools) login requires governance enabled
+
+    @integration @governance-gate
+    Scenario: device-session approval succeeds on a default installation
+      Given no governance flag override is configured
+      And a pending device code with credential_type "device_session"
+      When the user approves it
+      Then the approval is not refused by the governance gate
+      And no personal virtual key is minted, even though the organization has
+      a provider one could route to
+
+    @integration @governance-gate
+    Scenario: device-session approval is refused when governance is disabled
+      Given governance has been switched off for the organization
+      And a pending device code with credential_type "device_session"
+      When the user approves it
+      Then the response is 403 with error "governance_required"
+      And no personal virtual key is minted for the user
+
+    @integration @governance-gate
+    Scenario: device-session approval succeeds when governance is enabled
+      Given governance is enabled for the organization
+      And a pending device code with credential_type "device_session"
+      When the user approves it
+      Then the response is 200
+      And no personal virtual key is minted, on this path as on every other
+      successful approval
+
+  Rule: project login targets a deliberately chosen project; another user's personal project is never one
+
+    @integration @project-picker
+    Scenario: project-login approval rejects another user's personal project id
+      Given a pending device code with credential_type "project_api_key"
+      And a personal project owned by a DIFFERENT user exists in the organization
+      When the user approves with that personal project's id
+      Then the response is 400 with error "personal_project_not_allowed"
+      And that personal project's API key is NOT returned
+
+    @integration @project-picker
+    Scenario: project-login approval honours the caller's own explicitly picked personal project
+      Given a pending device code with credential_type "project_api_key"
+      And the user has a personal project and explicitly picked it in the browser
+      When the user approves with their own personal project's id
+      Then the response is 200 and names that personal project
+      And the exchange returns a project session on that project, never its API key
+
+    @integration @project-picker
+    Scenario: project-login approval opens a project session on the shared project
+      Given a pending device code with credential_type "project_api_key"
+      When the user approves with the shared team project's id
+      Then the response is 200 and names that project
+      And the exchange returns a project session on that project, never its API key
+
+    @integration @project-picker @rbac
+    Scenario: project-login approval allows an org admin who is not a direct team member
+      Given a pending device code with credential_type "project_api_key"
+      And a shared project on a team the org admin does not directly belong to
+      When the org admin who can write the project approves with its id
+      Then the response is 200 and names that project
+      And no API key is returned
+
+    @integration @project-picker @rbac
+    Scenario: project-login approval denies a project the caller cannot manage
+      Given a pending device code with credential_type "project_api_key"
+      And the caller lacks permission to manage the picked shared project
+      When the user approves with that project's id
+      Then the response is 403 with error "forbidden"
+      And the project's API key is NOT returned
+
+    @integration @project-picker @rbac
+    Scenario: owning a personal project does not replace project administration
+      Given a pending device code with credential_type "project_api_key"
+      And the caller owns the picked personal project
+      But the caller lacks permission to manage it
+      When the user approves with that personal project's id
+      Then the response is 403 with error "forbidden"
+      And the project's API key is NOT returned
+
+    @integration @project-picker @rbac
+    Scenario: project-login approval denies a member whose seat has been disabled
+      Given a pending device code with credential_type "project_api_key"
+      And an admin has disabled the caller's membership to free its seat
+      When the caller approves with a shared project's id
+      Then the response is 403 with error "forbidden"
+      And the project's API key is NOT returned
+
+    @integration @project-picker @rbac
+    Scenario: project-login exchange denies a member whose seat was disabled after approval
+      Given a device code approved while the caller was an active member
+      And an admin has since disabled the caller's membership
+      When the CLI exchanges that device code
+      Then the response is the fatal 410 "access_denied" and the project's API key is NOT returned
+      And the device code is consumed, so a further exchange reports it expired
+
+    @integration @project-picker @rbac
+    Scenario: project-login exchange rechecks administration after approval
+      Given a device code approved while the caller could manage the project
+      And the caller has since lost permission to manage it
+      When the CLI exchanges that device code
+      Then the response is the fatal 410 "access_denied" and the project's API key is NOT returned
+      And the device code is consumed, so a further exchange reports it expired
+
+    @unit @project-picker
+    Scenario: the project picker lists the caller's personal project explicitly and omits internal-governance projects
+      Given an org team with a personal project, an internal-governance project, and a shared project
+      When the CLI-auth project list is resolved
+      Then the shared project is offered under its team
+      And the personal project is offered as a separate, explicit personal entry
+      And the internal-governance project is never offered
+
+    @unit @project-picker @last-project
+    Scenario: the project picker pre-selects the user's last project when it is offered
+      Given the resolved project list contains the user's last project "acme-prod"
+      When the CLI-auth project default is computed
+      Then "acme-prod" is the pre-selected project
+
+  Rule: a Developer seat logs in to its own personal project only (ADR-171)
+
+    A Developer holds their personal project and nothing shared, so the only
+    project the CLI may open a session on is that one. Bound to
+    `auth-cli-personal-guard.integration.test.ts`; the seat itself is in
+    specs/members/developer-seat.feature.
+
+    @integration @developer-seat
+    Scenario: project-login approval refuses a shared project for a Developer, naming the seat
+      Given the caller holds a Developer seat in the organization
+      And a pending device code with credential_type "project_api_key"
+      When the caller approves it picking a shared team project
+      Then the response is 400 with error "developer_seat_personal_only"
+      And the shared project's API key is not returned
+
+    @integration @developer-seat
+    Scenario: project-login approval honours a Developer's own personal project
+      Given the caller holds a Developer seat in the organization
+      And a pending device code with credential_type "project_api_key"
+      When the caller approves it picking their own personal project
+      Then the response is 200 and names the personal project

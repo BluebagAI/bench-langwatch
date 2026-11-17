@@ -1,0 +1,205 @@
+{
+  "name": "langwatch",
+  "version": "2.2.0",
+  "description": "LangWatch TypeScript/JavaScript SDK. Interact with the full LangWatch API and use the LangWatch OpenTelemetry SDK to instrument your application. For more information, see https://docs.langwatch.ai/integration/typescript/guide",
+  "license": "MIT",
+  "author": "LangWatch",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/langwatch/langwatch.git",
+    "directory": "typescript-sdk"
+  },
+  "bin": {
+    "langwatch": "./dist/cli/index.js",
+    "lw": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/bin",
+    "!dist/cli/*.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./observability": {
+      "types": "./dist/observability-sdk/index.d.ts",
+      "require": "./dist/observability-sdk/index.js",
+      "import": "./dist/observability-sdk/index.mjs"
+    },
+    "./observability/semconv": {
+      "types": "./dist/observability-sdk/semconv/index.d.ts",
+      "require": "./dist/observability-sdk/semconv/index.js",
+      "import": "./dist/observability-sdk/semconv/index.mjs"
+    },
+    "./observability/node": {
+      "types": "./dist/observability-sdk/setup/node/index.d.ts",
+      "require": "./dist/observability-sdk/setup/node/index.js",
+      "import": "./dist/observability-sdk/setup/node/index.mjs"
+    },
+    "./observability/instrumentation/langchain": {
+      "types": "./dist/observability-sdk/instrumentation/langchain/index.d.ts",
+      "require": "./dist/observability-sdk/instrumentation/langchain/index.js",
+      "import": "./dist/observability-sdk/instrumentation/langchain/index.mjs"
+    },
+    "./agent": {
+      "types": "./dist/agent/index.d.ts",
+      "require": "./dist/agent/index.js",
+      "import": "./dist/agent/index.mjs"
+    }
+  },
+  "scripts": {
+    "generate": "pnpm run generate:server-types",
+    "cli": "node dist/cli/index.js",
+    "prelint": "pnpm run generate",
+    "lint": "eslint .",
+    "pretest": "pnpm run generate",
+    "test": "vitest run --exclude '**/*.integration.test.ts'",
+    "test:e2e": "dotenv -- vitest run -c ./vitest.e2e.config.mts",
+    "test:governance-e2e": "vitest run -c ./vitest.governance-e2e.config.mts",
+    "test:seed": "dotenv -e .env.test -- pnpm -w run prisma:seed",
+    "prebuild": "pnpm run generate",
+    "build": "rm -rf dist && tsup",
+    "postbuild": "node -e \"const{statSync}=require('node:fs'),{execFileSync}=require('node:child_process');const f='dist/cli/index.js',want=require('./package.json').version;const s=statSync(f);if(process.platform!=='win32'&&!(s.mode&0o111))throw new Error(f+' is not executable');const got=execFileSync(process.execPath,[f,'--version'],{encoding:'utf8',env:{...process.env,LANGWATCH_NO_DAEMON:'1'}}).trim();if(got!==want)throw new Error('version mismatch: '+f+' reports '+got+', package.json says '+want);console.log('postbuild: '+f+' ok ('+got+')')\"",
+    "build:binary": "bun run scripts/build-cli-binary.ts",
+    "tarball": "pnpm build && pnpm pack",
+    "typecheck": "GOMAXPROCS=2 GOMEMLIMIT=2GiB pnpm -w exec tsc -b sdks/typescript",
+    "prepublish": "pnpm run build",
+    "generate:openapi-types": "node scripts/generate-openapi-types.mjs",
+    "generate:server-types": "./copy-types.sh"
+  },
+  "dependencies": {
+    "@opentelemetry/api-logs": "catalog:",
+    "@opentelemetry/context-async-hooks": "catalog:",
+    "@opentelemetry/core": "catalog:",
+    "@opentelemetry/exporter-logs-otlp-proto": "catalog:",
+    "@opentelemetry/exporter-trace-otlp-proto": "catalog:",
+    "@opentelemetry/otlp-exporter-base": "catalog:",
+    "@opentelemetry/resources": "catalog:",
+    "@opentelemetry/sdk-logs": "catalog:",
+    "@opentelemetry/sdk-trace-base": "catalog:",
+    "@opentelemetry/sdk-trace-node": "catalog:",
+    "liquidjs": "catalog:",
+    "open": "^11.0.0",
+    "openapi-fetch": "^0.17.0",
+    "ws": "catalog:",
+    "xksuid": "^0.0.4",
+    "zod": "catalog:"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.32.0",
+    "@langchain/core": ">=0.3.68 <0.4.0",
+    "@langchain/langgraph": ">=0.4.0 <1.0.0",
+    "@langchain/openai": ">=0.6.0 <1.0.0",
+    "@langwatch/e2e-stack": "workspace:*",
+    "@langwatch/handled-error": "workspace:*",
+    "@opentelemetry/api": "catalog:",
+    "@opentelemetry/instrumentation": "catalog:",
+    "@opentelemetry/sdk-metrics": "catalog:",
+    "@opentelemetry/sdk-trace-web": "catalog:",
+    "@types/debug": "catalog:",
+    "@types/js-yaml": "catalog:",
+    "@types/node": "catalog:",
+    "@types/prompts": "catalog:",
+    "@types/ws": "catalog:",
+    "@typescript-eslint/parser": "^8.58.1",
+    "@vercel/otel": "^1.13.0",
+    "@vitest/coverage-v8": "^5.0.1",
+    "chalk": "catalog:",
+    "commander": "catalog:",
+    "dotenv": "catalog:",
+    "dotenv-cli": "^11.0.0",
+    "esbuild": "catalog:",
+    "eslint": "^9.32.0",
+    "fets": "^0.8.5",
+    "fishery": "^2.3.1",
+    "js-yaml": "catalog:",
+    "jsonc-parser": "^3.3.1",
+    "langchain": ">=0.3.0 <2.0.0",
+    "msw": "^2.10.4",
+    "nock": "^14.0.8",
+    "openapi-msw": "^1.2.0",
+    "openapi-typescript": "7.13.0",
+    "ora": "catalog:",
+    "prompts": "catalog:",
+    "tsup": "catalog:",
+    "typescript": "catalog:sdk-toolchain",
+    "typescript-eslint": "catalog:",
+    "vitest": "catalog:",
+    "vitest-mock-extended": "^5.1.1",
+    "yaml": "^2.8.1"
+  },
+  "peerDependencies": {
+    "@ai-sdk/openai": ">=2.0.0 <5.0.0",
+    "@langchain/core": ">=0.3.0 <2.0.0",
+    "@langchain/langgraph": ">=0.4.0 <2.0.0",
+    "@langchain/openai": ">=0.6.0 <2.0.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/context-zone": ">=1.19.0 <3.0.0",
+    "@opentelemetry/exporter-trace-otlp-grpc": ">=0.221.0 <1.0.0",
+    "@opentelemetry/instrumentation": ">=0.200.0 <1.0.0",
+    "@opentelemetry/sdk-metrics": ">=2.0.0 <3.0.0",
+    "@opentelemetry/sdk-trace-web": ">=1.19.0 <3.0.0",
+    "langchain": ">=0.3.0 <2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/openai": {
+      "optional": true
+    },
+    "@langchain/core": {
+      "optional": true
+    },
+    "@langchain/langgraph": {
+      "optional": true
+    },
+    "@langchain/openai": {
+      "optional": true
+    },
+    "@opentelemetry/context-zone": {
+      "optional": true
+    },
+    "@opentelemetry/exporter-trace-otlp-grpc": {
+      "optional": true
+    },
+    "@opentelemetry/instrumentation": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-metrics": {
+      "optional": true
+    },
+    "@opentelemetry/sdk-trace-web": {
+      "optional": true
+    },
+    "langchain": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": "^22.23.4 || ^24.22.1 || >=26.12.1",
+    "pnpm": ">=8"
+  },
+  "nx": {
+    "namedInputs": {
+      "sdkBuild": [
+        "default",
+        "!{projectRoot}/**/*.test.ts",
+        "!{projectRoot}/**/*.test.tsx",
+        "!{projectRoot}/**/*.test.mts",
+        "!{projectRoot}/vitest.config.*",
+        "!{projectRoot}/vitest.integration.config.*",
+        "!{projectRoot}/__tests__/**/*"
+      ],
+      "production": [
+        "sdkBuild",
+        "!{projectRoot}/src/cli/**/*"
+      ]
+    }
+  }
+}

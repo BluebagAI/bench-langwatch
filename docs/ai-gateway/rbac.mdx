@@ -1,0 +1,117 @@
+---
+title: RBAC
+description: The permissions that gate the LangWatch AI Gateway, the resources they cover and what each built-in role holds.
+sidebarTitle: RBAC
+---
+
+## How gateway permissions work
+
+The LangWatch AI Gateway uses the LangWatch permission model: a permission is `<resource>:<action>`, a role is a set of permissions, and a role binding gives a person a role on an organization, a team or a project. A grant at a higher scope covers the scopes below it: `virtualKeys:manage` on the organization covers every team and project in it.
+
+The gateway adds its own resources to that model. Provider credentials, the audit log and the webhook endpoints are shared with the rest of LangWatch. See [Access Control (RBAC)](/platform/rbac) for the model and role bindings.
+
+<Note>
+  The matrix below is the default. Custom roles can carry any combination of the permissions listed, see [Custom Roles](/platform/rbac#custom-roles) for how to define one.
+</Note>
+
+## Resources
+
+| Resource | Gates | Actions |
+|---|---|---|
+| `virtualKeys` | The Virtual Keys list, detail and drawers, and `/api/gateway/v1/virtual-keys*`. | `view`, `create`, `update`, `rotate`, `delete`, `manage`, `viewOtherPersonal` |
+| `gatewayBudgets` | The Budgets list, detail and drawers, and `/api/gateway/v1/budgets*`. | `view`, `create`, `update`, `delete`, `manage` |
+| `gatewayProviders` | The Advanced (Gateway) section on a provider credential under Settings > Model Providers. | `view`, `update`, `manage` |
+| `routingPolicies` | Routing policies. | `view`, `manage` |
+| `gatewayGuardrails` | Attaching and detaching guardrails on a key. | `view`, `attach`, `detach`, `manage` |
+| `gatewayCacheRules` | Cache rules, and `/api/gateway/v1/cache-rules*`. | `view`, `create`, `update`, `delete`, `manage` |
+| `gatewayUsage` | The Usage page and `GET /api/gateway/v1/virtual-keys/:id/spend`. | `view` |
+| `gatewaySpend` | Spend events and spend summaries under `/api/gateway/v1/spend-events*`, `/api/gateway/v1/spend-summaries` and `/api/gateway/v1/end-users/:id/spend`. Organization tier only. | `view`, `manage` |
+| `webhookEndpoints` | Webhook endpoints, their secrets and delivery logs. Organization tier only. | `view`, `manage` |
+| `auditLog` | The audit log under Settings. | `view` |
+
+`gatewaySpend` and `webhookEndpoints` come only from an organization role binding. A team or project binding never grants them.
+
+`virtualKeys:viewOtherPersonal` lets an administrator see other people's personal keys. Everyone sees their own personal keys without it.
+
+## What the built-in roles hold
+
+Team roles apply on the teams and projects the binding names. Organization roles apply on the whole organization.
+
+| Permission | Team Viewer | Team Member | Team Admin | Organization Admin |
+|---|:-:|:-:|:-:|:-:|
+| `virtualKeys:view` | yes | yes | yes | |
+| `virtualKeys:create`, `update`, `rotate` | | yes | yes | |
+| `virtualKeys:delete` | | | yes | |
+| `virtualKeys:manage`, `viewOtherPersonal` | | | yes | yes |
+| `gatewayBudgets:view` | yes | yes | yes | |
+| `gatewayBudgets:create`, `update`, `delete`, `manage` | | | yes | |
+| `gatewayProviders:view` | yes | yes | yes | |
+| `gatewayProviders:update`, `manage` | | | yes | |
+| `routingPolicies:view` | yes | yes | yes | |
+| `routingPolicies:manage` | | | yes | |
+| `gatewayGuardrails:view` | yes | yes | yes | |
+| `gatewayGuardrails:attach`, `detach`, `manage` | | | yes | |
+| `gatewayCacheRules:view` | yes | yes | yes | |
+| `gatewayCacheRules:create`, `update`, `delete`, `manage` | | | yes | |
+| `gatewayUsage:view` | yes | yes | yes | |
+| `auditLog:view` | | | yes | |
+| `gatewaySpend:view`, `manage` | | | | yes |
+| `webhookEndpoints:view`, `manage` | | | | yes |
+
+The Organization Admin column lists what the organization role grants on its own. An organization admin gets the team permissions through the team role bindings they hold, like everyone else.
+
+Organization Member and External hold no gateway permission on their own. They get gateway access through a team role binding.
+
+## Creating keys at a scope
+
+Creating a key with an organization, team or project scope needs `virtualKeys:manage` at every scope the key names. The same rule applies when you re-scope a key with `PATCH`. Naming a trace project on a team or organization key needs `virtualKeys:manage` on that project.
+
+A personal key needs only membership of the organization. See [Virtual keys](/ai-gateway/virtual-keys#ownership-and-scopes).
+
+## Permission per REST route
+
+| Route | Permission |
+|---|---|
+| `GET /api/gateway/v1/virtual-keys`, `GET .../:id` | `virtualKeys:view` |
+| `POST /api/gateway/v1/virtual-keys` | `virtualKeys:create`, plus `virtualKeys:manage` at every scope named |
+| `PATCH /api/gateway/v1/virtual-keys/:id` | `virtualKeys:update`, plus `virtualKeys:manage` at every scope the patch names, and on a trace project the patch names |
+| `POST .../:id/rotate` | `virtualKeys:rotate` |
+| `POST .../:id/disable`, `POST .../:id/enable` | `virtualKeys:update` |
+| `POST .../:id/revoke` | `virtualKeys:delete` |
+| `GET .../:id/spend` | `gatewayUsage:view` |
+| `GET /api/gateway/v1/budgets`, `GET .../:id` | `gatewayBudgets:view` |
+| `POST /api/gateway/v1/budgets` | `gatewayBudgets:create` |
+| `PATCH .../:id`, `POST .../:id/reset` | `gatewayBudgets:update` |
+| `DELETE .../:id` | `gatewayBudgets:delete` |
+| `GET /api/gateway/v1/cache-rules` | `gatewayCacheRules:view` |
+| `POST /api/gateway/v1/cache-rules` | `gatewayCacheRules:create` |
+| `PATCH .../:id` | `gatewayCacheRules:update` |
+| `DELETE .../:id` | `gatewayCacheRules:delete` |
+| `GET /api/gateway/v1/spend-events`, `GET .../spend-summaries`, `GET .../end-users/:id/spend` | `gatewaySpend:view` |
+| `POST /api/gateway/v1/spend-events/replay` | `gatewaySpend:manage` |
+
+A call with an API key that lacks the route's permission gets HTTP 403 `api_key_permission_denied`, with the permission in `error.meta.permission`. A call that holds the route's permission but not `virtualKeys:manage` on a scope the key names gets HTTP 403 `permission_denied` with the scope in the message.
+
+```json
+{
+  "error": {
+    "code": "api_key_permission_denied",
+    "message": "API Key does not grant required permission: virtualKeys:manage",
+    "meta": { "permission": "virtualKeys:manage" }
+  }
+}
+```
+
+<Note>
+**Also check:** [Access Control (RBAC)](/platform/rbac) for role bindings, [Virtual keys](/ai-gateway/virtual-keys) for scopes, and [Billing and spend events](/ai-gateway/billing-events) for the spend routes.
+</Note>
+
+## Changing the permission matrix
+
+Default roles are code-defined in `modules/authz/contract/src/roles.ts`, declared as differences rather than duplicate lists: `viewer` is the base set, `member` is `viewer` plus its additions, `admin` is `member` plus its additions, and `builtinRolePermissions()` resolves a role key to the permissions it ends up with.
+
+**Do not edit the default matrix in production**: a change to those built-in sets affects every team on the instance. Use a **custom role** instead: create it in the UI, assign the permissions you want, and assign it to specific users.
+
+## SCIM + SSO
+
+Default role matrix assignments flow through SCIM: when an IdP pushes a user with role `MEMBER`, they pick up the gateway permissions in the MEMBER column above. Custom roles must be assigned via the LangWatch UI (SCIM doesn't carry custom-role identifiers); the SCIM integration only maps to ADMIN, MEMBER, VIEWER.

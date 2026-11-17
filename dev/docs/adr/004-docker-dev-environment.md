@@ -1,0 +1,477 @@
+# ADR-004: Docker Compose Development Environment
+
+**Date:** 2026-01-23
+
+**Status:** Accepted
+
+## Context
+
+Local development required running multiple services (postgres, redis, clickhouse, NLP, workers, app) manually in separate terminals. Different developers need different service combinations:
+
+- Frontend work: app + postgres + redis + clickhouse
+- Scenario development: + workers + bullboard + ai-server (scenario processing is part of workers)
+- Full stack: everything
+
+Additionally, macOS developers face platform mismatch issues: native Node modules (esbuild, Prisma) compiled for macOS don't work in Linux containers.
+
+## Decision
+
+We use Docker Compose with **profiles** for selective service startup, and an **init container** for cross-platform dependency installation.
+
+### Profiles
+
+| Profile   | Services                                                  | Use Case             |
+| --------- | --------------------------------------------------------- | -------------------- |
+| (none)    | postgres, redis, clickhouse, app                          | Minimal frontend dev |
+| nlp       | + langwatch_nlp, langevals                                | Evaluations          |
+| scenarios | + workers (includes scenarios), bullboard, ai-server, nlp | Scenario development |
+| full      | Everything                                                | Full integration     |
+
+### Init Container Pattern
+
+```yaml
+init:
+  image: node:24
+  command: sh -c "pnpm install && pnpm prisma generate"
+  volumes:
+    - ./langwatch:/app
+    - app_modules:/app/node_modules # Named volume
+
+app:
+  volumes:
+    - ./langwatch:/app
+    - app_modules:/app/node_modules # Same volume
+  depends_on:
+    init:
+      condition: service_completed_successfully
+```
+
+The init container installs Linux-native dependencies into a named volume. All other containers share this volume, avoiding platform mismatch.
+
+### Networking
+
+Internal services (postgres, redis, clickhouse, nlp, langevals) have no host port exposure. They communicate via Docker network hostnames (`postgres:5432`, `redis:6379`, `clickhouse:8123`). Only app, bullboard, and ai-server expose ports for browser access.
+
+### Environment Variables
+
+`CLICKHOUSE_URL` is set in the `x-common-env` anchor, pointing to the local ClickHouse container. `ELASTICSEARCH_NODE_URL` comes from `.env` for any remaining ES-compatible integrations.
+
+### Resource Limits
+
+- **App:** 4GB memory, 2 CPUs (turbopack is hungry)
+- **Infra services:** Smaller limits (256MB-512MB) to prevent runaway
+
+No limit means a misbehaving container can starve the whole system. Too tight means OOM kills (exit code 137).
+
+## Rationale
+
+**Why profiles over multiple compose files?**
+Profiles keep everything in one file, easier to maintain. `--profile scenarios` is clearer than `-f infra/compose.yml -f infra/compose.scenarios.yml`.
+
+**Why init container over host install?**
+macOS binaries don't work in Linux containers. We tried `.npmrc` supportedArchitectures but it was unreliable. Init container guarantees correct platform binaries.
+
+**Why node:24 over node:24-slim?**
+Slim lacks build tools (python, gcc) for native modules and OpenSSL for Prisma. The ~200MB size difference is negligible for dev.
+
+**Why custom server over next dev?**
+The app uses `tsx src/server.ts` which wraps Next.js with metrics, proper upgrade handling, and other customizations. Plain `next dev` doesn't include these.
+
+## Consequences
+
+**Commands:**
+
+```bash
+make dev              # Minimal
+make dev-scenarios    # Scenario work
+make dev-full         # Everything
+make quickstart       # Interactive chooser
+make down             # Stop all
+```
+
+**Key files:**
+
+- `dev/compose.dev.yml` - Docker Compose configuration
+- `dev/scripts/dev.sh` - Interactive profile chooser
+- `Makefile` - Convenience targets
+
+**Trade-offs accepted:**
+
+- First startup slower (init container installs deps), but mitigated by shared pnpm store volume
+- Requires Docker Desktop with sufficient memory allocation
+- Host node_modules still needed for IDE tooling (separate from container's)
+
+**Performance optimization:**
+The `pnpm_store` named volume persists downloaded packages across container restarts and is shared across all worktrees (`name: langwatch-pnpm-store`). After first install, subsequent `pnpm install` runs are significantly faster.
+
+## Amendment: Worktree Isolation (2026-03)
+
+### Context
+
+The original design used `VOLUME_PREFIX` for volume naming but `dev/scripts/dev.sh` did not set it when running from worktrees, causing container and volume collisions between parallel worktrees.
+
+### Changes
+
+1. **Auto-detect worktree name** — `dev.sh` detects the git worktree directory name and sets `COMPOSE_PROJECT_NAME` and `VOLUME_PREFIX` for container and volume isolation.
+2. **Idempotent init** — The init container hashes `pnpm-lock.yaml` and skips `pnpm install` when unchanged, reducing restart time.
+3. **DRY environment variables** — Shared env vars extracted to `x-common-env` YAML anchor.
+4. **Port scan fix** — BULLBOARD_PORT scan starts at 6380 (matching container port) instead of 3000.
+
+### Decision: Named Volumes over Bind Mounts
+
+We considered switching node_modules to bind mounts for automatic per-worktree isolation. This was rejected because:
+
+- macOS VirtioFS performance degrades with 50K+ small files in node_modules
+- pnpm hard-links from store to node_modules break across filesystem boundaries (named volume is ext4, bind mount is macOS APFS)
+- Collapses the host/container node_modules separation (Linux ELF binaries would appear on host, breaking IDE tooling)
+
+Instead, we use per-worktree named volumes via `VOLUME_PREFIX`, which gives the same isolation without these downsides.
+
+## Amendment: Stateful volumes + intent-based modes (2026-05, #3860)
+
+### Context
+
+The 2026-03 worktree-isolation amendment treated **every** volume as per-worktree, and the compose profile names (`dev`, `nlp`, `scenarios`, `full`) named _which services exist_, not _what the developer is doing_. Two side effects:
+
+1. Sign-up state didn't persist across worktrees. Sign up `browser-test@langwatch.ai` in worktree A; switch to worktree B; the account is gone.
+2. Profiles conflated "what services exist" with "what URLs the app should use". The `x-common-env` anchor hard-set `DATABASE_URL` / `REDIS_URL` / etc. to local Docker network names regardless of profile, so a contributor's `.env` URLs never won — even when their intent was "I'm doing UI work, just leave my .env alone."
+
+### Decision
+
+**The contributor's `.env` is the source of truth.** A new `.env.dev-up` overlay is loaded as `env_file` AFTER `.env` and contains only the URLs whose services are starting locally for the chosen mode. `x-common-env` no longer sets infrastructure URLs.
+
+**`make quickstart` is the single entry point** with five intent-based modes:
+
+| Mode             | Compose services                                            | URLs overridden in `.env.dev-up`                      |
+| ---------------- | ----------------------------------------------------------- | ----------------------------------------------------- |
+| `frontend-only`  | (none)                                                      | (none — pure `.env`)                                  |
+| `backend-shared` | postgres + redis + clickhouse + app + init                  | `DATABASE_URL`, `REDIS_URL`, `CLICKHOUSE_URL`         |
+| `migration`      | postgres + clickhouse on host ports (5432, 8123)            | `DATABASE_URL` and `CLICKHOUSE_URL` (localhost forms) |
+| `nlp`            | + langwatch_nlp + langevals                                 | + `LANGWATCH_NLP_SERVICE`, `LANGEVALS_ENDPOINT`       |
+| `full-local`     | `--profile full` (workers, scenarios, bullboard, ai-server) | all five infrastructure URLs                          |
+
+Migration mode uses `dev/compose.dev.migration.yml` to expose host ports so the contributor can run `pnpm prisma migrate dev` and `pnpm clickhouse:migrate` from their host shell.
+
+`make quickstart` accepts a positional mode arg (`make quickstart frontend-only`) for non-interactive runs. `make quickstart-help` (or `./dev/scripts/dev.sh help`) prints the mode reference.
+
+**Stateful services share volumes across worktrees.** `db-data`, `clickhouse-data`, and `redis-data` use stable names (`langwatch-db-data`, `langwatch-clickhouse-data`, `langwatch-redis-data`) — they no longer interpolate `VOLUME_PREFIX`. Sign up once, persist forever.
+
+Trade-off: only one worktree can have the same stateful container `up` at a time (postgres locks `/var/lib/postgresql/data`). `dev/scripts/dev.sh` detects this (`check_stateful_collision`) and fails fast with a clear message pointing at the other compose project.
+
+**Redis is a singleton with a fixed host port.** `redis:alpine` exposes `:6379` on the host and uses the shared `langwatch-redis-data` volume. Parallel worktrees reuse the same redis instance.
+
+**Per-worktree volumes still apply to:** `app_modules`, `bullboard_modules`, `goose_bin`. These hold Linux-platform dependencies that vary by branch lockfile and must stay isolated.
+
+**Deprecated targets** (`make dev`, `dev-nlp`, `dev-scenarios`, `dev-test`, `dev-full`, and `dev-up` / `dev-down` / `dev-logs`) print a deprecation warning and forward to the corresponding `quickstart` mode for one release before being removed.
+
+**Fail-fast SSRF guard.** `dev/scripts/dev.sh` errors if `.env` has `IS_SAAS=true` with `BLOCK_LOCAL_HTTP_CALLS=false`. (Compose's runtime always sets `BLOCK_LOCAL_HTTP_CALLS=true` via `x-common-env`, but workers running outside compose / lambdas would inherit the broken combo.)
+
+### Migration
+
+Existing worktrees have stale `lw-<hash>-db-data` / `lw-<hash>-clickhouse-data` / `lw-<hash>-redis-data` volumes from the previous scheme. The first `make quickstart` after upgrading creates the new shared volumes (`langwatch-*-data`) — old volumes are not deleted automatically. To recover space:
+
+```
+docker volume ls | grep -E '^local +lw-[0-9a-f]{8}-(db|redis|clickhouse)-data'
+docker volume rm <volume-name>   # one per worktree, after confirming you don't need the data
+```
+
+If you previously relied on `x-common-env`'s implicit `DATABASE_URL` / `REDIS_URL` / `CLICKHOUSE_URL` overrides, those moved to `.env.dev-up` written by `quickstart`. Running `make dev` (deprecated alias for `quickstart backend-shared`) keeps the same effective behavior.
+
+## Amendment: In-process workers for local dev (2026-07)
+
+### Context
+
+Locally, the app and the background workers run as two Node processes,
+multiplexed by `concurrently` inside `scripts/start.sh` (the app plus a separate
+`pnpm run start:workers` lane, alongside Vite and the Go services). The second
+worker process has to be handed the exact matching env and Redis DB index, and
+if it silently fails to boot you get an app that looks healthy but never drains
+queues. Some contributors would rather run a single process locally.
+
+Production is different and stays that way: it runs web and worker as separate
+Deployments (`charts/langwatch/templates/{app,workers}`) so they scale
+independently. Collapsing them is a _dev-only_ convenience, never a prod change.
+
+### Decision
+
+Make **single-process dev the default**. `pnpm dev` sets
+`WORKERS_IN_PROCESS=1` and hosts the worker stack inside the app process; the
+two-process topology is still available as `pnpm dev:concurrent`, and
+`pnpm dev:app` / `pnpm dev:worker` run one side on its own (`dev:concurrent` and
+`dev:app` were deleted on 2026-10-10, ADR-168; `dev:api` and `dev:worker` remain). Amended after the
+default was inverted: a laptop running several worktrees cannot afford a second
+Node process per stack, and haven had already defaulted this way, so plain
+`pnpm dev` disagreeing with it was the surprise rather than the safeguard.
+
+A new process role `"all"` runs the web server AND the worker-side wiring in one
+process. The three prior `processRole === "worker"` gates now go through
+`roleRunsWorkers(role)` (`src/server/app-layer/config.ts`), which is true for
+both `"worker"` and `"all"`:
+
+- the outbox runtime + consumer/drainer and the heartbeat scheduler
+  (`src/server/app-layer/presets.ts`),
+- the GroupQueue consumer (`src/server/event-sourcing/eventSourcing.ts`),
+- the heartbeat scheduler's `start()` no-op guard
+  (`.../outbox/heartbeat/heartbeat.scheduler.ts`).
+
+The imperative worker boot (topic clustering, scenario pool, anomaly / spend-spike
+/ usage-stats workers, ingestion pullers, storage stats) is extracted from the
+`src/workers.ts` entrypoint into a reusable `startWorkers()`
+(`src/server/workers/startWorkers.ts`). The standalone worker calls it with its
+own metrics HTTP server; `src/start.ts` calls it with `shouldStartMetricsServer: false`
+(the web server already serves the shared prom registry at `/metrics`) after the
+server is listening, and drains it before closing the shared App on shutdown.
+
+`scripts/start.sh` skips the standalone `workers` concurrently lane when
+`WORKERS_IN_PROCESS` is set in development; `scripts/check-ports.sh` stops
+reserving the worker-metrics port in that mode.
+
+### Consequences
+
+- One fewer local process, guaranteed to boot with the app on the same Redis DB.
+- **Prod is unaffected**: `WORKERS_IN_PROCESS` is gated on `NODE_ENV=development`
+  in both `start.sh` and `start.ts`, and prod never sets it.
+- Vite and the Go services (aigateway, nlpgo) remain separate processes — this
+  only folds in the _worker_ Node process, not those.
+- In-process workers are instrumented. `server.mts` loads `instrumentation.node`
+  before the app graph evaluates — precisely because the standalone workers lane,
+  which does the same import, no longer runs under the single-process default.
+  Worker spans are real, not no-ops. (This was a known limitation when the mode
+  was opt-in; making it the default is what closed it.)
+
+## Amendment: Physical application workspaces (2026-08)
+
+[ADR-111](./111-physical-application-workspaces.md) preserves single-process
+development but changes its physical owner. The contributor-only
+`tools/dev-runtime` composition imports the API and worker runtime construction
+entry points, owns their shared infrastructure scope and closes it once. The API
+application no longer imports or starts the worker application itself. The
+separate `dev:app`, `dev:worker` and `dev:concurrent` modes remained available until
+2026-10-10, when `dev:app` and `dev:concurrent` were deleted (ADR-168); `dev:api` and
+`dev:worker` remain.
+
+When `platform/app` is retired, the contributor source of truth moves from
+`.env` to repository-root `.env`; quickstart and Haven write the
+generated overlay to repository-root `.env.dev-up`. Root tooling loads the
+source, while API and worker validate their own subsets independently. Existing
+path assertions remain truthful until that migration stage lands and must move
+atomically with the scripts that consume them.
+
+## Amendment: three processes, no in-process worker (2026-09-03)
+
+The "In-process workers for local dev (2026-07)" amendment above is **retired**,
+and so is the physical owner the 2026-08 amendment gave it. `platform/app` is
+gone; the product is three Node applications — `apps/ui` (Vite), `apps/api` and
+`apps/worker` — and each is its own process in development exactly as it is in
+production.
+
+`WORKERS_IN_PROCESS` and `START_WORKERS` are dead variables. Nothing reads
+either: there is no `startWorkers()` for an API process to call, no `"all"`
+process role, and no `roleRunsWorkers`. `haven up` refuses a stack whose
+environment still names one, on ANY value rather than only the value that used
+to change what ran, because no value of either describes a topology this
+repository has. `haven up ±workers` is refused the same way — the workers lane
+always runs, so there is nothing left to select.
+
+### What runs a local stack
+
+| Entry point                | What it starts                                                                                                                                                |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm dev`                 | `dev/scripts/dev-stack.sh`: the three Node lanes under `concurrently`, plus aigateway and nlpgo when their toolchain is present and their ports are free      |
+| `make haven up`            | the same three lanes as supervised children (`ui`, `api`, `workers`), each `pnpm --filter <package> dev` from the workspace root, plus the routed Go services |
+| `make quickstart <preset>` | `dev/compose.dev.yml`'s `ui`, `api` and `workers` services                                                                                                    |
+
+The port layout is unchanged and still derived from `PORT` (default 5560): ui on
+`PORT`, api on `PORT + 1000`, worker metrics on `PORT - 2561`, gateway on
+`PORT + 3`. `dev/scripts/check-ports.sh` reserves all three Node ports
+unconditionally — there is no mode in which one of them is unbound.
+
+### Consequences
+
+- One more local process than the 2026-07 default, and it is the honest one:
+  a dev stack that boots and processes no jobs is no longer reachable by
+  configuration.
+- The contributor source of truth is the **workspace-root `.env`**. Every
+  application resolves it from there. haven's own resolved values are not a
+  second file: it injects them into each process it starts, and `haven env`
+  prints them for a shell. A checkout upgrading across this change moves its own
+  file: `mv platform/app/.env .env`.
+- The migration lane the compose stack runs moved to the api service, which
+  owns the schema: Prisma deploy then the ClickHouse task, once, before the
+  process starts. The ui lane waits on it, so a browser never loads the SPA
+  against a half-migrated database.
+
+## Amendment: two local processes — `backend` and `go` (2026-09-07)
+
+The "three processes, no in-process worker (2026-09-03)" amendment above held
+that development should match production process-for-process. It does not any
+more, for development only. **Production is unchanged**: three Node deployments
+(`apps/ui`, `apps/api`, `apps/worker`) and each Go service its own container.
+
+### Context
+
+Matching production locally costs a laptop three Node runtimes and two to four
+Go ones per worktree, and a developer running several worktrees pays that
+several times. The thing the 2026-09-03 amendment was protecting against — a
+stack that boots, serves pages and quietly processes no jobs — was never the
+_process count_. It was the **switch**: `WORKERS_IN_PROCESS` and `START_WORKERS`
+let a stack be configured into a topology nobody could see. Remove the switch
+and the process count is free to be a local convenience again.
+
+### Decision
+
+Locally, a stack is **four lanes**, not six:
+
+| Lane      | Process                                 | What it is                                                                 |
+| --------- | --------------------------------------- | -------------------------------------------------------------------------- |
+| `ui`      | Vite (`apps/ui`)                        | the browser application, its own process as before                         |
+| `backend` | Node (`tools/dev-runtime`)              | the **api application and the worker application in one process**          |
+| `go`      | Go (`cmd/service combined`)             | **aigateway and nlpgo in one process**, on the two ports they already bind |
+| `langy`   | Go (`cmd/service langyagent`), optional | its own lane — see below                                                   |
+
+`backend` is a **launcher, not a process role.** Neither application learns it
+is sharing a process:
+
+- each resolves its own secrets through `SecretEnvironmentService`, parses its
+  own config with its own Zod schema, and composes its own graph — in the same
+  order, once each, as when it runs alone;
+- neither shares a Prisma client, a Redis connection or a ClickHouse client with
+  the other. They are shareable only where both applications already accept an
+  injected instance, and today neither standalone composition does. Two clients
+  is the same count two processes had; only the Node runtime is saved;
+- both health and metrics endpoints keep working: the API serves its own, the
+  worker serves its own metrics/healthz listener on `PORT - 2561`;
+- `WORKERS_IN_PROCESS` and `START_WORKERS` stay dead. Nothing reads either,
+  `haven up` still refuses a stack whose environment names one on any value, and
+  no value of either changes what the launcher starts;
+- `apps/api`'s and `apps/worker`'s own entrypoints are untouched and are what
+  production runs. `pnpm dev:api` and `pnpm dev:worker` still run one alone.
+
+**Boot order is worker, then api**, because the API can enqueue on its first
+request and consumers that are not yet attached let work pile up invisibly. If
+the API then fails to boot, the worker is drained before the failure is
+re-thrown.
+
+**Shutdown order is the reverse: drain the worker, then close the API
+listener.** The worker's jobs call back into the API's in-process graph; closing
+the listener first fails them mid-drain, and a job that fails during shutdown is
+indistinguishable from one that failed on its merits. The API is closed even
+when the drain throws, so a wedged queue cannot leave a listening socket behind.
+This ordering is the one thing the backend process owns that neither half can
+know about, and it is where its tests are.
+
+`go` hosts the two **data-plane** services under one `errgroup` with one signal
+handler and a per-service logger. Each keeps its own configuration, its own
+dependencies and its own telemetry identity (`langwatch-service-aigateway`,
+`langwatch-service-nlp`), so nothing in Grafana changes. `SERVER_ADDR` cannot
+address two listeners in one process, so each is handed its own:
+`LANGWATCH_GO_AIGATEWAY_ADDR` and `LANGWATCH_GO_NLPGO_ADDR`. The first service
+to fail cancels the group; `make service svc=aigateway` still runs one alone.
+
+**`langyagent` stays its own lane.** It is not a request/response server: it
+spawns one sandboxed worker subprocess per conversation and owns their
+lifetimes, so folding it into a lane that restarts on every Go source change
+would take live conversations with it. It is also optional (`haven up +langy`),
+and the rest of the Go code should not wait on an image or a tier resolution.
+
+### Hot reload, debounced
+
+Both lanes restart on change. This is **restart-on-change, not in-process module
+swapping** — no Node module graph is patched and no Go plugin is reloaded; the
+process is taken down (SIGTERM, then SIGKILL after a grace period) and a new one
+is started.
+
+- The `backend` lane reuses `dev/scripts/dev-supervisor.mjs --watch`, which
+  already coalesces a burst of writes into one restart and already reports how
+  many files triggered it. Its roots are the package's own `src` plus
+  `../../packages` (architecture-enforcer forbids a backend graph from importing a
+  browser package, so that is a safe superset), and it ignores tests, build
+  output, generated code and watcher noise.
+- The `go` lane is `air`, which rebuilds the one binary and **restarts only on a
+  successful build** — a broken edit prints the compile error once and leaves
+  the previous process serving.
+- One knob sets both quiet periods, so they cannot drift:
+  `LANGWATCH_DEV_WATCH_DEBOUNCE_MS`: the Node side **defaults to 2 s** after
+  the last write, at most 30 s after the first (ADR-168; 750 ms saw an agent's
+  edits as separate bursts), and air's delay to 750 ms.
+  An agent writing hundreds of files across a feature package in a few seconds
+  produces one restart, not hundreds of reconnects to Postgres, ClickHouse and
+  Redis.
+- `LANGWATCH_DEV_SUPERVISOR=0` runs the Node lane unwatched.
+
+### Consequences and risks
+
+- **One shared event loop.** The API and the worker now compete for one event
+  loop locally. A worker job that blocks it (a large JSON parse, a synchronous
+  crypto call) shows up as API latency, which it would not in production. That
+  is a real difference in what a laptop measures; performance work belongs on
+  the two-process shape (`pnpm dev:api` + `pnpm dev:worker`), not here.
+- **One crash takes both.** An uncaught exception in either half ends the
+  process. It is reported with the half it came from and the lane restarts, but
+  a wedged worker does mean a wedged API locally.
+- **The port layout is unchanged.** ui on `PORT`, api on `PORT + 1000`, worker
+  metrics on `PORT - 2561`, gateway on `PORT + 3`. Two ports are now bound by
+  one process; `dev/scripts/check-ports.sh` still reserves all of them.
+- `haven logs api` and `haven restart api` are gone as names — the lane is
+  `backend`, and `haven logs backend` / `haven restart backend` name it. Same
+  for `haven logs gateway` and `haven logs nlp`, which are `haven logs go`:
+  offering the old names would let someone bounce one service and silently take
+  the other down with it. `haven logs` still renders a pre-2026-09-07 log file
+  in its original lane colour.
+- The lanes are still not selectable. `haven up ±workers`, `±api` and `±backend`
+  are refused by name; `+gateway` / `-nlp` still choose which services the `go`
+  lane hosts, and a `go` lane hosting neither is not started at all.
+
+### Addendum: the simulators join the `go` lane (2026-09-30)
+
+A dev build of the mono-binary (`-tags dev`: `make service`, `make
+service-watch`, the Nx `service` target) links the five simulators, idpsim,
+mailsim, storagesim, voicesim and llmsim (`cmd/service/combined_dev.go`), so
+`service combined` hosts them beside aigateway and nlpgo, and haven runs every
+Go service but langyagent in one process. idpsim binds
+`LANGWATCH_GO_IDPSIM_ADDR`; the others keep their own address variables
+(`MAILSIM_HTTP_ADDR`/`MAILSIM_SMTP_ADDR`, `STORAGESIM_ADDR`, `VOICESIM_ADDR`,
+`LLMSIM_ADDR`). The release images build `./cmd/service` untagged, so no
+simulator is linked or selectable there. A checkout without that file, and the
+monolith layout, keep Haven's bundled `haven simulator` lanes. `haven logs
+idp|mail|storage|voice|llm` read the sims' lines out of the `go` capture;
+`haven restart go` bounces them.
+
+## Amendment: the boot sequence — prepare once, quietly, under a lock (2026-09-07)
+
+A haven stack printed its boot three times over. `haven up` migrated both
+datastores itself and then the api lane's own `dev` script migrated them again,
+as three separate Node processes — three secret resolutions, three config
+parses, three announcements — and because the lane is supervised, every crash
+and every file change replayed all three.
+
+The boot has one order: **validate the secrets and the configuration, prove the
+process boots, migrate, then report healthy.**
+
+- **Preparation is one invocation.** `apps/tasks` takes several task names in
+  one go: `pnpm -s task prisma-migrate clickhouse-migrate lwql-provision` is
+  one process that resolves secrets once, runs the three in order, and stops at
+  the first failure. `start:prepare:db` is that line, in the workspace root and
+  in `apps/api`.
+- **It runs once per stack start, not once per lane.** `dev/scripts/dev-stack.sh`
+  runs it before the first lane, and haven's `prepare` step runs the same
+  script. No lane's `dev` command prepares, so a reload and a crash restart
+  bring the process back and migrate nothing. A deployed process is unchanged:
+  `apps/api`'s `start` still prepares and only then serves, which is what keeps
+  the API from listening on a schema it was not built for.
+- **A second runner waits.** The three migration tasks run under a Postgres
+  session-level advisory lock on a key derived from a fixed string, taken on a
+  connection of the lock's own. A runner that cannot take it says once that it
+  is waiting, blocks, and then finds nothing pending. Rolling deploys and two
+  developers starting stacks at the same moment serialise instead of rebuilding
+  a schema underneath one another.
+- **An idle preparation is quiet.** The goose bootstrap statements, the
+  connection string, the migrations directory, the storage-policy notice and
+  the per-table TTL notes describe how the run works rather than what it did;
+  they are debug now. What stays at info is one line per store, and every
+  migration that actually applied.
+
+Spec: `specs/setup/boot-sequence.feature`. See also
+`specs/setup/schema-migrations-on-start.feature` for the deployed start path.
+
+**Amendment 2026-10-09:** on macOS haven now runs ClickHouse natively by default; the container tier (colima) is the fallback.

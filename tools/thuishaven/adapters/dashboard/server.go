@@ -1,0 +1,245 @@
+// Package dashboard implements app.Dashboard: the daemon's HTTP surface — the
+// dashboard page (which worktree runs what) and the telemetry
+// fan-out that broadcasts one OTLP export to every running stack.
+package dashboard
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/langwatch/langwatch/tools/thuishaven/domain"
+)
+
+// Server renders live state pulled through the callbacks it is built with, so it
+// never imports the app core.
+type Server struct {
+	config  Config
+	console http.Handler
+	// reads are config.CLIReads plus the orb's, which this adapter owns.
+	reads map[string]CLIRead
+}
+
+// Probes are the optional OS checks the page uses to show live health. A nil
+// PortInUse leaves every service dot in its default "down" state (the page
+// can't confirm the port is listening); a nil ProcessAlive falls back to
+// treating a stack with a launcher PID as live.
+type Probes struct {
+	PortInUse    func(port int) bool
+	ProcessAlive func(pid int) bool
+}
+
+// Config wires the Server to the world. Stacks yields the live registry;
+// SharedURL builds the shared-surface URLs (dashboard root, observability,
+// telemetry); Extras yields the machine picture (may be nil — the page
+// degrades to registry-only).
+type Config struct {
+	// LogDir resolves a slug's capture directory — its own worktree under
+	// domain.HavenLogsRoot, or the pre-ruling global home for a stack still
+	// running under the old layout (ruling 2026-09-29). Nil is log-capture-off.
+	LogDir    func(slug string) string
+	Stacks    func() []domain.Stack
+	SharedURL func(service string) string
+	Probes    Probes
+	Extras    func() Extras
+	// Actions are the lifecycle operations the page may take. Zero-valued means
+	// a dashboard you can only read, which is what it was before.
+	Actions Actions
+	// Limits reads and edits the machine resource limits. Zero-valued leaves
+	// the routes answering 501.
+	Limits Limits
+	// MachineSettings reads and flips the machine switches. Zero-valued leaves
+	// the routes answering 501.
+	MachineSettings MachineSettings
+	// Naming reads a Host header as a stack's home and names a stopped
+	// stack's hosts; StackURL builds a routed URL through the live proxy.
+	Naming   domain.Naming
+	StackURL func(service, slug string) string
+	// IdPTenants lists the tenants of the IdP simulator on a loopback port,
+	// or none. Nil leaves a stack home's credentials without them.
+	IdPTenants func(ctx context.Context, port int) []IdPTenant
+	// Console is the haven-web bundle; nil serves the one embedded at build.
+	Console fs.FS
+	// CLIReads are the stack console's tabs, by CLI command name; an absent
+	// name answers 404 like an unknown command.
+	CLIReads map[string]CLIRead
+	// Browser is the console's view of the stack's headless browser lanes.
+	Browser Browser
+}
+
+// New builds a Server.
+func New(config Config) *Server {
+	s := &Server{config: config, console: newConsole(config.Console)}
+	s.reads = s.cliReads()
+	return s
+}
+
+// routes is the whole HTTP surface, built apart from Serve so a test can drive
+// it without binding a port. The host guard wraps it in Serve rather than here:
+// what it refuses is a Host header, which is a property of being served.
+func (s *Server) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	mux.HandleFunc("GET /api/logs", s.handleLogs)
+	mux.HandleFunc("GET /api/hub", s.handleHub)
+	mux.HandleFunc("GET /api/stacks/{slug}", s.handleStackHome)
+	mux.HandleFunc("POST /api/stacks/{slug}/api-key", s.handleRevealAPIKey)
+	mux.HandleFunc("GET /api/stacks/{slug}/orb", s.handleOrbFacts)
+	mux.HandleFunc("POST /api/stacks/{slug}/orb/feedback", s.handleOrbFeedback)
+	mux.HandleFunc("POST /api/stacks/{slug}/orb/page", s.handleOrbPage)
+	mux.HandleFunc("OPTIONS /api/stacks/{slug}/orb", s.handleOrbPreflight)
+	mux.HandleFunc("OPTIONS /api/stacks/{slug}/orb/", s.handleOrbPreflight)
+	mux.HandleFunc("/api/stacks/{slug}/restart", s.handleRestart)
+	mux.HandleFunc("/api/stacks/{slug}/start", s.handleStartKeeper)
+	mux.HandleFunc("/api/stacks/{slug}/down", s.handleDown)
+	mux.HandleFunc("/api/stacks/{slug}/destroy", s.handleDestroy)
+	mux.HandleFunc("/api/stacks/{slug}/start-service", s.handleStartService)
+	mux.HandleFunc("/api/stacks/{slug}/stop-service", s.handleStopService)
+	mux.HandleFunc("/api/stacks/{slug}/seed", s.handleSeed)
+	mux.HandleFunc("GET /api/stacks/{slug}/cli/{name}", s.handleCLIRead)
+	mux.HandleFunc("/api/stacks/{slug}/feedback/{id}/resolve", s.handleFeedbackResolve)
+	mux.HandleFunc("GET /api/stacks/{slug}/browser/{lane}/snapshot", s.handleBrowserSnapshot)
+	mux.HandleFunc("GET /api/stacks/{slug}/browser/{lane}/screenshot", s.handleBrowserScreenshot)
+	mux.HandleFunc("/api/worktrees/start", s.handleStart)
+	mux.HandleFunc("GET /api/limits", s.handleLimits)
+	mux.HandleFunc("PUT /api/limits/{name}", s.handleSetLimit)
+	mux.HandleFunc("DELETE /api/limits/{name}", s.handleUnsetLimit)
+	mux.HandleFunc("GET /api/machine-settings", s.handleMachineSettings)
+	mux.HandleFunc("PUT /api/machine-settings/{name}", s.handleSetMachineSetting)
+	mux.HandleFunc("DELETE /api/machine-settings/{name}", s.handleSetMachineSetting)
+	mux.HandleFunc("/v1/", s.handleTelemetry) // OTLP: /v1/traces, /v1/metrics, /v1/logs
+	mux.HandleFunc("/", s.handleIndex)
+	return mux
+}
+
+// Serve runs the HTTP surface until the context is canceled.
+func (s *Server) Serve(ctx context.Context, port int) error {
+	srv := &http.Server{Addr: fmt.Sprintf("127.0.0.1:%d", port), Handler: s.guardHost(s.serveWaiting(s.routes())), ReadHeaderTimeout: 5 * time.Second}
+	go func() {
+		<-ctx.Done()
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(sctx)
+	}()
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// guardHost rejects any request whose Host header is neither loopback nor a
+// hostname under haven's own domain. Binding 127.0.0.1 already stops remote TCP
+// connections, but a DNS-rebinding page can still make a victim's browser issue
+// loopback requests carrying an attacker-controlled Host — pinning the Host to
+// haven's own domain (langwatch.localhost and its subdomains) closes that
+// same-origin hole without listing every stack host individually.
+func (s *Server) guardHost(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hostAllowed(r.Host) {
+			http.Error(w, "forbidden host", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// hostAllowed reports whether host (an HTTP Host header, possibly with a port) is
+// loopback or falls under the domain haven registers its hostnames beneath.
+func (s *Server) hostAllowed(host string) bool {
+	h := host
+	if hostOnly, _, err := net.SplitHostPort(h); err == nil {
+		h = hostOnly
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
+	switch h {
+	case "", "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	// The base domain haven owns (langwatch.localhost), derived live from the
+	// shared-surface URL so it honours a custom LANGWATCH_LOCAL_TLD. The bare
+	// domain is the dashboard root; every stack host and the observability /
+	// telemetry surfaces are subdomains of it.
+	u, err := url.Parse(s.config.SharedURL("langwatch"))
+	if err != nil {
+		return false
+	}
+	base := strings.ToLower(u.Hostname())
+	if base == "" {
+		return false
+	}
+	return h == base || strings.HasSuffix(h, "."+base)
+}
+
+// handleIndex serves the console bundle (apps/haven-web): the hub on its own
+// host, a stack's home on <slug>.langwatch.localhost, and every client route.
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	s.console.ServeHTTP(w, r)
+}
+
+// handleTelemetry broadcasts an incoming OTLP export to every running stack, so
+// one exporter pointed at telemetry.langwatch.localhost lands in every worktree
+// you have open. Best-effort and asynchronous — a slow or dead stack never
+// blocks the caller.
+func (s *Server) handleTelemetry(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "telemetry fan-out accepts POST", http.StatusMethodNotAllowed)
+		return
+	}
+	// Cap the buffered body: the daemon holds it in RAM and hands a copy to a
+	// goroutine per running stack, so an unbounded POST (a local process, or a
+	// page CSRF-posting to the loopback port) could exhaust memory. 32 MiB is far
+	// above any real OTLP export.
+	r.Body = http.MaxBytesReader(w, r.Body, 32<<20)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "telemetry body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "reading telemetry body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	prefix := os.Getenv("LANGWATCH_OTLP_FORWARD_PREFIX")
+	if prefix == "" {
+		prefix = "/api/otel"
+	}
+	ct := r.Header.Get("Content-Type")
+	fanned := 0
+	stacks := s.config.Stacks()
+	for i := range stacks {
+		for _, svc := range stacks[i].Services {
+			if svc.Name != "app" {
+				continue
+			}
+			fanned++
+			go forward(strings.TrimRight(svc.URL, "/")+prefix+r.URL.Path, ct, body)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"fannedOutTo": fanned})
+}
+
+func forward(url, contentType string, body []byte) {
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	if resp, err := client.Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+}

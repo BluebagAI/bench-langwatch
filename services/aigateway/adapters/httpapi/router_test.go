@@ -1,0 +1,944 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/langwatch/langwatch/pkg/health"
+	"github.com/langwatch/langwatch/pkg/herr"
+	"github.com/langwatch/langwatch/services/aigateway/app"
+	"github.com/langwatch/langwatch/services/aigateway/domain"
+)
+
+// --- Mock implementations ---
+
+type mockAuth struct {
+	resolveFn func(ctx context.Context, token string) (*domain.Bundle, error)
+}
+
+func (m *mockAuth) Resolve(ctx context.Context, key domain.PresentedKey) (*domain.Bundle, error) {
+	return m.resolveFn(ctx, key.Token)
+}
+
+type mockProvider struct {
+	dispatchFn func(ctx context.Context, req *domain.Request, cred domain.Credential) (*domain.Response, error)
+	streamFn   func(ctx context.Context, req *domain.Request, cred domain.Credential) (domain.StreamIterator, error)
+	listFn     func(ctx context.Context, creds []domain.Credential) ([]domain.Model, []domain.ModelDiscoveryGap, error)
+}
+
+func (m *mockProvider) Dispatch(ctx context.Context, req *domain.Request, cred domain.Credential) (*domain.Response, error) {
+	return m.dispatchFn(ctx, req, cred)
+}
+
+// DispatchStream answers from streamFn when a test sets one. Otherwise the
+// audio routes, which always stream, get dispatchFn's answer as one chunk,
+// with a provider refusal reshaped the way a real provider lane reports it.
+func (m *mockProvider) DispatchStream(ctx context.Context, req *domain.Request, cred domain.Credential) (domain.StreamIterator, error) {
+	if m.streamFn != nil {
+		return m.streamFn(ctx, req, cred)
+	}
+	if m.dispatchFn == nil {
+		return nil, nil
+	}
+	resp, err := m.dispatchFn(ctx, req, cred)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &domain.UpstreamError{StatusCode: resp.StatusCode, Body: resp.Body, Headers: resp.Headers}
+	}
+	return domain.BufferedStream(resp), nil
+}
+
+func (m *mockProvider) ListModels(ctx context.Context, creds []domain.Credential) ([]domain.Model, []domain.ModelDiscoveryGap, error) {
+	if m.listFn != nil {
+		return m.listFn(ctx, creds)
+	}
+	return nil, nil, nil
+}
+
+type mockRateLimiter struct {
+	allowFn func(ctx context.Context, vkID string, limits domain.RateLimits) error
+}
+
+func (m *mockRateLimiter) Allow(ctx context.Context, vkID string, limits domain.RateLimits) error {
+	if m.allowFn != nil {
+		return m.allowFn(ctx, vkID, limits)
+	}
+	return nil
+}
+
+type mockBudget struct {
+	precheckFn func(ctx context.Context, bundle *domain.Bundle) (domain.BudgetDecision, error)
+}
+
+func (m *mockBudget) Precheck(ctx context.Context, bundle *domain.Bundle) (domain.BudgetDecision, error) {
+	if m.precheckFn != nil {
+		return m.precheckFn(ctx, bundle)
+	}
+	return domain.BudgetDecision{Verdict: domain.BudgetAllow}, nil
+}
+
+// --- Helpers ---
+
+func testBundle() *domain.Bundle {
+	return &domain.Bundle{
+		VirtualKeyID: "vk-test",
+		ProjectID:    "proj-test",
+		TeamID:       "team-test",
+		Credentials: []domain.Credential{
+			{ID: "cred-1", ProviderID: domain.ProviderOpenAI, APIKey: "sk-test"},
+		},
+		Config: domain.BundleConfig{
+			Fallback: domain.FallbackConfig{MaxAttempts: 1},
+		},
+	}
+}
+
+// geminiBundle is testBundle plus the Google slot the /v1beta surface needs.
+// That surface hands the caller's body and URL path to Google unchanged, so
+// the gateway refuses it on a key with no Google credential rather than
+// forwarding the body to another vendor. A test whose subject is anything
+// else on that route binds the slot its own scenario implies; leaving it
+// unbound only proved that a mock provider ignores the credential it is
+// handed.
+func geminiBundle() *domain.Bundle {
+	bundle := testBundle()
+	bundle.Credentials = append(bundle.Credentials, domain.Credential{
+		ID: "cred-gemini", ProviderID: domain.ProviderGemini, APIKey: "goog-test",
+	})
+	return bundle
+}
+
+func successResponse() *domain.Response {
+	return &domain.Response{
+		Body:       []byte(`{"choices":[{"message":{"content":"hello"}}]}`),
+		StatusCode: 200,
+		Usage:      domain.Usage{PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8},
+	}
+}
+
+func chatBody() []byte {
+	return []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`)
+}
+
+func buildRouter(opts ...app.Option) http.Handler {
+	reg := health.New("test")
+	reg.MarkStarted()
+	application := app.New(opts...)
+	return NewRouter(RouterDeps{
+		App:    application,
+		Logger: zap.NewNop(),
+		Health: reg,
+	})
+}
+
+func buildRouterWithVersion(version string, opts ...app.Option) http.Handler {
+	reg := health.New(version)
+	reg.MarkStarted()
+	application := app.New(opts...)
+	return NewRouter(RouterDeps{
+		App:     application,
+		Logger:  zap.NewNop(),
+		Health:  reg,
+		Version: version,
+	})
+}
+
+// --- Tests ---
+
+func TestRouter_HealthEndpoints(t *testing.T) {
+	router := buildRouter()
+
+	endpoints := []string{"/healthz", "/readyz", "/startupz"}
+	for _, ep := range endpoints {
+		t.Run(ep, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, ep, nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			assert.Equal(t, http.StatusOK, rec.Code)
+		})
+	}
+}
+
+func TestRouter_AuthMiddleware_MissingToken(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Content-Type", "application/json")
+	// No Authorization header.
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusUnauthorized, rec.Code)
+
+	var errResp herr.ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, string(domain.ErrInvalidAPIKey), errResp.Error.Type)
+}
+
+func TestRouter_AuthMiddleware_ValidToken(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, token string) (*domain.Bundle, error) {
+			if token == "vk-lw-test" {
+				return testBundle(), nil
+			}
+			return nil, herr.New(context.Background(), domain.ErrInvalidAPIKey, nil)
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	body, err := io.ReadAll(rec.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"choices":[{"message":{"content":"hello"}}]}`, string(body))
+}
+
+// X-Goog-Api-Key — Gemini SDK / gemini-cli's canonical auth header.
+// Verifying the gateway accepts it lets gemini-native clients
+// (gemini-cli, @google/genai SDK) point at the gateway with no auth
+// changes — the VK secret slots into the same place a Google API key
+// would normally go.
+func TestRouter_AuthMiddleware_XGoogApiKey(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, token string) (*domain.Bundle, error) {
+			if token == "vk-lw-test" {
+				return testBundle(), nil
+			}
+			return nil, herr.New(context.Background(), domain.ErrInvalidAPIKey, nil)
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Goog-Api-Key", "vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestRouter_AuthMiddleware_XApiKey(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, token string) (*domain.Bundle, error) {
+			if token == "vk-lw-test" {
+				return testBundle(), nil
+			}
+			return nil, herr.New(context.Background(), domain.ErrInvalidAPIKey, nil)
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", "vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+}
+
+func TestRouter_DispatchError_RateLimited(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+	rl := &mockRateLimiter{
+		allowFn: func(_ context.Context, _ string, _ domain.RateLimits) error {
+			return fmt.Errorf("rpm exceeded")
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithRateLimiter(rl),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusTooManyRequests, rec.Code)
+
+	var errResp herr.ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, "rate_limited", errResp.Error.Type)
+}
+
+func TestRouter_DispatchError_BudgetExceeded(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+	budget := &mockBudget{
+		precheckFn: func(_ context.Context, _ *domain.Bundle) (domain.BudgetDecision, error) {
+			return domain.BudgetDecision{Verdict: domain.BudgetBlock}, nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithBudget(budget),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusPaymentRequired, rec.Code)
+
+	var errResp herr.ErrorResponse
+	require.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+	assert.Equal(t, "budget_exceeded", errResp.Error.Type)
+}
+
+func TestRouter_MetaHeaders(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.NotEmpty(t, rec.Header().Get("X-LangWatch-Gateway-Request-Id"))
+}
+
+// TestRouter_BodySizeCap_RejectsOverLimit pins the contract: a request
+// strictly over the explicit cap is rejected with 413, a request below is
+// accepted. Uses a small-ish 1 KiB cap so the test can fit a giant-enough
+// body in memory without dominating the test suite. Zero-cap fallback is
+// exercised implicitly by every other test in this file (buildRouter leaves
+// MaxRequestBodyBytes unset → fallback to the default cap).
+func TestRouter_BodySizeCap_RejectsOverLimit(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	reg := health.New("test")
+	reg.MarkStarted()
+	application := app.New(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+	router := NewRouter(RouterDeps{
+		App:                 application,
+		Logger:              zap.NewNop(),
+		Health:              reg,
+		MaxRequestBodyBytes: 1024,
+	})
+
+	// 2 KiB of padding wrapped in a minimally-valid chat body overruns the
+	// 1 KiB cap — the MaxBytesReader trips at read time, the handler
+	// surfaces it as 413.
+	big := bytes.Repeat([]byte("x"), 2048)
+	body := []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"`)
+	body = append(body, big...)
+	body = append(body, []byte(`"}]}`)...)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code < 400 {
+		t.Fatalf("want 4xx (413 or similar), got %d; body: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRouter_VersionHeader(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			return successResponse(), nil
+		},
+	}
+
+	router := buildRouterWithVersion("1.0.0",
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(chatBody()))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, "1.0.0", rec.Header().Get("X-LangWatch-Gateway-Version"))
+}
+
+// Regression for the codex/opencode /v1/responses streaming
+// misclassification bug: coding-agent bodies run 30-60 KiB, pushing
+// the top-level `stream` flag past the 32 KiB default peek window.
+// A miss routes a streaming request through the non-streaming
+// handler, OpenAI returns 200+SSE, Bifrost can't unmarshal, client
+// sees a 502 with SSE frames as the error body. The /v1/responses
+// handler must peek far enough to still find `stream` at ~50 KiB.
+func TestRouter_Responses_LargeBody_PicksStreamHandler(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+
+	syncCalled := false
+	streamCalled := false
+	provider := &mockStreamProvider{
+		mockProvider: mockProvider{
+			dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+				syncCalled = true
+				return successResponse(), nil
+			},
+		},
+		dispatchStreamFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (domain.StreamIterator, error) {
+			streamCalled = true
+			return &emptyStreamIter{}, nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	// Build a ~50 KiB /v1/responses body. The `instructions` string is
+	// padded past 32 KiB so `stream` lands outside the default peek
+	// window — same shape codex / opencode send in practice.
+	padding := bytes.Repeat([]byte("x"), 40*1024)
+	body := []byte(`{"model":"gpt-5-mini","input":"hi","instructions":"`)
+	body = append(body, padding...)
+	body = append(body, []byte(`","stream":true}`)...)
+	require.Greater(t, len(body), 40*1024)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.False(t, syncCalled, "Responses handler routed large body with stream:true through non-streaming Dispatch")
+	require.True(t, streamCalled, "Responses handler did not pick streaming path for stream:true beyond default peek window")
+}
+
+// Regression for bug 32: Claude Code sends 100 KiB+ /v1/messages bodies
+// with the top-level `stream` flag dead last (after the unbounded
+// messages array), and its offset grows with every conversation turn. A
+// fixed-size peek window — even the 256 KiB large variant — misses it
+// past that point, routing the streaming request through the
+// non-streaming handler: Anthropic answers 200+SSE, Bifrost can't
+// unmarshal the SSE frames as one JSON object, and the client gets a 502
+// with the SSE as the error body (claude then retries forever). Padding
+// the body past 256 KiB proves stream detection is size-independent
+// (full-body read), not merely a larger fixed peek.
+func TestRouter_Messages_HugeBody_PicksStreamHandler(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return testBundle(), nil
+		},
+	}
+
+	syncCalled := false
+	streamCalled := false
+	provider := &mockStreamProvider{
+		mockProvider: mockProvider{
+			dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+				syncCalled = true
+				return successResponse(), nil
+			},
+		},
+		dispatchStreamFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (domain.StreamIterator, error) {
+			streamCalled = true
+			return &emptyStreamIter{}, nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	// ~1 MiB body — well past the 256 KiB large-peek — with `stream:true`
+	// at the very tail, mirroring how Claude Code serializes the field
+	// after a large messages/system payload.
+	padding := bytes.Repeat([]byte("x"), 1024*1024)
+	body := []byte(`{"model":"claude-opus-4-7","messages":[{"role":"user","content":"`)
+	body = append(body, padding...)
+	body = append(body, []byte(`"}],"stream":true}`)...)
+	require.Greater(t, len(body), 256*1024)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.False(t, syncCalled, "messages handler routed huge stream:true body through non-streaming Dispatch")
+	require.True(t, streamCalled, "messages handler did not pick streaming path for stream:true beyond any fixed peek window")
+}
+
+type mockStreamProvider struct {
+	mockProvider
+	dispatchStreamFn func(ctx context.Context, req *domain.Request, cred domain.Credential) (domain.StreamIterator, error)
+}
+
+func (m *mockStreamProvider) DispatchStream(ctx context.Context, req *domain.Request, cred domain.Credential) (domain.StreamIterator, error) {
+	if m.dispatchStreamFn != nil {
+		return m.dispatchStreamFn(ctx, req, cred)
+	}
+	return &emptyStreamIter{}, nil
+}
+
+type emptyStreamIter struct{}
+
+func (*emptyStreamIter) Next(_ context.Context) bool { return false }
+func (*emptyStreamIter) Chunk() []byte               { return nil }
+func (*emptyStreamIter) Usage() domain.Usage         { return domain.Usage{} }
+func (*emptyStreamIter) Err() error                  { return nil }
+func (*emptyStreamIter) Close() error                { return nil }
+
+func TestGeminiModelFromPath(t *testing.T) {
+	cases := []struct {
+		path string
+		want string
+	}{
+		{"/models/gemini-2.5-flash:generateContent", "gemini-2.5-flash"},
+		{"/models/gemini-2.5-pro:streamGenerateContent", "gemini-2.5-pro"},
+		{"/models/gemini-1.5-flash-001:countTokens", "gemini-1.5-flash-001"},
+		{"/models/gemini-2.5-flash", "gemini-2.5-flash"},
+		{"/cachedContents", ""},
+		{"/", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.path, func(t *testing.T) {
+			assert.Equal(t, c.want, geminiModelFromPath(c.path))
+		})
+	}
+}
+
+// Regression for the Gemini-native passthrough route. gemini-cli's
+// `GOOGLE_GEMINI_BASE_URL` makes it POST to /v1beta/models/{m}:generateContent
+// (and :streamGenerateContent). The gateway must (1) accept the request,
+// (2) extract model from URL path, (3) call the provider with
+// RequestTypePassthrough, (4) forward method/path/query via req.Passthrough,
+// (5) return the body + status code verbatim. Streaming path must pick
+// DispatchStream instead of Dispatch.
+func TestRouter_GeminiPassthrough_NonStreaming(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return geminiBundle(), nil
+		},
+	}
+
+	var gotReq *domain.Request
+	provider := &mockProvider{
+		dispatchFn: func(_ context.Context, req *domain.Request, _ domain.Credential) (*domain.Response, error) {
+			gotReq = req
+			return &domain.Response{
+				Body:       []byte(`{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}`),
+				StatusCode: 200,
+				Headers:    map[string]string{"Content-Type": "application/json; charset=UTF-8"},
+			}, nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	geminiBody := []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-2.5-flash:generateContent", bytes.NewReader(geminiBody))
+	req.Header.Set("X-Goog-Api-Key", "vk-lw-test")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotNil(t, gotReq, "provider was not dispatched")
+	assert.Equal(t, domain.RequestTypePassthrough, gotReq.Type)
+	assert.Equal(t, "gemini-2.5-flash", gotReq.Model)
+	assert.Equal(t, "/models/gemini-2.5-flash:generateContent", gotReq.Passthrough.Path)
+	assert.Equal(t, http.MethodPost, gotReq.Passthrough.Method)
+	assert.False(t, gotReq.Passthrough.Stream)
+	// Auth headers must be stripped before forwarding upstream — Bifrost
+	// injects the real provider key.
+	assert.NotContains(t, gotReq.Passthrough.Headers, "X-Goog-Api-Key")
+	assert.NotContains(t, gotReq.Passthrough.Headers, "Authorization")
+
+	// Upstream body + content-type passed through verbatim.
+	assert.Contains(t, rec.Body.String(), "candidates")
+	assert.Equal(t, "application/json; charset=UTF-8", rec.Header().Get("Content-Type"))
+}
+
+func TestRouter_GeminiPassthrough_Streaming_PicksStream(t *testing.T) {
+	auth := &mockAuth{
+		resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+			return geminiBundle(), nil
+		},
+	}
+
+	syncCalled := false
+	streamCalled := false
+	var gotReq *domain.Request
+	provider := &mockStreamProvider{
+		mockProvider: mockProvider{
+			dispatchFn: func(_ context.Context, _ *domain.Request, _ domain.Credential) (*domain.Response, error) {
+				syncCalled = true
+				return successResponse(), nil
+			},
+		},
+		dispatchStreamFn: func(_ context.Context, req *domain.Request, _ domain.Credential) (domain.StreamIterator, error) {
+			streamCalled = true
+			gotReq = req
+			return &emptyStreamIter{}, nil
+		},
+	}
+
+	router := buildRouter(
+		app.WithAuth(auth),
+		app.WithProviders(provider),
+		app.WithLogger(zap.NewNop()),
+	)
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse",
+		bytes.NewReader([]byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)))
+	req.Header.Set("X-Goog-Api-Key", "vk-lw-test")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.False(t, syncCalled, "non-streaming Dispatch was called for :streamGenerateContent")
+	require.True(t, streamCalled, "streaming DispatchStream was not called for :streamGenerateContent")
+	require.NotNil(t, gotReq)
+	assert.True(t, gotReq.Passthrough.Stream)
+	assert.Equal(t, "alt=sse", gotReq.Passthrough.RawQuery)
+}
+
+// @scenario "/v1/models reflects effective VK allowlist"
+// The endpoint must emit OpenAI list shape — {"id", "object": "model"}
+// entries under an always-present data array — for the VK's aliases and
+// allowlist, or model-picker clients (OpenWebUI, LibreChat) cannot parse it.
+func TestRouter_ModelsEndpoint_EmitsOpenAIListShape(t *testing.T) {
+	bundle := testBundle()
+	bundle.Config.ModelAliases = map[string]domain.ModelAlias{
+		"chat": {ProviderID: domain.ProviderOpenAI, Model: "gpt-5-mini"},
+	}
+	bundle.Config.AllowedModels = []string{"gpt-5-mini"}
+
+	router := buildRouter(
+		app.WithLogger(zap.NewNop()),
+		app.WithAuth(&mockAuth{
+			resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+				return bundle, nil
+			},
+		}),
+		app.WithProviders(&mockProvider{}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer vk-test-secret")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var parsed struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created *int64 `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed))
+	assert.Equal(t, "list", parsed.Object)
+	require.NotNil(t, parsed.Data, "data must be an array, never null")
+
+	ids := make(map[string]string, len(parsed.Data))
+	ownedBy := make(map[string]string, len(parsed.Data))
+	for _, m := range parsed.Data {
+		ids[m.ID] = m.Object
+		ownedBy[m.ID] = m.OwnedBy
+		// `created` and `owned_by` are required fields of the OpenAI
+		// Model object. The openai SDKs type them as int / str, so a
+		// missing one lands as a null the client did not ask for.
+		assert.NotNil(t, m.Created, "model %q is missing the required `created` field", m.ID)
+		assert.NotEmpty(t, m.OwnedBy, "model %q is missing the required `owned_by` field", m.ID)
+	}
+	assert.Equal(t, "model", ids["chat"], `response must include {"id": "chat", "object": "model"}`)
+	assert.Equal(t, "model", ids["gpt-5-mini"], `response must include {"id": "gpt-5-mini", "object": "model"}`)
+	assert.Equal(t, "openai", ownedBy["gpt-5-mini"],
+		"the bundle's sole credential provider must be attributed to a plain allowlist entry")
+}
+
+// @scenario "GET /v1/models says so when a provider's catalog cannot be enumerated"
+// @scenario "a failed catalog probe surfaces as a gap, not a silent empty list"
+// Discovery gaps render as the X-Langwatch-Models-Discovery-Incomplete
+// header (provider:reason tokens), so an empty or partial list is
+// diagnosable from the response while the body stays exactly the OpenAI
+// list shape. No gaps, no header.
+// Spec: specs/ai-gateway/provider-routing.feature
+func TestRouter_ModelsEndpoint_SurfacesDiscoveryGapsHeader(t *testing.T) {
+	bundle := testBundle()
+	bundle.Credentials = []domain.Credential{
+		{ID: "cred-1", ProviderID: domain.ProviderAnthropic, APIKey: "sk"},
+		{ID: "cred-2", ProviderID: domain.ProviderBedrock},
+	}
+
+	router := buildRouter(
+		app.WithLogger(zap.NewNop()),
+		app.WithAuth(&mockAuth{
+			resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+				return bundle, nil
+			},
+		}),
+		app.WithProviders(&mockProvider{
+			listFn: func(_ context.Context, _ []domain.Credential) ([]domain.Model, []domain.ModelDiscoveryGap, error) {
+				return []domain.Model{{ID: "claude-haiku-4-5", ProviderID: domain.ProviderAnthropic}},
+					[]domain.ModelDiscoveryGap{
+						{ProviderID: domain.ProviderOpenAI, Reason: domain.ModelDiscoveryProbeFailed},
+						{ProviderID: domain.ProviderBedrock, Reason: domain.ModelDiscoveryNotEnumerable},
+					},
+					nil
+			},
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer vk-test-secret")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	// Both reasons serialize distinctly: a formatter collapsing every
+	// reason to one token would pass a single-gap assertion.
+	assert.Equal(t, "openai:probe-failed,bedrock:not-enumerable",
+		rec.Header().Get("X-Langwatch-Models-Discovery-Incomplete"))
+	var parsed struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed))
+	require.Len(t, parsed.Data, 1, "the listable provider's models still appear")
+}
+
+// The header is absent when discovery has nothing to report: quiet
+// success must look exactly like it did before the header existed.
+func TestRouter_ModelsEndpoint_NoGapsNoHeader(t *testing.T) {
+	bundle := testBundle()
+	router := buildRouter(
+		app.WithLogger(zap.NewNop()),
+		app.WithAuth(&mockAuth{
+			resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+				return bundle, nil
+			},
+		}),
+		app.WithProviders(&mockProvider{
+			listFn: func(_ context.Context, _ []domain.Credential) ([]domain.Model, []domain.ModelDiscoveryGap, error) {
+				return []domain.Model{{ID: "gpt-5-mini", ProviderID: domain.ProviderOpenAI}}, nil, nil
+			},
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer vk-test-secret")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	_, present := rec.Header()["X-Langwatch-Models-Discovery-Incomplete"]
+	assert.False(t, present, "no gaps must mean no header")
+}
+
+// A model the gateway cannot attribute to a provider still needs a
+// non-empty `owned_by`: it is a required string in the OpenAI Model
+// object, and a blank one renders as an unlabelled row in model pickers.
+func TestRouter_ModelsEndpoint_AttributesUnownedModelsToGateway(t *testing.T) {
+	bundle := testBundle()
+	bundle.Credentials = []domain.Credential{
+		{ID: "cred-1", ProviderID: domain.ProviderOpenAI},
+		{ID: "cred-2", ProviderID: domain.ProviderAnthropic},
+	}
+	bundle.Config.AllowedModels = []string{"some-model"}
+
+	router := buildRouter(
+		app.WithLogger(zap.NewNop()),
+		app.WithAuth(&mockAuth{
+			resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+				return bundle, nil
+			},
+		}),
+		app.WithProviders(&mockProvider{}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer vk-test-secret")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var parsed struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed))
+	require.Len(t, parsed.Data, 1)
+	assert.Equal(t, "langwatch", parsed.Data[0].OwnedBy)
+}
+
+// `owned_by` names the vendor a client groups its model picker by, so an
+// instance carrying a routing handle keeps its family there. The handle goes
+// in the id, which is the string a caller sends.
+func TestRouter_ModelsEndpoint_KeepsTheFamilyInOwnedBy(t *testing.T) {
+	bundle := testBundle()
+	bundle.Credentials = []domain.Credential{
+		{ID: "cred-1", ProviderID: domain.ProviderAnthropic, Handle: "eu"},
+	}
+	bundle.Config.AllowedModels = nil
+
+	router := buildRouter(
+		app.WithLogger(zap.NewNop()),
+		app.WithAuth(&mockAuth{
+			resolveFn: func(_ context.Context, _ string) (*domain.Bundle, error) {
+				return bundle, nil
+			},
+		}),
+		app.WithProviders(&mockProvider{
+			listFn: func(_ context.Context, _ []domain.Credential) ([]domain.Model, []domain.ModelDiscoveryGap, error) {
+				return []domain.Model{
+					{ID: "claude-sonnet-5", ProviderID: domain.ProviderAnthropic, Handle: "eu"},
+				}, nil, nil
+			},
+		}),
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer vk-test-secret")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var parsed struct {
+		Data []struct {
+			ID      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &parsed))
+	require.Len(t, parsed.Data, 1)
+	assert.Equal(t, "eu/claude-sonnet-5", parsed.Data[0].ID)
+	assert.Equal(t, "anthropic", parsed.Data[0].OwnedBy)
+}

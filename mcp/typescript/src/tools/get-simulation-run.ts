@@ -1,0 +1,72 @@
+import {
+  getSimulationRun as apiGetSimulationRun,
+  type SimulationRunSummary,
+} from "../langwatch-api-simulation-runs.ts";
+import { formatEvaluations, pendingEvaluationNote } from "./format-suite-details.ts";
+
+function resultLines(results: NonNullable<SimulationRunSummary["results"]>): string[] {
+  const lines = ["\n## Results"];
+  if (results.verdict) {
+    lines.push(`**Verdict**: ${results.verdict}`);
+  }
+  if (results.reasoning) {
+    lines.push(`**Reasoning**: ${results.reasoning}`);
+  }
+  if (results.metCriteria && results.metCriteria.length > 0) {
+    lines.push(`**Met Criteria**: ${results.metCriteria.join(", ")}`);
+  }
+  if (results.unmetCriteria && results.unmetCriteria.length > 0) {
+    lines.push(`**Unmet Criteria**: ${results.unmetCriteria.join(", ")}`);
+  }
+  if (results.error) {
+    lines.push(`**Error**: ${results.error}`);
+  }
+  lines.push(...formatEvaluations(results.evaluations));
+  return lines;
+}
+
+/**
+ * Handles the platform_get_simulation_run MCP tool invocation.
+ */
+export async function handleGetSimulationRun(params: {
+  scenarioRunId: string;
+  format?: "digest" | "json";
+}): Promise<string> {
+  const run = await apiGetSimulationRun(params.scenarioRunId);
+
+  if (params.format === "json") {
+    return JSON.stringify(run, null, 2);
+  }
+
+  const lines: string[] = [];
+  lines.push(`# Simulation Run: ${run.name ?? run.scenarioRunId}\n`);
+  lines.push(`**Run ID**: ${run.scenarioRunId}`);
+  lines.push(`**Scenario ID**: ${run.scenarioId}`);
+  lines.push(`**Batch ID**: ${run.batchRunId}`);
+  lines.push(`**Status**: ${run.status}`);
+  lines.push(...pendingEvaluationNote(run.status));
+
+  const duration = run.durationInMs > 0 ? `${(run.durationInMs / 1000).toFixed(1)}s` : "—";
+  lines.push(`**Duration**: ${duration}`);
+  if (run.totalCost) {
+    lines.push(`**Cost**: $${run.totalCost.toFixed(4)}`);
+  }
+  lines.push(`**Started**: ${new Date(run.timestamp).toISOString()}`);
+  if (run.note) {
+    lines.push(`**Note**: ${run.note}`);
+  }
+
+  if (run.results) {
+    lines.push(...resultLines(run.results));
+  }
+
+  if (run.messages && run.messages.length > 0) {
+    lines.push("\n## Conversation");
+    for (const msg of run.messages) {
+      const content = msg.content.length > 300 ? msg.content.slice(0, 300) + "..." : msg.content;
+      lines.push(`**[${msg.role}]**: ${content}`);
+    }
+  }
+
+  return lines.join("\n");
+}

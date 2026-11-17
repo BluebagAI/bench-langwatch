@@ -1,0 +1,176 @@
+import fs from "fs";
+import path from "path";
+
+import type { Root, RootContent } from "mdast";
+import remarkFrontmatter from "remark-frontmatter";
+import remarkMdx from "remark-mdx";
+import remarkParse from "remark-parse";
+import remarkStringify from "remark-stringify";
+import { unified } from "unified";
+
+export interface InlineOptions {
+  // When provided, partials referenced more than once collapse to a stub on
+  // subsequent references. Used by the prompt compiler to dedup shared
+  // sections across multi-skill compositions (e.g. `level-up`). Sync passes
+  // `undefined` so each published file is fully self-contained.
+  seenShared?: Set<string>;
+  // Strip top-level frontmatter from output. Defaults to false (preserve).
+  // Partials are always frontmatter-stripped when spliced in.
+  stripFrontmatter?: boolean;
+  // `_shared/` partials to drop entirely, by basename without the extension
+  // (e.g. "cli-setup"): for readers already provisioned with what the
+  // partial sets up (the in-product agent has credentials and CLI before a
+  // skill loads), priced at every token it reads regardless. An unknown name
+  // is an error, not a silent no-op, so a renamed partial can't re-inline.
+  excludeShared?: string[];
+}
+
+const parser = unified().use(remarkParse).use(remarkFrontmatter, ["yaml"]).use(remarkMdx);
+
+const stringifier = unified()
+  .use(remarkStringify, { bullet: "-", fences: true, rule: "-" })
+  .use(remarkFrontmatter, ["yaml"])
+  .use(remarkMdx);
+
+interface EsmNode {
+  value: string;
+  data?: {
+    estree?: {
+      body?: {
+        type: string;
+        specifiers?: { type: string; local?: { name?: string } }[];
+        source?: { value?: string };
+      }[];
+    };
+  };
+}
+
+function parseImports(node: EsmNode): { name: string; source: string }[] {
+  // remark-mdx attaches a parsed estree under `data` — use it instead of regex
+  // so we get bulletproof handling of multi-line / multi-statement import blocks.
+  const body = node.data?.estree?.body ?? [];
+  const out: { name: string; source: string }[] = [];
+  for (const stmt of body) {
+    if (stmt.type !== "ImportDeclaration") {
+      throw new Error(
+        `Only \`import Name from './path.mdx'\` statements are supported. Got: ${stmt.type}`,
+      );
+    }
+    const def = stmt.specifiers?.find((s) => s.type === "ImportDefaultSpecifier");
+    if (!def?.local?.name || !stmt.source?.value) {
+      throw new Error(`Default import expected: \`import Name from './path.mdx'\``);
+    }
+    out.push({ name: def.local.name, source: stmt.source.value });
+  }
+  return out;
+}
+
+function parseFile(filePath: string): Root {
+  const raw = fs.readFileSync(filePath, "utf8");
+  return parser.parse(raw) as Root;
+}
+
+const basename = (p: string) => path.basename(p, path.extname(p));
+
+/** Every default import in the file's ESM blocks, by local name, resolved against the file. */
+function collectImports(tree: Root, filePath: string): Map<string, string> {
+  const dir = path.dirname(filePath);
+  const imports = new Map<string, string>();
+  for (const node of tree.children) {
+    if (node.type !== "mdxjsEsm") continue;
+    try {
+      for (const { name, source } of parseImports(node as unknown as EsmNode)) {
+        imports.set(name, path.resolve(dir, source));
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Bad ESM block in ${filePath}: ${msg}`);
+    }
+  }
+  return imports;
+}
+
+type InlineContext = {
+  filePath: string;
+  imports: Map<string, string>;
+  opts: InlineOptions;
+  stack: string[];
+};
+
+/** A block-level `<Partial />` replaced by the imported file's content. */
+function inlineElement({ name, context }: { name: string; context: InlineContext }): RootContent[] {
+  const { filePath, imports, opts, stack } = context;
+  const target = imports.get(name);
+  if (!target) {
+    throw new Error(`<${name} /> in ${filePath} has no matching import`);
+  }
+  // Dedup only applies to repo-wide `_shared/` partials. Other imports
+  // (skill-local helpers, future per-skill components) must always inline
+  // in full so we don't drop real content from a composed skill.
+  const isSharedPartial = target.includes(`${path.sep}_shared${path.sep}`);
+  if (isSharedPartial && opts.excludeShared?.includes(basename(target))) return [];
+  if (isSharedPartial && opts.seenShared?.has(target)) {
+    return [{ type: "paragraph", children: [{ type: "text", value: `(see "${name}" above)` }] }];
+  }
+  if (isSharedPartial) opts.seenShared?.add(target);
+  return inlineTree(target, { ...opts, stripFrontmatter: true }, [...stack, filePath]).children;
+}
+
+/** What one top-level node contributes to the inlined tree. */
+function inlineNode(node: RootContent, context: InlineContext): RootContent[] {
+  if (node.type === "mdxjsEsm") return [];
+  if (node.type === "yaml") return context.opts.stripFrontmatter ? [] : [node];
+  if (node.type === "mdxJsxFlowElement" && typeof node.name === "string") {
+    return inlineElement({ name: node.name, context });
+  }
+  if (node.type === "mdxJsxTextElement") {
+    throw new Error(
+      `Inline JSX <${(node as { name?: string }).name ?? "?"} /> in ${context.filePath} is not supported. ` +
+        `Use block-level JSX (on its own line).`,
+    );
+  }
+  return [node];
+}
+
+function inlineTree(filePath: string, opts: InlineOptions, stack: string[]): Root {
+  if (stack.includes(filePath)) {
+    throw new Error(`Cyclic import detected: ${[...stack, filePath].join(" -> ")}`);
+  }
+  const tree = parseFile(filePath);
+  const context: InlineContext = { filePath, imports: collectImports(tree, filePath), opts, stack };
+  return { ...tree, children: tree.children.flatMap((node) => inlineNode(node, context)) };
+}
+
+export function inlineMdx(sourceFile: string, opts: InlineOptions = {}): string {
+  if (opts.excludeShared?.length) {
+    // Recipes sit one level deeper than skills, so walk up for the `_shared/`
+    // directory rather than assuming a fixed depth.
+    let dir = path.dirname(path.resolve(sourceFile));
+    let sharedDir = "";
+    while (dir !== path.dirname(dir)) {
+      const candidate = path.join(dir, "_shared");
+      if (fs.existsSync(candidate)) {
+        sharedDir = candidate;
+        break;
+      }
+      dir = path.dirname(dir);
+    }
+    const known = sharedDir ? new Set(fs.readdirSync(sharedDir).map(basename)) : new Set<string>();
+    for (const name of opts.excludeShared) {
+      if (!known.has(name)) {
+        throw new Error(
+          `excludeShared names "${name}", which is not a partial in ${sharedDir}. ` +
+            `A renamed partial must not silently start inlining again.`,
+        );
+      }
+    }
+  }
+  const tree = inlineTree(path.resolve(sourceFile), opts, []);
+  const out = stringifier.stringify(tree) as string;
+  // remark-stringify escapes intra-word underscores (e.g. `LANGWATCH_API_KEY`
+  // becomes `LANGWATCH\_API\_KEY`) to be safe against emphasis ambiguity, but
+  // CommonMark already treats them as plain text. Only restore where the
+  // underscore is flanked by alphanumerics — leave intentional escapes like
+  // `\_private` (where the leading char isn't alphanumeric) alone.
+  return out.replace(/([A-Za-z0-9])\\_(?=[A-Za-z0-9])/g, "$1_");
+}

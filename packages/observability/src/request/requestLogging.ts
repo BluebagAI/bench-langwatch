@@ -1,0 +1,200 @@
+import { REQUEST_CAUSE_FIELD } from "../constants.ts";
+import type { Logger } from "../logger.ts";
+import { summarizeError } from "./errorSummary.ts";
+import type { RequestAttribution } from "./trafficAttribution.ts";
+
+/**
+ * The one logger name for every HTTP access record, whatever family or lane answered: the
+ * request-failure alerts filter on it. The family travels as the record's `family` field.
+ * Spec: specs/observability/request-log-cause-and-level.feature
+ */
+export const REQUEST_LOGGER_NAME = "langwatch:api:hono";
+
+/**
+ * Common request logging data structure.
+ */
+export interface RequestLogData {
+  method: string;
+  url: string;
+  statusCode: number;
+  duration: number;
+  userAgent: string | null;
+  error?: unknown;
+  /**
+   * Traffic attribution (endpoint class + client source), flattened onto the
+   * log line. These fields plus the tenant the logging context stamps are
+   * what the usage dashboards slice by.
+   */
+  attribution?: RequestAttribution;
+  /** Additional context to include in log */
+  extra?: Record<string, unknown>;
+  /**
+   * Pins the level, ignoring status and fault. For a caller that samples a flood of one
+   * customer fault and writes the held-back repeats below `info`.
+   */
+  level?: "debug" | "info" | "warn" | "error";
+}
+
+/**
+ * Extracts HTTP status code from an error object.
+ * Returns 500 for generic errors, 200 if no error.
+ * Checks both `status` (HttpError, Hono) and `httpStatus` (HandledError).
+ */
+export function getStatusCodeFromError(error: unknown): number {
+  if (error && typeof error === "object") {
+    const err = error as Record<string, unknown>;
+    if (typeof err.httpStatus === "number") return err.httpStatus;
+    if (typeof err.status === "number") return err.status;
+    return 500;
+  }
+
+  if (error) {
+    return 500;
+  }
+
+  return 200;
+}
+
+/**
+ * Log level by HTTP status: 404 is `info` (a normal response, not a
+ * warning), other 4xx are `warn`, 5xx `error`, everything else `info`.
+ */
+export function getLogLevelFromStatusCode(statusCode: number): "info" | "warn" | "error" {
+  if (statusCode >= 500) return "error";
+  if (statusCode === 404) return "info";
+  if (statusCode >= 400) return "warn";
+  return "info";
+}
+
+/**
+ * The fault attribution of a handled error, duck-typed (`code` + `httpStatus`
+ * + `fault`) so this package doesn't import the HandledError class. Returns
+ * undefined for unhandled errors.
+ */
+export function handledFaultOf(
+  error: unknown,
+): "customer" | "platform" | "provider" | "presumed_platform" | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const e = error as Record<string, unknown>;
+  if (typeof e.code !== "string" || typeof e.httpStatus !== "number") {
+    return undefined;
+  }
+  const fault = e.fault;
+  return fault === "customer" ||
+    fault === "platform" ||
+    fault === "provider" ||
+    fault === "presumed_platform"
+    ? fault
+    : undefined;
+}
+
+/**
+ * Request log level by fault, as the tRPC logger does: `customer` warns (spike-watched);
+ * `platform`, `provider` and `presumed_platform` error (incident); unhandled goes by status.
+ */
+export function getLogLevelForRequest(
+  error: unknown,
+  statusCode: number,
+): "info" | "warn" | "error" {
+  const fault = handledFaultOf(error);
+  if (fault === "customer") return "warn";
+  if (fault === "platform" || fault === "provider" || fault === "presumed_platform") return "error";
+  return getLogLevelFromStatusCode(statusCode);
+}
+
+/**
+ * The `errorType` given to a 5xx that arrived with nothing attached, so the
+ * records group and count like any other failure shape rather than hiding
+ * among the successes.
+ */
+const UNCAUSED_SERVER_ERROR = "UncausedServerError";
+
+/**
+ * Attaches the cause, as a bounded {@link summarizeError} summary, under the
+ * field its level allows: error-level uses "error", others use
+ * {@link REQUEST_CAUSE_FIELD}. See specs/observability/request-log-cause-and-level.feature.
+ */
+function attachCause({
+  logData,
+  error,
+  level,
+}: {
+  logData: Record<string, unknown>;
+  error: unknown;
+  level: "debug" | "info" | "warn" | "error";
+}): void {
+  if (level === "error") {
+    logData.error = summarizeError(error);
+  } else {
+    logData[REQUEST_CAUSE_FIELD] = summarizeError(error);
+    // Re-keying costs the derived `error_type`, which is how these records
+    // were grouped. Restated flat so the grouping survives the move.
+    const name = (error as { name?: unknown }).name;
+    if (typeof name === "string") logData.errorType = name;
+  }
+
+  const fault = handledFaultOf(error);
+  if (fault) {
+    logData.handledErrorCode = (error as Record<string, unknown>).code;
+    logData.handledErrorFault = fault;
+  }
+}
+
+/**
+ * What the record says happened. A 5xx with no cause attached must not claim
+ * the request was handled: that message is the only thing distinguishing it
+ * from a success in every log view that does not print the status.
+ */
+function requestLogMessage({
+  error,
+  level,
+}: {
+  error: unknown;
+  level: "debug" | "info" | "warn" | "error";
+}): string {
+  if (error) return "error handling request";
+  return level === "error" ? "request failed without a cause attached" : "request handled";
+}
+
+/**
+ * Logs an HTTP request with appropriate level based on status code (5xx=error,
+ * 4xx=warn, success=info).
+ */
+export function logHttpRequest(logger: Logger, data: RequestLogData): void {
+  const logData: Record<string, unknown> = {
+    ...data.extra,
+    ...data.attribution,
+    method: data.method,
+    url: data.url,
+    statusCode: data.statusCode,
+    duration: data.duration,
+    userAgent: data.userAgent,
+  };
+
+  const level = data.level ?? getLogLevelForRequest(data.error, data.statusCode);
+
+  if (data.error) {
+    attachCause({ logData, error: data.error, level });
+  } else if (level === "error") {
+    // Route returned 5xx without throwing: name it so it can be found and traced.
+    logData.errorType = UNCAUSED_SERVER_ERROR;
+  }
+
+  logger[level](logData, requestLogMessage({ error: data.error, level }));
+}
+
+/**
+ * Detects if an authorization token is present in request headers.
+ */
+export function hasAuthorizationToken(headers: {
+  "x-auth-token"?: string;
+  authorization?: string;
+}): boolean {
+  const xAuthToken = headers["x-auth-token"];
+  const authHeader = headers.authorization;
+
+  if (xAuthToken) return true;
+  if (authHeader) return true;
+
+  return false;
+}

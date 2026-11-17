@@ -1,0 +1,55 @@
+---
+title: Concepts
+description: The nouns of the LangWatch AI Gateway, each defined once, virtual key, scope, provider credential, routing policy, budget, spend event and gateway request id.
+sidebarTitle: Concepts
+---
+
+## Virtual key
+
+A virtual key is the credential your application presents to the gateway in place of a provider API key. A virtual key is like a virtual credit card that you can attach a budget to.
+
+The key has the form `vk-lw-` followed by a 26-character ULID. Send it as `Authorization: Bearer vk-lw-...` or in the `X-Api-Key` header. The gateway resolves the key to its organization, its scopes, the providers it may reach, its routing, its budgets and its expiry.
+
+See [Virtual keys](/ai-gateway/virtual-keys).
+
+## Scope
+
+A scope is the place in your LangWatch hierarchy that a virtual key or a budget belongs to. The scope types are organization, team and project.
+
+A key owned by a project reaches the provider credentials configured on that project, its team and the organization. A personal key is a key with a principal, the person behind it, and its scopes still decide which providers it reaches. Every key has one trace project where its traces and costs land.
+
+## Provider credential
+
+A provider credential is the row you configure under **Settings > Model Providers**: an OpenAI API key, an Azure OpenAI endpoint with its key, AWS Bedrock access keys with a region, and so on. The gateway reads the same rows that the rest of LangWatch uses.
+
+The credential also carries gateway settings on its **Advanced (Gateway)** section: a routing handle, a fallback priority and a provider config JSON. See [Providers](/ai-gateway/providers/overview).
+
+## Routing policy
+
+A routing policy is an ordered list of provider credentials that a virtual key dispatches through. A key with no routing does not fail over: a provider error goes back to the caller. A key set to **Fall back to all eligible providers** retries the next credential it can reach. A key bound to a policy follows the policy's order.
+
+See [Routing policies](/ai-gateway/governance/routing-policies) and [Fallback chains](/ai-gateway/providers/fallback-chains).
+
+## Model name
+
+A model name selects the provider and the model. Write it as `provider/model`, for example `openai/gpt-6-luna` or `anthropic/claude-sonnet-4-5`. A bare name such as `gpt-6-luna` works when one of the key's credentials serves it. A routing handle set on a credential, for example `eu`, pins that exact credential: `eu/claude-sonnet-4-5`.
+
+See [Model naming](/ai-gateway/model-naming).
+
+## Budget
+
+A budget is a spend cap in USD on a scope, over a window. The scope is an organization, a team, a project, a virtual key, a member, each member of a group, or each end user of your product. The window is a minute, an hour, a day, a week, a month, the total lifetime, or manual.
+
+A `block` budget rejects the request at the limit with HTTP 402 `budget_exceeded`. A `warn` budget lets the request through and sets the `X-LangWatch-Budget-Warning` header. Every budget adds that header from 80 percent of its limit on the requests it lets through.
+
+See [Budgets](/ai-gateway/budgets).
+
+## Spend event
+
+A spend event is the record of one request: token counts per class, cost in nano-USD, the virtual key, the end user and the metadata your request carried. LangWatch delivers spend events to your webhook endpoints and serves them over REST for reconciliation.
+
+See [Billing and spend events](/ai-gateway/billing-events).
+
+## Gateway request id
+
+The gateway request id identifies one request across the response, the trace and the spend event. The response carries it as `X-LangWatch-Gateway-Request-Id`, the trace as `langwatch.gateway_request_id`, and the spend event as `gateway_request_id`. Quote it when you contact support.
