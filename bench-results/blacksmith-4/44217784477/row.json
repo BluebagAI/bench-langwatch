@@ -1,0 +1,28 @@
+{
+ "at": "2026-11-18T01:49:11+00:00",
+ "suite": "langwatch",
+ "repo": "BluebagAI/bench-langwatch",
+ "runner": "blacksmith-4",
+ "shards": "1",
+ "note": "measured",
+ "run": "https://github.com/BluebagAI/bench-langwatch/actions/runs/44217784477",
+ "run_id": 44217784477,
+ "sha": "a03c35e4ab4edbb7c26d8aa72560c458e307e87d",
+ "conclusion": "success",
+ "wall_s": 416,
+ "queue_s": 12,
+ "job_s": 416,
+ "jobs": 1,
+ "vcpu_min": 27.7,
+ "billed_min": 7,
+ "usd": 0.056,
+ "tests": {
+  "passed": 33,
+  "failed": 0,
+  "flaky": 0,
+  "skipped": 8,
+  "failed_tests": [],
+  "flaky_tests": [],
+  "files": 1
+ }
+}
